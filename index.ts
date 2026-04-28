@@ -72,6 +72,7 @@ import {
   getAgentDir,
   isToolCallEventType,
 } from "@mariozechner/pi-coding-agent";
+import { matchesKey, Key, truncateToWidth } from "@mariozechner/pi-tui";
 
 interface SandboxConfig extends SandboxRuntimeConfig {
   enabled?: boolean;
@@ -422,55 +423,175 @@ export default function (pi: ExtensionAPI) {
 
   // ── UI prompts ──────────────────────────────────────────────────────────────
 
+  interface PromptOption {
+    label: string;
+    key: string;
+    action: "abort" | "session" | "project" | "global";
+    confirm?: boolean;
+    hint?: string;
+  }
+
+  const PERMISSION_OPTIONS: PromptOption[] = [
+    { label: "Abort (keep blocked)", key: "esc", action: "abort" },
+    { label: "Allow for this session only", key: "s", action: "session" },
+    {
+      label: "Allow for this project",
+      key: "P",
+      action: "project",
+      confirm: true,
+      hint: "→ .pi/sandbox.json",
+    },
+    {
+      label: "Allow for all projects",
+      key: "A",
+      action: "global",
+      confirm: true,
+      hint: "→ ~/.pi/agent/sandbox.json",
+    },
+  ];
+
+  async function showPermissionPrompt(
+    ctx: ExtensionContext,
+    title: string,
+    options: PromptOption[],
+  ): Promise<"abort" | "session" | "project" | "global"> {
+    if (!ctx.hasUI) return "abort";
+
+    const result = await ctx.ui.custom<"abort" | "session" | "project" | "global">(
+      (tui, theme, _kb, done) => {
+        let selectedIndex = 0;
+        let pendingAction: "abort" | "session" | "project" | "global" | null = null;
+
+        function resolve(action: "abort" | "session" | "project" | "global") {
+          done(action);
+        }
+
+        return {
+          render(width: number): string[] {
+            const lines: string[] = [];
+            lines.push(truncateToWidth(theme.fg("warning", title), width));
+            lines.push("");
+
+            for (let i = 0; i < options.length; i++) {
+              const opt = options[i];
+              const isSelected = i === selectedIndex;
+              const isPending = pendingAction === opt.action;
+
+              const prefix = isSelected ? " → " : "   ";
+              const keyHint = theme.fg("accent", `[${opt.key}]`);
+              let label = opt.label;
+
+              if (opt.hint) {
+                label += `  ${theme.fg("dim", opt.hint)}`;
+              }
+
+              if (isPending) {
+                label += `  ${theme.fg("warning", "→ press Enter to confirm")}`;
+              }
+
+              const line = `${prefix}${keyHint} ${label}`;
+              lines.push(truncateToWidth(line, width));
+            }
+
+            lines.push("");
+            const footer = pendingAction
+              ? "↑↓ navigate  enter confirm  esc cancel"
+              : "↑↓ navigate  enter select  esc/ctrl+c cancel";
+            lines.push(truncateToWidth(theme.fg("dim", footer), width));
+
+            return lines;
+          },
+
+          handleInput(data: string): void {
+            if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+              resolve("abort");
+              return;
+            }
+
+            if (matchesKey(data, Key.enter)) {
+              if (pendingAction) {
+                resolve(pendingAction);
+              } else {
+                resolve(options[selectedIndex]?.action ?? "abort");
+              }
+              return;
+            }
+
+            if (matchesKey(data, Key.up)) {
+              selectedIndex = Math.max(0, selectedIndex - 1);
+              pendingAction = null;
+              tui.requestRender();
+              return;
+            }
+            if (matchesKey(data, Key.down)) {
+              selectedIndex = Math.min(options.length - 1, selectedIndex + 1);
+              pendingAction = null;
+              tui.requestRender();
+              return;
+            }
+
+            for (let i = 0; i < options.length; i++) {
+              const opt = options[i];
+              if (data === opt.key) {
+                // Exact case match (uppercase P/A) → immediate
+                resolve(opt.action);
+                return;
+              }
+              if (data.toLowerCase() === opt.key.toLowerCase()) {
+                // Lowercase match → confirmation required for P/A
+                if (opt.confirm) {
+                  pendingAction = opt.action;
+                  selectedIndex = i;
+                } else {
+                  resolve(opt.action);
+                }
+                tui.requestRender();
+                return;
+              }
+            }
+          },
+
+          invalidate(): void {
+            // no-op
+          },
+        };
+      },
+    );
+
+    return result ?? "abort";
+  }
+
   async function promptDomainBlock(
     ctx: ExtensionContext,
     domain: string,
   ): Promise<"abort" | "session" | "project" | "global"> {
-    if (!ctx.hasUI) return "abort";
-    const choice = await ctx.ui.select(`🌐 Network blocked: "${domain}" is not in allowedDomains`, [
-      "Abort (keep blocked)",
-      "Allow for this session only",
-      "Allow for this project  →  .pi/sandbox.json",
-      "Allow for all projects  →  ~/.pi/agent/sandbox.json",
-    ]);
-    if (!choice || choice.startsWith("Abort")) return "abort";
-    if (choice.startsWith("Allow for this session")) return "session";
-    if (choice.startsWith("Allow for this project")) return "project";
-    return "global";
+    return showPermissionPrompt(
+      ctx,
+      `🌐 Network blocked: "${domain}" is not in allowedDomains`,
+      PERMISSION_OPTIONS,
+    );
   }
 
   async function promptReadBlock(
     ctx: ExtensionContext,
     filePath: string,
   ): Promise<"abort" | "session" | "project" | "global"> {
-    if (!ctx.hasUI) return "abort";
-    const choice = await ctx.ui.select(`📖 Read blocked: "${filePath}" is not in allowRead`, [
-      "Abort (keep blocked)",
-      "Allow for this session only",
-      "Allow for this project  →  .pi/sandbox.json",
-      "Allow for all projects  →  ~/.pi/agent/sandbox.json",
-    ]);
-    if (!choice || choice.startsWith("Abort")) return "abort";
-    if (choice.startsWith("Allow for this session")) return "session";
-    if (choice.startsWith("Allow for this project")) return "project";
-    return "global";
+    return showPermissionPrompt(
+      ctx,
+      `📖 Read blocked: "${filePath}" is not in allowRead`,
+      PERMISSION_OPTIONS,
+    );
   }
 
   async function promptWriteBlock(
     ctx: ExtensionContext,
     filePath: string,
   ): Promise<"abort" | "session" | "project" | "global"> {
-    if (!ctx.hasUI) return "abort";
-    const choice = await ctx.ui.select(`📝 Write blocked: "${filePath}" is not in allowWrite`, [
-      "Abort (keep blocked)",
-      "Allow for this session only",
-      "Allow for this project  →  .pi/sandbox.json",
-      "Allow for all projects  →  ~/.pi/agent/sandbox.json",
-    ]);
-    if (!choice || choice.startsWith("Abort")) return "abort";
-    if (choice.startsWith("Allow for this session")) return "session";
-    if (choice.startsWith("Allow for this project")) return "project";
-    return "global";
+    return showPermissionPrompt(
+      ctx,
+      `📝 Write blocked: "${filePath}" is not in allowWrite`,
+      PERMISSION_OPTIONS,
+    );
   }
 
   // ── Apply allowance choices ─────────────────────────────────────────────────
