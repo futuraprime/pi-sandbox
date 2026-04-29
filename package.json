@@ -30,6 +30,7 @@
     "fmt": "oxfmt index.ts",
     "lint": "oxlint index.ts",
     "check": "tsc --noEmit",
+    "all": "npm run fmt && npm run lint && npm run check",
     "ci:fmt": "oxfmt --check index.ts",
     "ci:lint": "npm run lint",
     "ci:check": "npm run check"
@@ -48,8 +49,8 @@
   "devDependencies": {
     "@mariozechner/pi-coding-agent": "^0.61.0",
     "@types/node": "^24",
-    "oxfmt": "^0.33.0",
-    "oxlint": "^1.48.0",
+    "oxfmt": "^0.47.0",
+    "oxlint": "^1.62.0",
     "typescript": "^5"
   },
   "overrides": {

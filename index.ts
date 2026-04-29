@@ -60,20 +60,22 @@
  * Linux also requires: bubblewrap, socat, ripgrep
  */
 
-import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
-import {
-  SandboxManager,
-  type SandboxAskCallback,
-  type SandboxRuntimeConfig,
-} from "@carderne/sandbox-runtime";
 import type {
   AgentToolResult,
   ExtensionAPI,
   ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
+
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+
+import {
+  SandboxManager,
+  type SandboxAskCallback,
+  type SandboxRuntimeConfig,
+} from "@carderne/sandbox-runtime";
 import {
   type BashOperations,
   createBashTool,
@@ -630,7 +632,7 @@ export default function (pi: ExtensionAPI) {
     if (!allowsAllDomains(config.network?.allowedDomains)) return;
     ctx.ui.notify(
       '⚠️ Network sandbox allows all domains because network.allowedDomains contains "*". ' +
-      'Only use this intentionally; remove "*" to restore per-domain prompts.',
+        'Only use this intentionally; remove "*" to restore per-domain prompts.',
       "warning",
     );
   }
@@ -726,7 +728,7 @@ export default function (pi: ExtensionAPI) {
             if (matchesPattern(blockedPath, config.filesystem?.denyWrite ?? [])) {
               ctx.ui.notify(
                 `⚠️ "${blockedPath}" was added to allowWrite, but it is also in denyWrite and will remain blocked.\n` +
-                `Check denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
+                  `Check denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
                 "warning",
               );
               return result;
@@ -850,7 +852,7 @@ export default function (pi: ExtensionAPI) {
         if (matchesPattern(path, denyWrite)) {
           ctx.ui.notify(
             `⚠️ "${path}" was added to allowWrite, but it is also in denyWrite and will remain blocked.\n` +
-            `Check denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
+              `Check denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
             "warning",
           );
           return {
