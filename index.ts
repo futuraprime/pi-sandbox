@@ -78,7 +78,7 @@ import {
 } from "@carderne/sandbox-runtime";
 import {
   type BashOperations,
-  createBashTool,
+  createBashToolDefinition,
   getAgentDir,
   isToolCallEventType,
 } from "@mariozechner/pi-coding-agent";
@@ -392,7 +392,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   const localCwd = process.cwd();
-  const localBash = createBashTool(localCwd);
+  const localBash = createBashToolDefinition(localCwd);
 
   let sandboxEnabled = false;
   let sandboxInitialized = false;
@@ -683,12 +683,12 @@ export default function (pi: ExtensionAPI) {
     async execute(id, params, signal, onUpdate, ctx) {
       const runBash = () => {
         if (!sandboxEnabled || !sandboxInitialized) {
-          return localBash.execute(id, params, signal, onUpdate);
+          return localBash.execute(id, params, signal, onUpdate, ctx);
         }
-        const sandboxedBash = createBashTool(localCwd, {
+        const sandboxedBash = createBashToolDefinition(localCwd, {
           operations: createSandboxedBashOps(),
         });
-        return sandboxedBash.execute(id, params, signal, onUpdate);
+        return sandboxedBash.execute(id, params, signal, onUpdate, ctx);
       };
 
       let result: AgentToolResult<any>;
