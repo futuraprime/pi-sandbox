@@ -442,7 +442,7 @@ export default function (pi: ExtensionAPI) {
           filesystem: {
             ...config.filesystem,
             denyRead: config.filesystem?.denyRead ?? [],
-            allowRead: config.filesystem?.allowRead ?? [],
+            allowRead: [...(config.filesystem?.allowRead ?? []), ...sessionAllowedReadPaths],
             allowWrite: [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths],
             denyWrite: config.filesystem?.denyWrite ?? [],
           },
