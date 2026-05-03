@@ -67,9 +67,9 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 import {
   SandboxManager,
@@ -228,12 +228,38 @@ function extractBlockedWritePath(output: string): string | null {
 
 // ── Path pattern matching ─────────────────────────────────────────────────────
 
+function expandPath(filePath: string): string {
+  const expanded = filePath.replace(/^~(?=$|\/)/, homedir());
+  return resolve(expanded);
+}
+
+function canonicalizePath(filePath: string): string {
+  const abs = expandPath(filePath);
+  try {
+    return realpathSync.native(abs);
+  } catch {
+    // For writes to paths that do not exist yet, resolve symlinks in the nearest
+    // existing parent directory, then append the non-existent tail.
+    const tail: string[] = [];
+    let probe = abs;
+    while (!existsSync(probe)) {
+      const parent = dirname(probe);
+      if (parent === probe) return abs;
+      tail.unshift(basename(probe));
+      probe = parent;
+    }
+    try {
+      return resolve(realpathSync.native(probe), ...tail);
+    } catch {
+      return abs;
+    }
+  }
+}
+
 function matchesPattern(filePath: string, patterns: string[]): boolean {
-  const expanded = filePath.replace(/^~/, homedir());
-  const abs = resolve(expanded);
+  const abs = canonicalizePath(filePath);
   return patterns.some((p) => {
-    const expandedP = p.replace(/^~/, homedir());
-    const absP = resolve(expandedP);
+    const absP = p.includes("*") ? expandPath(p) : canonicalizePath(p);
     if (p.includes("*")) {
       const escaped = absP.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
       return new RegExp(`^${escaped}$`).test(abs);
@@ -816,7 +842,7 @@ export default function (pi: ExtensionAPI) {
     //   - denyRead is never a hard-block on its own — it just sets the default
     //     denied state that the prompt can override.
     if (isToolCallEventType("read", event)) {
-      const filePath = event.input.path;
+      const filePath = canonicalizePath(event.input.path);
       const effectiveAllowRead = getEffectiveAllowRead(ctx.cwd);
 
       if (!matchesPattern(filePath, effectiveAllowRead)) {
@@ -835,7 +861,7 @@ export default function (pi: ExtensionAPI) {
 
     // Path policy: write/edit — prompt for allowWrite, hard-block for denyWrite.
     if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
-      const path = (event.input as { path: string }).path;
+      const path = canonicalizePath((event.input as { path: string }).path);
       const allowWrite = getEffectiveAllowWrite(ctx.cwd);
       const denyWrite = config.filesystem?.denyWrite ?? [];
 
