@@ -266,8 +266,10 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
  * More path segments = more specific.
  */
 function pathSpecificity(pattern: string): number {
-  // Normalize: strip wildcards, expand tilde, count path segments
-  const cleaned = pattern.replace(/\*\*/g, "").replace(/\*/g, "");
+  // Normalize similarly to matchesPattern so relative paths like "." are
+  // scored as their resolved absolute paths.
+  const absP = pattern.includes("*") ? expandPath(pattern) : canonicalizePath(pattern);
+  const cleaned = absP.replace(/\*\*/g, "").replace(/\*/g, "");
   return cleaned.split("/").filter(Boolean).length;
 }
 
