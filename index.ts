@@ -19,13 +19,15 @@
  *   (d) Allow for all projects       — written to ~/.pi/agent/sandbox.json
  *
  * What gets prompted vs. hard-blocked:
- *   - domains: prompted if not whitelisted nor explicitly denied
- *   - write: prompted if not whitelisted nor explicitly denied
- *   - read: always prompted (because denyRead is used for broad block, may want to punch holes)
+ *   - domains: prompted if not in allowedDomains; hard-blocked if in deniedDomains
+ *   - write: prompted if not in allowWrite; hard-blocked if in denyWrite
+ *   - read: prompted if not matching any rule; hard-blocked if in denyRead
  *
- * IMPORTANT — precedence for read:
- *   Read:  allowRead OVERRIDES denyRead (prompt grant adds to allowRead)
- *   Write: denyWrite OVERRIDES allowWrite (most-specific deny wins)
+ * IMPORTANT — precedence (deny-first with specificity):
+ *   Rules are evaluated: deny → ask → allow. The first matching rule wins.
+ *   Deny always wins ties. A more specific allow can punch through a broader deny.
+ *   Specificity = more path segments or domain labels; wildcards carry no weight.
+ *   denyRead is a hard block (not a soft default), same as denyWrite.
  *
  * Config files (merged, project takes precedence):
  * - ~/.pi/agent/sandbox.json (global)
@@ -141,18 +143,83 @@ function loadConfig(cwd: string): SandboxConfig {
   return deepMerge(deepMerge(DEFAULT_CONFIG, globalConfig), projectConfig);
 }
 
+// ── Array merge helpers ─────────────────────────────────────────────────────
+
+/** Deduplicate an array (preserves first occurrence order). */
+function dedup<T>(arr: T[]): T[] {
+  return [...new Set(arr)];
+}
+
+/** Concatenate + deduplicate arrays from two configs for a given key. */
+function mergeArray<T>(
+  base: T[] | undefined,
+  overrides: T[] | undefined,
+): T[] {
+  const merged: T[] = [];
+  if (base) merged.push(...base);
+  if (overrides) merged.push(...overrides);
+  return dedup(merged);
+}
+
+/**
+ * Deep-merge two sandbox configs. Arrays are concatenated and deduplicated
+ * (defaults → global → project chain). Deny lists accumulate so a lower
+ * level cannot weaken a higher-level restriction. Scalars override.
+ */
 function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): SandboxConfig {
-  const result: SandboxConfig = { ...base };
+  const result: SandboxConfig = {
+    ...base,
+    enabled: overrides.enabled ?? base.enabled,
+    network: {
+      ...base.network,
+      ...(overrides.network ? overrides.network : {}),
+    },
+    filesystem: {
+      ...base.filesystem,
+      ...(overrides.filesystem ? overrides.filesystem : {}),
+    },
+  };
 
-  if (overrides.enabled !== undefined) result.enabled = overrides.enabled;
-  if (overrides.network) {
-    result.network = { ...base.network, ...overrides.network };
-  }
-  if (overrides.filesystem) {
-    result.filesystem = { ...base.filesystem, ...overrides.filesystem };
+  // Network arrays: concat+dedup
+  if (base.network || overrides.network) {
+    result.network = {
+      ...result.network,
+      allowedDomains: mergeArray(
+        base.network?.allowedDomains,
+        overrides.network?.allowedDomains,
+      ),
+      deniedDomains: mergeArray(
+        base.network?.deniedDomains,
+        overrides.network?.deniedDomains,
+      ),
+    };
   }
 
-  const extOverrides = overrides as {
+  // Filesystem arrays: concat+dedup
+  if (base.filesystem || overrides.filesystem) {
+    result.filesystem = {
+      ...result.filesystem,
+      allowRead: mergeArray(
+        base.filesystem?.allowRead,
+        overrides.filesystem?.allowRead,
+      ),
+      denyRead: mergeArray(
+        base.filesystem?.denyRead,
+        overrides.filesystem?.denyRead,
+      ),
+      allowWrite: mergeArray(
+        base.filesystem?.allowWrite,
+        overrides.filesystem?.allowWrite,
+      ),
+      denyWrite: mergeArray(
+        base.filesystem?.denyWrite,
+        overrides.filesystem?.denyWrite,
+      ),
+    };
+  }
+
+  // Extension scalars + ignoreViolations
+  const extBase = base as {
     ignoreViolations?: Record<string, string[]>;
     enableWeakerNestedSandbox?: boolean;
     allowBrowserProcess?: boolean;
@@ -162,9 +229,25 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
     enableWeakerNestedSandbox?: boolean;
     allowBrowserProcess?: boolean;
   };
+  const extOverrides = overrides as {
+    ignoreViolations?: Record<string, string[]>;
+    enableWeakerNestedSandbox?: boolean;
+    allowBrowserProcess?: boolean;
+  };
 
-  if (extOverrides.ignoreViolations) {
-    extResult.ignoreViolations = extOverrides.ignoreViolations;
+  if (extBase.ignoreViolations || extOverrides.ignoreViolations) {
+    const merged: Record<string, string[]> = {};
+    if (extBase.ignoreViolations) {
+      for (const [k, v] of Object.entries(extBase.ignoreViolations)) {
+        merged[k] = [...v];
+      }
+    }
+    if (extOverrides.ignoreViolations) {
+      for (const [k, v] of Object.entries(extOverrides.ignoreViolations)) {
+        merged[k] = dedup([...(merged[k] ?? []), ...v]);
+      }
+    }
+    extResult.ignoreViolations = merged;
   }
   if (extOverrides.enableWeakerNestedSandbox !== undefined) {
     extResult.enableWeakerNestedSandbox = extOverrides.enableWeakerNestedSandbox;
@@ -176,7 +259,63 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
   return result;
 }
 
+// ── Specificity scoring ─────────────────────────────────────────────────────
+
+/**
+ * Compute the specificity of a path pattern. Wildcards carry no weight.
+ * More path segments = more specific.
+ */
+function pathSpecificity(pattern: string): number {
+  // Normalize: strip wildcards, expand tilde, count path segments
+  const cleaned = pattern.replace(/\*\*/g, "").replace(/\*/g, "");
+  return cleaned.split("/").filter(Boolean).length;
+}
+
+/**
+ * Compute the specificity of a domain pattern. Wildcards carry no weight.
+ * More domain labels = more specific.
+ */
+function domainSpecificity(pattern: string): number {
+  const cleaned = pattern.replace(/^\*\./, "");
+  return cleaned.split(".").filter(Boolean).length;
+}
+
+/**
+ * Evaluate a permission check with deny-first + specificity precedence.
+ *
+ * Order: deny -> ask -> allow. Deny wins unless a strictly more specific
+ * allow rule matches. Ties go to deny. "*" in allowedDomains means
+ * "no per-domain prompt" but does not override deniedDomains.
+ *
+ * Returns: "allowed" (silently OK), "denied" (hard block), "ask" (prompt)
+ */
+function checkPermission(
+  target: string,
+  denyRules: string[],
+  allowRules: string[],
+  specificityFn: (pattern: string) => number,
+  matchesFn: (target: string, pattern: string) => boolean,
+): "allowed" | "denied" | "ask" {
+  const matchedDenies = denyRules.filter((p) => matchesFn(target, p));
+  const matchedAllows = allowRules.filter((p) => matchesFn(target, p));
+
+  if (matchedDenies.length === 0 && matchedAllows.length === 0) return "ask";
+  if (matchedDenies.length === 0) return "allowed";
+  if (matchedAllows.length === 0) return "denied";
+
+  // Both match — compare specificity. Wildcards carry no weight.
+  const bestDeny = Math.max(...matchedDenies.map(specificityFn));
+  const bestAllow = Math.max(...matchedAllows.map(specificityFn));
+
+  return bestAllow > bestDeny ? "allowed" : "denied";
+}
+
 // ── Domain helpers ────────────────────────────────────────────────────────────
+
+/** Match a single path pattern (single-pattern variant of matchesPattern). */
+function matchSinglePath(filePath: string, pattern: string): boolean {
+  return matchesPattern(filePath, [pattern]);
+}
 
 export function shouldPromptForWrite(
   path: string,
@@ -436,19 +575,37 @@ export default function (pi: ExtensionAPI) {
 
   // ── Effective config helpers ────────────────────────────────────────────────
 
-  function getEffectiveAllowedDomains(cwd: string): string[] {
+  function getEffectiveDomains(cwd: string): {
+    allowed: string[];
+    denied: string[];
+  } {
     const config = loadConfig(cwd);
-    return [...(config.network?.allowedDomains ?? []), ...sessionAllowedDomains];
+    return {
+      allowed: [...(config.network?.allowedDomains ?? []), ...sessionAllowedDomains],
+      denied: config.network?.deniedDomains ?? [],
+    };
   }
 
-  function getEffectiveAllowRead(cwd: string): string[] {
+  function getEffectiveRead(cwd: string): {
+    allow: string[];
+    deny: string[];
+  } {
     const config = loadConfig(cwd);
-    return [...(config.filesystem?.allowRead ?? []), ...sessionAllowedReadPaths];
+    return {
+      allow: [...(config.filesystem?.allowRead ?? []), ...sessionAllowedReadPaths],
+      deny: config.filesystem?.denyRead ?? [],
+    };
   }
 
-  function getEffectiveAllowWrite(cwd: string): string[] {
+  function getEffectiveWrite(cwd: string): {
+    allow: string[];
+    deny: string[];
+  } {
     const config = loadConfig(cwd);
-    return [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths];
+    return {
+      allow: [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths],
+      deny: config.filesystem?.denyWrite ?? [],
+    };
   }
 
   // ── Sandbox reinitialize ────────────────────────────────────────────────────
@@ -790,10 +947,23 @@ export default function (pi: ExtensionAPI) {
     if (!sandboxEnabled || !sandboxInitialized) return;
 
     const domains = extractDomainsFromCommand(event.command);
-    const effectiveDomains = getEffectiveAllowedDomains(ctx.cwd);
+    const { allowed, denied } = getEffectiveDomains(ctx.cwd);
 
     for (const domain of domains) {
-      if (!domainIsAllowed(domain, effectiveDomains)) {
+      const verdict = checkPermission(
+        domain, denied, allowed, domainSpecificity, domainMatchesPattern,
+      );
+      if (verdict === "denied") {
+        return {
+          result: {
+            output: `Blocked: "${domain}" is in deniedDomains.`,
+            exitCode: 1,
+            cancelled: false,
+            truncated: false,
+          },
+        };
+      }
+      if (verdict === "ask") {
         const choice = await promptDomainBlock(ctx, domain);
         if (choice === "abort") {
           return {
@@ -812,22 +982,28 @@ export default function (pi: ExtensionAPI) {
     return { operations: createSandboxedBashOps(userShellPath) };
   });
 
-  // ── tool_call — network pre-check for bash, path policy for read/write/edit
-
-  pi.on("tool_call", async (event, ctx) => {
+    pi.on("tool_call", async (event, ctx) => {
     if (!sandboxEnabled) return;
 
     const config = loadConfig(ctx.cwd);
     if (!config.enabled) return;
 
     const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
-
     // Network pre-check for bash tool calls.
     if (sandboxInitialized && isToolCallEventType("bash", event)) {
       const domains = extractDomainsFromCommand(event.input.command);
-      const effectiveDomains = getEffectiveAllowedDomains(ctx.cwd);
+      const { allowed, denied } = getEffectiveDomains(ctx.cwd);
       for (const domain of domains) {
-        if (!domainIsAllowed(domain, effectiveDomains)) {
+        const verdict = checkPermission(
+          domain, denied, allowed, domainSpecificity, domainMatchesPattern,
+        );
+        if (verdict === "denied") {
+          return {
+            block: true,
+            reason: `Network access to "${domain}" is blocked (in deniedDomains).`,
+          };
+        }
+        if (verdict === "ask") {
           const choice = await promptDomainBlock(ctx, domain);
           if (choice === "abort") {
             return {
@@ -841,16 +1017,24 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Path policy: read tool.
-    //   - If the path is already in effectiveAllowRead, allow silently.
-    //   - Otherwise always prompt, regardless of denyRead.
-    //   - Granting (session or permanent) adds to allowRead, which overrides denyRead.
-    //   - denyRead is never a hard-block on its own — it just sets the default
-    //     denied state that the prompt can override.
+    //   denyRead is a hard block, but a strictly more specific allowRead wins.
     if (isToolCallEventType("read", event)) {
       const filePath = canonicalizePath(event.input.path);
-      const effectiveAllowRead = getEffectiveAllowRead(ctx.cwd);
+      const { allow, deny } = getEffectiveRead(ctx.cwd);
 
-      if (!matchesPattern(filePath, effectiveAllowRead)) {
+      const verdict = checkPermission(
+        filePath, deny, allow, pathSpecificity, matchSinglePath,
+      );
+
+      if (verdict === "denied") {
+        return {
+          block: true,
+          reason:
+            `Sandbox: read access denied for "${filePath}" (in denyRead). ` +
+            `To change this, edit denyRead in:\n  ${projectPath}\n  ${globalPath}`,
+        };
+      }
+      if (verdict === "ask") {
         const choice = await promptReadBlock(ctx, filePath);
         if (choice === "abort") {
           return {
@@ -862,16 +1046,19 @@ export default function (pi: ExtensionAPI) {
         // Allowed — fall through, tool runs.
         return;
       }
+      // verdict === "allowed" → silently proceed
     }
 
-    // Path policy: write/edit — prompt for allowWrite, hard-block for denyWrite.
+    // Path policy: write/edit — denyWrite hard block, allowWrite can punch holes if more specific.
     if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
       const path = canonicalizePath((event.input as { path: string }).path);
-      const allowWrite = getEffectiveAllowWrite(ctx.cwd);
-      const denyWrite = config.filesystem?.denyWrite ?? [];
+      const { allow, deny } = getEffectiveWrite(ctx.cwd);
 
-      // denyWrite takes precedence and is never prompted.
-      if (matchesPattern(path, denyWrite)) {
+      const verdict = checkPermission(
+        path, deny, allow, pathSpecificity, matchSinglePath,
+      );
+
+      if (verdict === "denied") {
         return {
           block: true,
           reason:
@@ -880,7 +1067,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      if (shouldPromptForWrite(path, allowWrite, matchesPattern)) {
+      if (verdict === "ask") {
         const choice = await promptWriteBlock(ctx, path);
         if (choice === "abort") {
           return {
@@ -1105,9 +1292,10 @@ export default function (pi: ExtensionAPI) {
           ? [`  Session write: ${sessionAllowedWritePaths.join(", ")}`]
           : []),
         "",
-        "Note: ALL reads are prompted unless the path is already in allowRead.",
-        "Note: denyRead is not a hard-block — granting a prompt adds to allowRead, overriding denyRead.",
-        "Note: denyWrite takes PRECEDENCE over allowWrite and is never prompted.",
+        "Note: denyRead is a hard block — a more specific allowRead can punch through.",
+        "Note: denyWrite is a hard block — a more specific allowWrite can punch through.",
+        "Note: deniedDomains block takes precedence over allowedDomains.",
+        "Note: Specificity = more path segments or domain labels; wildcards carry no weight.",
       ];
       ctx.ui.notify(lines.join("\n"), "info");
     },
