@@ -8,6 +8,8 @@ Sandboxes pi like this:
 
 When a blocked action is attempted, the user is
 prompted to allow it temporarily or permanently rather than silently failing.
+Direct agent attempts to edit `.pi/sandbox.json` or `~/.pi/agent/sandbox.json`
+are also blocked and redirected back through the same approval flow.
 
 ![demo](./demo/demo.gif)
 
@@ -119,6 +121,12 @@ When a block is triggered, a prompt appears with four options:
 **Session allowances** are held in memory only. They are never written to disk
 and the agent has no way to read or modify them. They are reset when the
 extension reloads or pi restarts.
+
+If the agent later tries to modify `.pi/sandbox.json` or
+`~/.pi/agent/sandbox.json` directly, pi-sandbox blocks that write and reuses
+the most recent blocked read/write/network request as the thing being approved.
+The extension applies the approval itself; the original config-file write stays
+blocked.
 
 ### What is prompted vs. hard-blocked
 

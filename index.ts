@@ -424,6 +424,26 @@ function getConfigPaths(cwd: string): {
   };
 }
 
+function isSandboxConfigPath(filePath: string, cwd: string): boolean {
+  const canonical = canonicalizePath(filePath);
+  const { globalPath, projectPath } = getConfigPaths(cwd);
+  return canonical === canonicalizePath(projectPath) || canonical === canonicalizePath(globalPath);
+}
+
+function bashCommandMentionsSandboxConfig(command: string, cwd: string): boolean {
+  const { globalPath, projectPath } = getConfigPaths(cwd);
+  const mentions = [
+    ".pi/sandbox.json",
+    "~/.pi/agent/sandbox.json",
+    expandPath(projectPath),
+    expandPath(globalPath),
+    canonicalizePath(projectPath),
+    canonicalizePath(globalPath),
+    join(getAgentDir(), "sandbox.json"),
+  ];
+  return mentions.some((mention) => command.includes(mention));
+}
+
 function readOrEmptyConfig(configPath: string): Partial<SandboxConfig> {
   if (!existsSync(configPath)) return {};
   try {
@@ -574,6 +594,13 @@ export default function (pi: ExtensionAPI) {
   const sessionAllowedDomains: string[] = [];
   const sessionAllowedReadPaths: string[] = [];
   const sessionAllowedWritePaths: string[] = [];
+
+  type PendingPermissionRequest =
+    | { kind: "domain"; value: string }
+    | { kind: "read"; value: string }
+    | { kind: "write"; value: string };
+
+  let pendingPermissionRequest: PendingPermissionRequest | null = null;
 
   // ── Effective config helpers ────────────────────────────────────────────────
 
@@ -865,6 +892,67 @@ export default function (pi: ExtensionAPI) {
     await reinitializeSandbox(cwd);
   }
 
+  async function requestDomainAccess(ctx: ExtensionContext, domain: string): Promise<boolean> {
+    pendingPermissionRequest = { kind: "domain", value: domain };
+    const choice = await promptDomainBlock(ctx, domain);
+    if (choice === "abort") return false;
+    await applyDomainChoice(choice, domain, ctx.cwd);
+    pendingPermissionRequest = null;
+    return true;
+  }
+
+  async function requestReadAccess(ctx: ExtensionContext, filePath: string): Promise<boolean> {
+    pendingPermissionRequest = { kind: "read", value: filePath };
+    const choice = await promptReadBlock(ctx, filePath);
+    if (choice === "abort") return false;
+    await applyReadChoice(choice, filePath, ctx.cwd);
+    pendingPermissionRequest = null;
+    return true;
+  }
+
+  async function requestWriteAccess(ctx: ExtensionContext, filePath: string): Promise<boolean> {
+    pendingPermissionRequest = { kind: "write", value: filePath };
+    const choice = await promptWriteBlock(ctx, filePath);
+    if (choice === "abort") return false;
+    await applyWriteChoice(choice, filePath, ctx.cwd);
+    pendingPermissionRequest = null;
+    return true;
+  }
+
+  async function redirectSandboxConfigMutationToPrompt(
+    ctx: ExtensionContext,
+  ): Promise<{ block: true; reason: string }> {
+    const pending = pendingPermissionRequest;
+    if (!pending) {
+      return {
+        block: true,
+        reason:
+          "Sandbox config files cannot be edited directly. Trigger the blocked read/write/network action and use the sandbox approval prompt instead.",
+      };
+    }
+
+    const approved =
+      pending.kind === "domain"
+        ? await requestDomainAccess(ctx, pending.value)
+        : pending.kind === "read"
+          ? await requestReadAccess(ctx, pending.value)
+          : await requestWriteAccess(ctx, pending.value);
+
+    if (!approved) {
+      return {
+        block: true,
+        reason:
+          `Sandbox config files cannot be edited directly. Permission for "${pending.value}" was not approved.`,
+      };
+    }
+
+    return {
+      block: true,
+      reason:
+        `Sandbox permissions updated via prompt for "${pending.value}". Direct edits to sandbox config files remain blocked.`,
+    };
+  }
+
   // ── Bash tool — with write-block detection and retry ───────────────────────
 
   pi.registerTool({
@@ -909,10 +997,8 @@ export default function (pi: ExtensionAPI) {
 
         const blockedPath = extractBlockedWritePath(outputText);
         if (blockedPath) {
-          const choice = await promptWriteBlock(ctx, blockedPath);
-          if (choice !== "abort") {
-            await applyWriteChoice(choice, blockedPath, ctx.cwd);
-
+          const approved = await requestWriteAccess(ctx, blockedPath);
+          if (approved) {
             // Check if denyWrite would still block it even after allowing.
             const config = loadConfig(ctx.cwd);
             const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
@@ -991,6 +1077,22 @@ export default function (pi: ExtensionAPI) {
     if (!config.enabled) return;
 
     const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
+
+    if (
+      (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) &&
+      isSandboxConfigPath((event.input as { path: string }).path, ctx.cwd)
+    ) {
+      return redirectSandboxConfigMutationToPrompt(ctx);
+    }
+
+    if (
+      sandboxInitialized &&
+      isToolCallEventType("bash", event) &&
+      bashCommandMentionsSandboxConfig(event.input.command, ctx.cwd)
+    ) {
+      return redirectSandboxConfigMutationToPrompt(ctx);
+    }
+
     // Network pre-check for bash tool calls.
     if (sandboxInitialized && isToolCallEventType("bash", event)) {
       const domains = extractDomainsFromCommand(event.input.command);
@@ -1006,14 +1108,13 @@ export default function (pi: ExtensionAPI) {
           };
         }
         if (verdict === "ask") {
-          const choice = await promptDomainBlock(ctx, domain);
-          if (choice === "abort") {
+          const approved = await requestDomainAccess(ctx, domain);
+          if (!approved) {
             return {
               block: true,
               reason: `Network access to "${domain}" is blocked (not in allowedDomains).`,
             };
           }
-          await applyDomainChoice(choice, domain, ctx.cwd);
         }
       }
     }
@@ -1037,14 +1138,13 @@ export default function (pi: ExtensionAPI) {
         };
       }
       if (verdict === "ask") {
-        const choice = await promptReadBlock(ctx, filePath);
-        if (choice === "abort") {
+        const approved = await requestReadAccess(ctx, filePath);
+        if (!approved) {
           return {
             block: true,
             reason: `Sandbox: read access denied for "${filePath}"`,
           };
         }
-        await applyReadChoice(choice, filePath, ctx.cwd);
         // Allowed — fall through, tool runs.
         return;
       }
@@ -1070,14 +1170,13 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (verdict === "ask") {
-        const choice = await promptWriteBlock(ctx, path);
-        if (choice === "abort") {
+        const approved = await requestWriteAccess(ctx, path);
+        if (!approved) {
           return {
             block: true,
             reason: `Sandbox: write access denied for "${path}" (not in allowWrite)`,
           };
         }
-        await applyWriteChoice(choice, path, ctx.cwd);
         // Allowed — fall through, tool runs.
         return;
       }
