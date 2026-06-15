@@ -497,8 +497,11 @@ function parseViolationEvent(
   };
 }
 
-function parseFallbackDiagnosticFromOutput(output: string): SandboxDiagnostic | null {
-  const sshFallback = makeSshAgentFallbackDiagnostic(process.env.SSH_AUTH_SOCK, output);
+function parseFallbackDiagnosticFromOutput(
+  command: string,
+  output: string,
+): SandboxDiagnostic | null {
+  const sshFallback = makeSshAgentFallbackDiagnostic(process.env.SSH_AUTH_SOCK, command, output);
   if (sshFallback) return sshFallback;
 
   const blockedPath = extractPathFromOperationNotPermitted(output);
@@ -1391,7 +1394,7 @@ export default function (pi: ExtensionAPI) {
             .filter((item): item is SandboxDiagnostic => item !== null)
             .map((item) => finalizePathDiagnostic(cwd, item));
           if (diagnostics.length === 0) {
-            const fallback = parseFallbackDiagnosticFromOutput(annotatedOutput);
+            const fallback = parseFallbackDiagnosticFromOutput(command, annotatedOutput);
             if (fallback) diagnostics.push(finalizePathDiagnostic(cwd, fallback));
           }
 

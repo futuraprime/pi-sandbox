@@ -150,6 +150,7 @@ describe("makeSshAgentFallbackDiagnostic", () => {
   it("classifies agent operation-not-permitted failures as ssh-auth", () => {
     const diagnostic = makeSshAgentFallbackDiagnostic(
       "/var/run/com.apple.launchd.sock",
+      "ssh-add -l",
       "Error connecting to agent: Operation not permitted",
     );
 
@@ -165,7 +166,31 @@ describe("makeSshAgentFallbackDiagnostic", () => {
     expect(
       makeSshAgentFallbackDiagnostic(
         undefined,
+        "ssh-add -l",
         "Error connecting to agent: Operation not permitted",
+      ),
+    ).toBeNull();
+  });
+
+  it("classifies git publickey failures only for clearly SSH-targeted commands", () => {
+    const diagnostic = makeSshAgentFallbackDiagnostic(
+      "/var/run/com.apple.launchd.sock",
+      "git ls-remote origin",
+      "git@github.com: Permission denied (publickey).",
+    );
+
+    expect(diagnostic).toMatchObject({
+      type: "ssh-auth",
+      target: "current SSH agent",
+    });
+  });
+
+  it("does not classify unrelated publickey text without an SSH-targeted command", () => {
+    expect(
+      makeSshAgentFallbackDiagnostic(
+        "/var/run/com.apple.launchd.sock",
+        "echo permission denied",
+        "Permission denied (publickey).",
       ),
     ).toBeNull();
   });

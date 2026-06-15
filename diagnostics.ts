@@ -116,11 +116,30 @@ export function formatCommandPreview(command: string): string {
   return `${squashed.slice(0, 77)}...`;
 }
 
+function isClearlySshTargetedCommand(command: string): boolean {
+  return (
+    /\bssh\b/.test(command) ||
+    (/\bgit\b/.test(command) &&
+      (/\b(?:ls-remote|fetch|pull|push|clone)\b/.test(command) ||
+        /git@[^\s:]+:/.test(command) ||
+        /ssh:\/\//.test(command)))
+  );
+}
+
 export function makeSshAgentFallbackDiagnostic(
   sshAuthSock: string | undefined,
+  command: string,
   output: string,
 ): SandboxDiagnostic | null {
-  if (!sshAuthSock || !output.includes("Error connecting to agent: Operation not permitted")) {
+  if (!sshAuthSock) return null;
+
+  const explicitAgentFailure = output.includes(
+    "Error connecting to agent: Operation not permitted",
+  );
+  const publicKeyFailure =
+    output.includes("Permission denied (publickey)") && isClearlySshTargetedCommand(command);
+
+  if (!explicitAgentFailure && !publicKeyFailure) {
     return null;
   }
 
