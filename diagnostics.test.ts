@@ -4,6 +4,7 @@ import {
   diagnosticIdentity,
   formatCommandPreview,
   isMateriallyDifferent,
+  makeSshAgentFallbackDiagnostic,
   renderDiagnosticBlock,
   retainIncident,
   selectPrimaryViolation,
@@ -142,5 +143,30 @@ describe("formatCommandPreview", () => {
   it("squashes whitespace and truncates long commands", () => {
     expect(formatCommandPreview("git   push\norigin   main")).toBe("git push origin main");
     expect(formatCommandPreview(`echo ${"x".repeat(120)}`)).toMatch(/\.\.\.$/);
+  });
+});
+
+describe("makeSshAgentFallbackDiagnostic", () => {
+  it("classifies agent operation-not-permitted failures as ssh-auth", () => {
+    const diagnostic = makeSshAgentFallbackDiagnostic(
+      "/var/run/com.apple.launchd.sock",
+      "Error connecting to agent: Operation not permitted",
+    );
+
+    expect(diagnostic).toMatchObject({
+      type: "ssh-auth",
+      target: "current SSH agent",
+      rawTarget: "/var/run/com.apple.launchd.sock",
+      promptable: true,
+    });
+  });
+
+  it("returns null when no agent socket is present", () => {
+    expect(
+      makeSshAgentFallbackDiagnostic(
+        undefined,
+        "Error connecting to agent: Operation not permitted",
+      ),
+    ).toBeNull();
   });
 });

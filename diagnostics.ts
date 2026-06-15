@@ -115,3 +115,21 @@ export function formatCommandPreview(command: string): string {
   if (squashed.length <= 80) return squashed;
   return `${squashed.slice(0, 77)}...`;
 }
+
+export function makeSshAgentFallbackDiagnostic(
+  sshAuthSock: string | undefined,
+  output: string,
+): SandboxDiagnostic | null {
+  if (!sshAuthSock || !output.includes("Error connecting to agent: Operation not permitted")) {
+    return null;
+  }
+
+  return {
+    type: "ssh-auth",
+    target: "current SSH agent",
+    rawTarget: sshAuthSock,
+    rule: "ssh agent socket blocked",
+    promptable: true,
+    action: "allow SSH use for this session",
+  };
+}

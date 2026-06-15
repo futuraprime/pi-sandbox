@@ -89,6 +89,7 @@ import {
   diagnosticIdentity,
   formatCommandPreview,
   isMateriallyDifferent,
+  makeSshAgentFallbackDiagnostic,
   renderDiagnosticBlock,
   retainIncident,
   selectPrimaryViolation,
@@ -497,6 +498,9 @@ function parseViolationEvent(
 }
 
 function parseFallbackDiagnosticFromOutput(output: string): SandboxDiagnostic | null {
+  const sshFallback = makeSshAgentFallbackDiagnostic(process.env.SSH_AUTH_SOCK, output);
+  if (sshFallback) return sshFallback;
+
   const blockedPath = extractPathFromOperationNotPermitted(output);
   if (!blockedPath) return null;
 
