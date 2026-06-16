@@ -5,7 +5,10 @@ import {
   formatCommandPreview,
   isMateriallyDifferent,
   makeSshAgentFallbackDiagnostic,
+  parseDiagnosticBlock,
   renderDiagnosticBlock,
+  renderDiagnosticNotice,
+  renderDiagnosticSummaryLines,
   retainIncident,
   selectPrimaryViolation,
   trimIncidents,
@@ -124,6 +127,29 @@ describe("renderDiagnosticBlock", () => {
     expect(block).toContain("choice: ssh-session");
     expect(block).toContain("final_outcome: success");
     expect(block).toContain("other_violations: 1");
+  });
+
+  it("parses a trailing diagnostic block and produces a cleaner notice", () => {
+    const block = renderDiagnosticBlock(
+      makeIncident({
+        promptShown: true,
+        promptChoice: "ssh-session",
+        retried: true,
+        finalOutcome: "success",
+        primaryViolation: makeDiagnostic({
+          type: "ssh-auth",
+          target: "current SSH agent",
+          rule: "ssh agent socket blocked",
+          action: "allow SSH use for this session",
+        }),
+      }),
+    );
+
+    const parsed = parseDiagnosticBlock(`git output\n\n${block}`);
+    expect(parsed?.visibleText).toBe("git output");
+    expect(parsed?.data.type).toBe("ssh-auth");
+    expect(renderDiagnosticNotice(parsed!.data)).toContain("/sandbox-debug");
+    expect(renderDiagnosticSummaryLines(parsed!.data)).toContain("Type: SSH auth");
   });
 });
 

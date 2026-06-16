@@ -34,6 +34,24 @@ export interface SandboxIncident {
   configMutation: "none" | ".pi/sandbox.json" | "~/.pi/agent/sandbox.json";
 }
 
+export interface SandboxDiagnosticBlockData {
+  type: SandboxDiagnosticType;
+  target: string;
+  rule: string;
+  prompted: boolean;
+  choice: SandboxPromptChoice;
+  retried: boolean;
+  finalOutcome: "success" | "failure";
+  otherViolations: number;
+  action: string;
+}
+
+export interface ParsedSandboxDiagnosticBlock {
+  data: SandboxDiagnosticBlockData;
+  block: string;
+  visibleText: string;
+}
+
 const PRIMARY_PRIORITY: Record<SandboxDiagnosticType, number> = {
   "ssh-auth": 0,
   read: 1,
@@ -66,22 +84,131 @@ export function isMateriallyDifferent(
   return diagnosticIdentity(a) !== diagnosticIdentity(b);
 }
 
-export function renderDiagnosticBlock(incident: SandboxIncident): string | null {
+export function getDiagnosticBlockData(
+  incident: SandboxIncident,
+): SandboxDiagnosticBlockData | null {
   if (!incident.attributed || !incident.primaryViolation) return null;
   const primary = incident.primaryViolation;
+  return {
+    type: primary.type,
+    target: primary.target,
+    rule: primary.rule,
+    prompted: incident.promptShown,
+    choice: incident.promptChoice,
+    retried: incident.retried,
+    finalOutcome: incident.finalOutcome,
+    otherViolations: Math.max(0, incident.violations.length - 1),
+    action: primary.action,
+  };
+}
+
+export function renderDiagnosticBlockData(data: SandboxDiagnosticBlockData): string {
   return [
     "<sandbox_diagnostic>",
-    `type: ${primary.type}`,
-    `target: ${primary.target}`,
-    `rule: ${primary.rule}`,
-    `prompted: ${incident.promptShown ? "yes" : "no"}`,
-    `choice: ${incident.promptChoice}`,
-    `retried: ${incident.retried ? "yes" : "no"}`,
-    `final_outcome: ${incident.finalOutcome}`,
-    `other_violations: ${Math.max(0, incident.violations.length - 1)}`,
-    `action: ${primary.action}`,
+    `type: ${data.type}`,
+    `target: ${data.target}`,
+    `rule: ${data.rule}`,
+    `prompted: ${data.prompted ? "yes" : "no"}`,
+    `choice: ${data.choice}`,
+    `retried: ${data.retried ? "yes" : "no"}`,
+    `final_outcome: ${data.finalOutcome}`,
+    `other_violations: ${data.otherViolations}`,
+    `action: ${data.action}`,
     "</sandbox_diagnostic>",
   ].join("\n");
+}
+
+export function renderDiagnosticBlock(incident: SandboxIncident): string | null {
+  const data = getDiagnosticBlockData(incident);
+  return data ? renderDiagnosticBlockData(data) : null;
+}
+
+export function parseDiagnosticBlock(text: string): ParsedSandboxDiagnosticBlock | null {
+  const match = text.match(/\n*<sandbox_diagnostic>\n([\s\S]*?)\n<\/sandbox_diagnostic>\s*$/);
+  if (!match) return null;
+
+  const body = match[1] ?? "";
+  const fields = new Map<string, string>();
+  for (const line of body.split("\n")) {
+    const separator = line.indexOf(":");
+    if (separator === -1) continue;
+    const key = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1).trim();
+    fields.set(key, value);
+  }
+
+  const type = fields.get("type");
+  const target = fields.get("target");
+  const rule = fields.get("rule");
+  const choice = fields.get("choice") as SandboxPromptChoice | undefined;
+  const finalOutcome = fields.get("final_outcome") as "success" | "failure" | undefined;
+  const action = fields.get("action");
+  if (!type || !target || !rule || !choice || !finalOutcome || !action) return null;
+
+  const data: SandboxDiagnosticBlockData = {
+    type: type as SandboxDiagnosticType,
+    target,
+    rule,
+    prompted: fields.get("prompted") === "yes",
+    choice,
+    retried: fields.get("retried") === "yes",
+    finalOutcome,
+    otherViolations: Number.parseInt(fields.get("other_violations") ?? "0", 10) || 0,
+    action,
+  };
+
+  return {
+    data,
+    block: match[0].trim(),
+    visibleText: text.slice(0, match.index).replace(/\s+$/, ""),
+  };
+}
+
+function diagnosticTypeLabel(type: SandboxDiagnosticType): string {
+  switch (type) {
+    case "ssh-auth":
+      return "SSH auth";
+    case "read":
+      return "read access";
+    case "write":
+      return "write access";
+    case "network":
+      return "network access";
+    case "ambiguous":
+      return "sandbox intervention";
+  }
+}
+
+function diagnosticChoiceLabel(choice: SandboxPromptChoice): string {
+  switch (choice) {
+    case "ssh-session":
+      return "allowed for this session";
+    case "session":
+      return "allowed for this session";
+    case "project":
+      return "allowed for this project";
+    case "global":
+      return "allowed for all projects";
+    case "abort":
+      return "left blocked";
+    case "none":
+      return "not approved";
+  }
+}
+
+export function renderDiagnosticNotice(data: SandboxDiagnosticBlockData): string {
+  const parts = [diagnosticTypeLabel(data.type)];
+  if (data.prompted) {
+    parts.push(diagnosticChoiceLabel(data.choice));
+  }
+  if (data.retried) {
+    parts.push(
+      data.finalOutcome === "success" ? "retried successfully" : "retried but still failed",
+    );
+  } else {
+    parts.push(data.finalOutcome === "success" ? "completed" : "blocked or failed");
+  }
+  return `[sandbox: ${parts.join("; ")} — /sandbox-debug for details]`;
 }
 
 export function retainIncident(incident: SandboxIncident): boolean {
@@ -108,6 +235,20 @@ export function summarizePromptChoice(choice: SandboxPromptChoice): string {
     case "none":
       return "none";
   }
+}
+
+export function renderDiagnosticSummaryLines(data: SandboxDiagnosticBlockData): string[] {
+  return [
+    `Type: ${diagnosticTypeLabel(data.type)}`,
+    `Target: ${data.target}`,
+    `Rule: ${data.rule}`,
+    `Prompted: ${data.prompted ? "yes" : "no"}`,
+    `Choice: ${data.choice}`,
+    `Retried: ${data.retried ? "yes" : "no"}`,
+    `Final outcome: ${data.finalOutcome}`,
+    `Other violations: ${data.otherViolations}`,
+    `Action: ${data.action}`,
+  ];
 }
 
 export function formatCommandPreview(command: string): string {

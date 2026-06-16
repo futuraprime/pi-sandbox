@@ -171,23 +171,17 @@ matching, so `.` covers the entire current working directory.
 
 ### Bash diagnostics and `/sandbox-debug`
 
-For clearly attributed bash or `!cmd` violations, pi-sandbox appends a compact tagged block to the command result:
+For clearly attributed sandboxed `bash` tool results, pi-sandbox now keeps the machine-readable `<sandbox_diagnostic>` block in the tool result content for the model, but hides that raw block in Pi's TUI. Users see a compact “Sandbox intervention” summary instead, with the normal command output available by expanding the tool result.
+
+For interactive `!cmd` results, pi-sandbox shows a one-line sandbox notice such as:
 
 ```text
-<sandbox_diagnostic>
-type: ssh-auth
-target: current SSH agent
-rule: ssh agent socket blocked
-prompted: yes
-choice: ssh-session
-retried: yes
-final_outcome: success
-other_violations: 0
-action: allow SSH use for this session
-</sandbox_diagnostic>
+[sandbox: SSH auth; allowed for this session; retried successfully — /sandbox-debug for details]
 ```
 
-pi-sandbox only emits this when it can clearly attribute a sandbox intervention to the command. The normal command output remains unchanged otherwise.
+When `!cmd` output is included in conversation context, pi-sandbox also records the raw `<sandbox_diagnostic>` block as a hidden session message so the agent can still inspect it later without showing it to the user by default.
+
+pi-sandbox only emits these diagnostics when it can clearly attribute a sandbox intervention to the command. Normal command output remains unchanged otherwise.
 
 `/sandbox-debug` shows the last 5 current-session bash/`!cmd` incidents, newest first, including:
 
@@ -214,7 +208,7 @@ Suggested manual checks:
 1. **Blocked network precheck**
    - Run a command that hits a host outside `allowedDomains`.
    - Confirm the network prompt appears.
-   - Confirm the result includes `<sandbox_diagnostic>`.
+   - Confirm the TUI shows a compact sandbox summary instead of a raw diagnostic block.
 
 2. **Blocked read diagnostic**
    - Run a command that tries to read a denied path such as `~/.ssh/...`.
@@ -223,7 +217,7 @@ Suggested manual checks:
 3. **SSH auth prompt flow**
    - With `SSH_AUTH_SOCK` set, run an SSH/Git command that needs the agent.
    - Confirm pi-sandbox offers the session-only “Allow SSH use” prompt.
-   - Confirm a successful retry still appends `<sandbox_diagnostic>` with `final_outcome: success`.
+   - Confirm a successful retry shows a compact sandbox summary in the UI while preserving the underlying diagnostic metadata.
 
 4. **Debug incident history**
    - Run `/sandbox-debug`.

@@ -80,21 +80,27 @@ import {
   createBashToolDefinition,
   getAgentDir,
   getShellConfig,
+  isBashToolResult,
   isToolCallEventType,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { matchesKey, Key, truncateToWidth } from "@earendil-works/pi-tui";
+import { Container, matchesKey, Key, Text, truncateToWidth } from "@earendil-works/pi-tui";
 
 import {
   diagnosticIdentity,
   formatCommandPreview,
+  getDiagnosticBlockData,
   isMateriallyDifferent,
   makeSshAgentFallbackDiagnostic,
+  parseDiagnosticBlock,
   renderDiagnosticBlock,
+  renderDiagnosticNotice,
+  renderDiagnosticSummaryLines,
   retainIncident,
   selectPrimaryViolation,
   trimIncidents,
   type SandboxDiagnostic,
+  type SandboxDiagnosticBlockData,
   type SandboxIncident,
   type SandboxPromptChoice,
 } from "./diagnostics.js";
@@ -145,6 +151,21 @@ type PendingPermissionRequest =
   | { kind: "write"; value: string };
 
 type BashIncidentSource = "bash" | "user_bash";
+
+interface SandboxedBashResultDetails {
+  truncation?: {
+    truncated: boolean;
+    totalLines: number;
+    outputLines: number;
+    outputBytes: number;
+    truncatedBy?: "lines" | "bytes";
+    maxBytes?: number;
+    lastLinePartial?: boolean;
+  };
+  fullOutputPath?: string;
+  sandboxDiagnostic?: SandboxDiagnosticBlockData;
+  sandboxVisibleText?: string;
+}
 
 function loadConfig(cwd: string): SandboxConfig {
   const projectConfigPath = join(cwd, ".pi", "sandbox.json");
@@ -548,6 +569,58 @@ function addUniqueDiagnostics(
 function emitOutput(onData: ((data: Buffer) => void) | undefined, text: string): void {
   if (!onData || text.length === 0) return;
   onData(Buffer.from(text));
+}
+
+function renderSandboxedBashResult(
+  result: { content?: Array<{ type: string; text?: string }>; details?: unknown },
+  expanded: boolean,
+  theme: ExtensionContext["ui"]["theme"],
+): Container {
+  const details = (result.details ?? {}) as SandboxedBashResultDetails;
+  const diagnostic = details.sandboxDiagnostic;
+  if (!diagnostic) return new Container();
+  const textContent = result.content?.find((content) => content.type === "text");
+  const output =
+    details.sandboxVisibleText ?? (textContent?.type === "text" ? (textContent.text ?? "") : "");
+
+  const container = new Container();
+  const notice = renderDiagnosticNotice(diagnostic);
+  container.addChild(
+    new Text(
+      theme.fg("warning", theme.bold("Sandbox intervention")) + " " + theme.fg("muted", notice),
+      0,
+      0,
+    ),
+  );
+
+  if (expanded) {
+    const detailLines = renderDiagnosticSummaryLines(diagnostic)
+      .map((line) => theme.fg("dim", line))
+      .join("\n");
+    container.addChild(new Text(`\n${detailLines}`, 0, 0));
+
+    const trimmedOutput = output.trim();
+    if (trimmedOutput) {
+      const renderedOutput = trimmedOutput
+        .split("\n")
+        .map((line) => theme.fg("toolOutput", line))
+        .join("\n");
+      container.addChild(new Text(`\n${renderedOutput}`, 0, 0));
+    }
+
+    const warnings: string[] = [];
+    if (details.fullOutputPath) warnings.push(`Full output: ${details.fullOutputPath}`);
+    if (details.truncation?.truncated) warnings.push("Output truncated");
+    if (warnings.length > 0) {
+      container.addChild(new Text(`\n${theme.fg("warning", `[${warnings.join(". ")}]`)}`, 0, 0));
+    }
+  } else {
+    container.addChild(
+      new Text(theme.fg("dim", "Expand to view command output and full diagnostic details."), 0, 0),
+    );
+  }
+
+  return container;
 }
 
 // ── Path pattern matching ─────────────────────────────────────────────────────
@@ -1308,6 +1381,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     source: BashIncidentSource,
     shellPath?: string,
+    options?: { recordDiagnosticInContext?: boolean },
   ): BashOperations {
     const baseOps = createSandboxedBashOps(shellPath);
 
@@ -1347,10 +1421,21 @@ export default function (pi: ExtensionAPI) {
 
             if (verdict === "denied") {
               incident.finalOutcome = "failure";
+              const diagnosticBlock = renderDiagnosticBlock(incident);
+              const diagnosticData = getDiagnosticBlockData(incident);
               emitOutput(
                 originalOnData,
-                `Blocked: "${domain}" is in deniedDomains.\n${renderDiagnosticBlock(incident) ?? ""}\n`,
+                source === "user_bash" && diagnosticData
+                  ? `Blocked: "${domain}" is in deniedDomains.\n${renderDiagnosticNotice(diagnosticData)}\n`
+                  : `Blocked: "${domain}" is in deniedDomains.\n${diagnosticBlock ?? ""}\n`,
               );
+              if (source === "user_bash" && options?.recordDiagnosticInContext && diagnosticBlock) {
+                pi.sendMessage({
+                  customType: "sandbox-diagnostic",
+                  content: diagnosticBlock,
+                  display: false,
+                });
+              }
               storeIncident(incident);
               return { exitCode: 1 };
             }
@@ -1359,10 +1444,21 @@ export default function (pi: ExtensionAPI) {
             lastPrompted = diagnostic;
             if (choice === "abort" || choice === "none") {
               incident.finalOutcome = "failure";
+              const diagnosticBlock = renderDiagnosticBlock(incident);
+              const diagnosticData = getDiagnosticBlockData(incident);
               emitOutput(
                 originalOnData,
-                `Blocked: "${domain}" is not in allowedDomains. Use /sandbox to review your config.\n${renderDiagnosticBlock(incident) ?? ""}\n`,
+                source === "user_bash" && diagnosticData
+                  ? `Blocked: "${domain}" is not in allowedDomains. Use /sandbox to review your config.\n${renderDiagnosticNotice(diagnosticData)}\n`
+                  : `Blocked: "${domain}" is not in allowedDomains. Use /sandbox to review your config.\n${diagnosticBlock ?? ""}\n`,
               );
+              if (source === "user_bash" && options?.recordDiagnosticInContext && diagnosticBlock) {
+                pi.sendMessage({
+                  customType: "sandbox-diagnostic",
+                  content: diagnosticBlock,
+                  display: false,
+                });
+              }
               storeIncident(incident);
               return { exitCode: 1 };
             }
@@ -1422,8 +1518,22 @@ export default function (pi: ExtensionAPI) {
           }
 
           const block = renderDiagnosticBlock(incident);
-          if (block && (incident.attributed || precheckBlocked))
-            emitOutput(originalOnData, `\n${block}\n`);
+          if (block && (incident.attributed || precheckBlocked)) {
+            if (source === "user_bash") {
+              const diagnosticData = getDiagnosticBlockData(incident);
+              if (diagnosticData)
+                emitOutput(originalOnData, `\n${renderDiagnosticNotice(diagnosticData)}\n`);
+              if (options?.recordDiagnosticInContext) {
+                pi.sendMessage({
+                  customType: "sandbox-diagnostic",
+                  content: block,
+                  display: false,
+                });
+              }
+            } else {
+              emitOutput(originalOnData, `\n${block}\n`);
+            }
+          }
           storeIncident(incident);
           return { exitCode: finalExitCode };
         }
@@ -1447,14 +1557,42 @@ export default function (pi: ExtensionAPI) {
       });
       return sandboxedBash.execute(id, params, signal, onUpdate, ctx);
     },
+    renderResult(result, options, theme, context) {
+      const details = (result.details ?? {}) as SandboxedBashResultDetails;
+      if (!details.sandboxDiagnostic) {
+        return localBash.renderResult
+          ? localBash.renderResult(result as never, options as never, theme, context)
+          : new Text("", 0, 0);
+      }
+      return renderSandboxedBashResult(result, options.expanded, theme);
+    },
   });
 
   // ── user_bash — instrumented sandboxed execution ──────────────────────────
 
-  pi.on("user_bash", async (_event, ctx) => {
+  pi.on("user_bash", async (event, ctx) => {
     if (!sandboxEnabled || !sandboxInitialized) return;
     return {
-      operations: createInstrumentedSandboxedBashOps(ctx, "user_bash", userShellPath),
+      operations: createInstrumentedSandboxedBashOps(ctx, "user_bash", userShellPath, {
+        recordDiagnosticInContext: !event.excludeFromContext,
+      }),
+    };
+  });
+
+  pi.on("tool_result", async (event) => {
+    if (!isBashToolResult(event)) return;
+    const textContent = event.content.find((content) => content.type === "text");
+    if (!textContent || textContent.type !== "text") return;
+
+    const parsed = parseDiagnosticBlock(textContent.text);
+    if (!parsed) return;
+
+    return {
+      details: {
+        ...(event.details as Record<string, unknown> | undefined),
+        sandboxDiagnostic: parsed.data,
+        sandboxVisibleText: parsed.visibleText,
+      },
     };
   });
 
