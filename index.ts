@@ -104,6 +104,12 @@ import {
   type SandboxIncident,
   type SandboxPromptChoice,
 } from "./diagnostics.js";
+import {
+  describeSandboxCommandResult,
+  formatSandboxCommandUsage,
+  parseSandboxCommand,
+  updateSandboxConfigFile,
+} from "./sandbox-command.js";
 
 interface SandboxConfig extends SandboxRuntimeConfig {
   enabled?: boolean;
@@ -1852,15 +1858,30 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("sandbox", {
-    description: "Show sandbox configuration",
-    handler: async (_args, ctx) => {
+    description: "Show or update sandbox configuration",
+    handler: async (args, ctx) => {
+      let parsedCommand;
+      try {
+        parsedCommand = parseSandboxCommand(args);
+      } catch {
+        ctx.ui.notify(formatSandboxCommandUsage(), "error");
+        return;
+      }
+
+      const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
+      if (parsedCommand) {
+        const result = updateSandboxConfigFile(projectPath, parsedCommand);
+        if (sandboxEnabled) await reinitializeSandbox(ctx.cwd);
+        ctx.ui.notify(`${describeSandboxCommandResult(result)}\nUpdated: ${projectPath}`, "info");
+        return;
+      }
+
       if (!sandboxEnabled) {
         ctx.ui.notify("Sandbox is disabled", "info");
         return;
       }
 
       const config = loadConfig(ctx.cwd);
-      const { globalPath, projectPath } = getConfigPaths(ctx.cwd);
 
       const lines = [
         "Sandbox Configuration",

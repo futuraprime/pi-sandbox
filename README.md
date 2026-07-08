@@ -101,9 +101,15 @@ Note below that pi-sandbox treats reads and writes differently, and that broad U
 #### Usage
 
 ```
-pi --no-sandbox          disable sandboxing for the session
-/sandbox                 show current configuration and session allowances
-/sandbox-debug           show recent sandbox incidents for bash and !cmd
+pi --no-sandbox                  disable sandboxing for the session
+/sandbox                         show current configuration and session allowances
+/sandbox allowRead <path>        add a project-local filesystem.allowRead entry
+/sandbox denyRead <path>         add a project-local filesystem.denyRead entry
+/sandbox allowWrite <path>       add a project-local filesystem.allowWrite entry
+/sandbox denyWrite <path>        add a project-local filesystem.denyWrite entry
+/sandbox allowedDomains <domain> add a project-local network.allowedDomains entry
+/sandbox deniedDomains <domain>  add a project-local network.deniedDomains entry
+/sandbox-debug                   show recent sandbox incidents for bash and !cmd
 ```
 
 ## What it does
