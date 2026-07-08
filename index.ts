@@ -62,11 +62,7 @@
  * Linux also requires: bubblewrap, socat, ripgrep
  */
 
-import type {
-  AgentToolResult,
-  ExtensionAPI,
-  ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
@@ -77,16 +73,37 @@ import {
   SandboxManager,
   type SandboxAskCallback,
   type SandboxRuntimeConfig,
+  type SandboxViolationEvent,
 } from "@carderne/sandbox-runtime";
 import {
   type BashOperations,
   createBashToolDefinition,
   getAgentDir,
   getShellConfig,
+  isBashToolResult,
   isToolCallEventType,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { matchesKey, Key, truncateToWidth } from "@earendil-works/pi-tui";
+import { Container, matchesKey, Key, Text, truncateToWidth } from "@earendil-works/pi-tui";
+
+import {
+  diagnosticIdentity,
+  formatCommandPreview,
+  getDiagnosticBlockData,
+  isMateriallyDifferent,
+  makeSshAgentFallbackDiagnostic,
+  parseDiagnosticBlock,
+  renderDiagnosticBlock,
+  renderDiagnosticNotice,
+  renderDiagnosticSummaryLines,
+  retainIncident,
+  selectPrimaryViolation,
+  trimIncidents,
+  type SandboxDiagnostic,
+  type SandboxDiagnosticBlockData,
+  type SandboxIncident,
+  type SandboxPromptChoice,
+} from "./diagnostics.js";
 
 interface SandboxConfig extends SandboxRuntimeConfig {
   enabled?: boolean;
@@ -116,6 +133,39 @@ const DEFAULT_CONFIG: SandboxConfig = {
     denyWrite: [".env", ".env.*", "*.pem", "*.key"],
   },
 };
+
+const MAX_DEBUG_INCIDENTS = 5;
+const MAX_PROMPT_ATTEMPTS = 2;
+const AUTH_ADJACENT_READ_PATTERNS = [
+  "~/.ssh",
+  "~/.gitconfig",
+  "~/.git-credentials",
+  "~/.config/gh",
+  "~/.config/git",
+];
+
+type PermissionChoice = "session" | "project" | "global" | "abort";
+type PendingPermissionRequest =
+  | { kind: "domain"; value: string }
+  | { kind: "read"; value: string }
+  | { kind: "write"; value: string };
+
+type BashIncidentSource = "bash" | "user_bash";
+
+interface SandboxedBashResultDetails {
+  truncation?: {
+    truncated: boolean;
+    totalLines: number;
+    outputLines: number;
+    outputBytes: number;
+    truncatedBy?: "lines" | "bytes";
+    maxBytes?: number;
+    lastLinePartial?: boolean;
+  };
+  fullOutputPath?: string;
+  sandboxDiagnostic?: SandboxDiagnosticBlockData;
+  sandboxVisibleText?: string;
+}
 
 function loadConfig(cwd: string): SandboxConfig {
   const projectConfigPath = join(cwd, ".pi", "sandbox.json");
@@ -151,10 +201,7 @@ function dedup<T>(arr: T[]): T[] {
 }
 
 /** Concatenate + deduplicate arrays from two configs for a given key. */
-function mergeArray<T>(
-  base: T[] | undefined,
-  overrides: T[] | undefined,
-): T[] {
+function mergeArray<T>(base: T[] | undefined, overrides: T[] | undefined): T[] {
   const merged: T[] = [];
   if (base) merged.push(...base);
   if (overrides) merged.push(...overrides);
@@ -184,13 +231,11 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
   if (base.network || overrides.network) {
     result.network = {
       ...result.network,
-      allowedDomains: mergeArray(
-        base.network?.allowedDomains,
-        overrides.network?.allowedDomains,
-      ),
-      deniedDomains: mergeArray(
-        base.network?.deniedDomains,
-        overrides.network?.deniedDomains,
+      allowedDomains: mergeArray(base.network?.allowedDomains, overrides.network?.allowedDomains),
+      deniedDomains: mergeArray(base.network?.deniedDomains, overrides.network?.deniedDomains),
+      allowUnixSockets: mergeArray(
+        base.network?.allowUnixSockets,
+        overrides.network?.allowUnixSockets,
       ),
     };
   }
@@ -199,22 +244,10 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
   if (base.filesystem || overrides.filesystem) {
     result.filesystem = {
       ...result.filesystem,
-      allowRead: mergeArray(
-        base.filesystem?.allowRead,
-        overrides.filesystem?.allowRead,
-      ),
-      denyRead: mergeArray(
-        base.filesystem?.denyRead,
-        overrides.filesystem?.denyRead,
-      ),
-      allowWrite: mergeArray(
-        base.filesystem?.allowWrite,
-        overrides.filesystem?.allowWrite,
-      ),
-      denyWrite: mergeArray(
-        base.filesystem?.denyWrite,
-        overrides.filesystem?.denyWrite,
-      ),
+      allowRead: mergeArray(base.filesystem?.allowRead, overrides.filesystem?.allowRead),
+      denyRead: mergeArray(base.filesystem?.denyRead, overrides.filesystem?.denyRead),
+      allowWrite: mergeArray(base.filesystem?.allowWrite, overrides.filesystem?.allowWrite),
+      denyWrite: mergeArray(base.filesystem?.denyWrite, overrides.filesystem?.denyWrite),
     };
   }
 
@@ -329,12 +362,20 @@ export function shouldPromptForWrite(
 }
 
 function extractDomainsFromCommand(command: string): string[] {
-  const urlRegex = /https?:\/\/([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
   const domains = new Set<string>();
-  let match;
-  while ((match = urlRegex.exec(command)) !== null) {
-    domains.add(match[1]);
+  const patterns = [
+    /https?:\/\/([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g,
+    /ssh:\/\/(?:[^@\s]+@)?([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g,
+    /\b(?:[^@\s]+)@([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}):/g,
+  ];
+
+  for (const regex of patterns) {
+    let match;
+    while ((match = regex.exec(command)) !== null) {
+      domains.add(match[1]);
+    }
   }
+
   return [...domains];
 }
 
@@ -361,12 +402,225 @@ function createNetworkAskCallback(allowedDomains: string[]): SandboxAskCallback 
 
 // ── Output analysis ───────────────────────────────────────────────────────────
 
-/** Extract a path from a bash "Operation not permitted" OS sandbox error. */
-function extractBlockedWritePath(output: string): string | null {
-  const match = output.match(
-    /(?:\/bin\/bash|bash|sh): (?:line \d: )?(\/[^\s:]+): Operation not permitted/,
+function extractPathFromOperationNotPermitted(output: string): string | null {
+  const patterns = [
+    /(?:\/bin\/bash|bash|sh|git|ssh|cat): (?:line \d: )?(\/[^\s:"]+): Operation not permitted/,
+    /Load key "([^"]+)": Operation not permitted/,
+    /Could not open "([^"]+)": Operation not permitted/,
+    /open ([^:]+): Operation not permitted/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = output.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+
+  return null;
+}
+
+function extractPathFromViolationRemainder(remainder: string): string | null {
+  const quoted = remainder.match(/"([^"]+)"/);
+  if (quoted?.[1]) return quoted[1];
+
+  const absolute = remainder.match(/(\/[A-Za-z0-9._~\-/]+)/);
+  if (absolute?.[1]) return absolute[1];
+
+  return null;
+}
+
+function isAuthAdjacentReadPath(filePath: string): boolean {
+  const canonical = canonicalizePath(filePath);
+  return AUTH_ADJACENT_READ_PATTERNS.some((pattern) => matchesPattern(canonical, [pattern]));
+}
+
+function makeReadAction(filePath: string, rule: string): string {
+  if (isAuthAdjacentReadPath(filePath)) {
+    return "prefer SSH agent delegation; avoid broad allowRead";
+  }
+  return rule === "denyRead" ? "blocked by denyRead; change policy" : "allow and retry";
+}
+
+function makeWriteAction(rule: string): string {
+  return rule === "denyWrite" ? "blocked by denyWrite; change policy" : "allow and retry";
+}
+
+function makeNetworkAction(rule: string): string {
+  return rule === "deniedDomains"
+    ? "blocked by deniedDomains; change policy"
+    : "host not allowed; approve network access";
+}
+
+function parseViolationEvent(
+  violation: SandboxViolationEvent,
+  sshAuthSock: string | undefined,
+): SandboxDiagnostic | null {
+  const line = violation.line.trim();
+
+  if (sshAuthSock && line.includes(sshAuthSock)) {
+    return {
+      type: "ssh-auth",
+      target: "current SSH agent",
+      rawTarget: sshAuthSock,
+      rule: "ssh agent socket blocked",
+      promptable: true,
+      action: "allow SSH use for this session",
+    };
+  }
+
+  const readMatch = line.match(/\b(file-read[^\s]*)\s+(.+)$/);
+  if (readMatch?.[2]) {
+    const filePath = extractPathFromViolationRemainder(readMatch[2]);
+    if (filePath) {
+      return {
+        type: "read",
+        target: filePath,
+        rawTarget: filePath,
+        rule: "denyRead",
+        promptable: false,
+        action: makeReadAction(filePath, "denyRead"),
+      };
+    }
+  }
+
+  const writeMatch = line.match(/\b(file-write[^\s]*)\s+(.+)$/);
+  if (writeMatch?.[2]) {
+    const filePath = extractPathFromViolationRemainder(writeMatch[2]);
+    if (filePath) {
+      return {
+        type: "write",
+        target: filePath,
+        rawTarget: filePath,
+        rule: "allowWrite",
+        promptable: true,
+        action: makeWriteAction("allowWrite"),
+      };
+    }
+  }
+
+  const networkHost = line.match(/\b([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})(?::\d+)?\b/);
+  if (line.includes("network") && networkHost?.[1]) {
+    return {
+      type: "network",
+      target: networkHost[1],
+      rawTarget: networkHost[1],
+      rule: "allowedDomains",
+      promptable: true,
+      action: makeNetworkAction("allowedDomains"),
+    };
+  }
+
+  return {
+    type: "ambiguous",
+    target: "sandbox violation",
+    rule: "runtime violation",
+    promptable: false,
+    action: "ambiguous; inspect /sandbox-debug",
+  };
+}
+
+function parseFallbackDiagnosticFromOutput(
+  command: string,
+  output: string,
+): SandboxDiagnostic | null {
+  const sshFallback = makeSshAgentFallbackDiagnostic(process.env.SSH_AUTH_SOCK, command, output);
+  if (sshFallback) return sshFallback;
+
+  const blockedPath = extractPathFromOperationNotPermitted(output);
+  if (!blockedPath) return null;
+
+  const looksLikeRead =
+    output.includes("Load key") || output.includes("Could not open") || output.includes("cat:");
+  if (looksLikeRead) {
+    return {
+      type: "read",
+      target: blockedPath,
+      rawTarget: blockedPath,
+      rule: "denyRead",
+      promptable: false,
+      action: makeReadAction(blockedPath, "denyRead"),
+    };
+  }
+
+  return {
+    type: "write",
+    target: blockedPath,
+    rawTarget: blockedPath,
+    rule: "allowWrite",
+    promptable: true,
+    action: makeWriteAction("allowWrite"),
+  };
+}
+
+function addUniqueDiagnostics(
+  existing: SandboxDiagnostic[],
+  additions: SandboxDiagnostic[],
+): SandboxDiagnostic[] {
+  const seen = new Set(existing.map((item) => diagnosticIdentity(item)));
+  const next = [...existing];
+  for (const diagnostic of additions) {
+    const identity = diagnosticIdentity(diagnostic);
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    next.push(diagnostic);
+  }
+  return next;
+}
+
+function emitOutput(onData: ((data: Buffer) => void) | undefined, text: string): void {
+  if (!onData || text.length === 0) return;
+  onData(Buffer.from(text));
+}
+
+function renderSandboxedBashResult(
+  result: { content?: Array<{ type: string; text?: string }>; details?: unknown },
+  expanded: boolean,
+  theme: ExtensionContext["ui"]["theme"],
+): Container {
+  const details = (result.details ?? {}) as SandboxedBashResultDetails;
+  const diagnostic = details.sandboxDiagnostic;
+  if (!diagnostic) return new Container();
+  const textContent = result.content?.find((content) => content.type === "text");
+  const output =
+    details.sandboxVisibleText ?? (textContent?.type === "text" ? (textContent.text ?? "") : "");
+
+  const container = new Container();
+  const notice = renderDiagnosticNotice(diagnostic);
+  container.addChild(
+    new Text(
+      theme.fg("warning", theme.bold("Sandbox intervention")) + " " + theme.fg("muted", notice),
+      0,
+      0,
+    ),
   );
-  return match ? match[1] : null;
+
+  if (expanded) {
+    const detailLines = renderDiagnosticSummaryLines(diagnostic)
+      .map((line) => theme.fg("dim", line))
+      .join("\n");
+    container.addChild(new Text(`\n${detailLines}`, 0, 0));
+
+    const trimmedOutput = output.trim();
+    if (trimmedOutput) {
+      const renderedOutput = trimmedOutput
+        .split("\n")
+        .map((line) => theme.fg("toolOutput", line))
+        .join("\n");
+      container.addChild(new Text(`\n${renderedOutput}`, 0, 0));
+    }
+
+    const warnings: string[] = [];
+    if (details.fullOutputPath) warnings.push(`Full output: ${details.fullOutputPath}`);
+    if (details.truncation?.truncated) warnings.push("Output truncated");
+    if (warnings.length > 0) {
+      container.addChild(new Text(`\n${theme.fg("warning", `[${warnings.join(". ")}]`)}`, 0, 0));
+    }
+  } else {
+    container.addChild(
+      new Text(theme.fg("dim", "Expand to view command output and full diagnostic details."), 0, 0),
+    );
+  }
+
+  return container;
 }
 
 // ── Path pattern matching ─────────────────────────────────────────────────────
@@ -594,11 +848,9 @@ export default function (pi: ExtensionAPI) {
   const sessionAllowedDomains: string[] = [];
   const sessionAllowedReadPaths: string[] = [];
   const sessionAllowedWritePaths: string[] = [];
-
-  type PendingPermissionRequest =
-    | { kind: "domain"; value: string }
-    | { kind: "read"; value: string }
-    | { kind: "write"; value: string };
+  const sessionAllowedUnixSockets: string[] = [];
+  const sandboxIncidents: SandboxIncident[] = [];
+  let incidentCounter = 0;
 
   let pendingPermissionRequest: PendingPermissionRequest | null = null;
 
@@ -607,11 +859,15 @@ export default function (pi: ExtensionAPI) {
   function getEffectiveDomains(cwd: string): {
     allowed: string[];
     denied: string[];
+    allowUnixSockets: string[];
+    allowAllUnixSockets: boolean;
   } {
     const config = loadConfig(cwd);
     return {
       allowed: [...(config.network?.allowedDomains ?? []), ...sessionAllowedDomains],
       denied: config.network?.deniedDomains ?? [],
+      allowUnixSockets: [...(config.network?.allowUnixSockets ?? []), ...sessionAllowedUnixSockets],
+      allowAllUnixSockets: config.network?.allowAllUnixSockets ?? false,
     };
   }
 
@@ -637,6 +893,40 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  function finalizePathDiagnostic(cwd: string, diagnostic: SandboxDiagnostic): SandboxDiagnostic {
+    if (diagnostic.type === "read" && diagnostic.rawTarget) {
+      const filePath = canonicalizePath(diagnostic.rawTarget);
+      const { allow, deny } = getEffectiveRead(cwd);
+      const verdict = checkPermission(filePath, deny, allow, pathSpecificity, matchSinglePath);
+      const rule = verdict === "denied" ? "denyRead" : "allowRead";
+      return {
+        ...diagnostic,
+        target: filePath,
+        rawTarget: filePath,
+        rule,
+        promptable: verdict === "ask",
+        action: makeReadAction(filePath, rule),
+      };
+    }
+
+    if (diagnostic.type === "write" && diagnostic.rawTarget) {
+      const filePath = canonicalizePath(diagnostic.rawTarget);
+      const { allow, deny } = getEffectiveWrite(cwd);
+      const verdict = checkPermission(filePath, deny, allow, pathSpecificity, matchSinglePath);
+      const rule = verdict === "denied" ? "denyWrite" : "allowWrite";
+      return {
+        ...diagnostic,
+        target: filePath,
+        rawTarget: filePath,
+        rule,
+        promptable: verdict === "ask",
+        action: makeWriteAction(rule),
+      };
+    }
+
+    return diagnostic;
+  }
+
   // ── Sandbox reinitialize ────────────────────────────────────────────────────
   // Called after granting a session/permanent allowance so the OS-level sandbox
   // picks up the new rules before the next bash subprocess starts.
@@ -650,6 +940,10 @@ export default function (pi: ExtensionAPI) {
         ...config.network,
         allowedDomains: [...(config.network?.allowedDomains ?? []), ...sessionAllowedDomains],
         deniedDomains: config.network?.deniedDomains ?? [],
+        allowUnixSockets: [
+          ...(config.network?.allowUnixSockets ?? []),
+          ...sessionAllowedUnixSockets,
+        ],
       };
       await SandboxManager.reset();
       await SandboxManager.initialize(
@@ -677,7 +971,7 @@ export default function (pi: ExtensionAPI) {
   interface PromptOption {
     label: string;
     key: string;
-    action: "abort" | "session" | "project" | "global";
+    action: "abort" | "session" | "project" | "global" | "ssh-session";
     confirm?: boolean;
     hint?: string;
   }
@@ -705,15 +999,15 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     title: string,
     options: PromptOption[],
-  ): Promise<"abort" | "session" | "project" | "global"> {
+  ): Promise<"abort" | "session" | "project" | "global" | "ssh-session"> {
     if (!ctx.hasUI) return "abort";
 
-    const result = await ctx.ui.custom<"abort" | "session" | "project" | "global">(
+    const result = await ctx.ui.custom<"abort" | "session" | "project" | "global" | "ssh-session">(
       (tui, theme, _kb, done) => {
         let selectedIndex = 0;
-        let pendingAction: "abort" | "session" | "project" | "global" | null = null;
+        let pendingAction: "abort" | "session" | "project" | "global" | "ssh-session" | null = null;
 
-        function resolve(action: "abort" | "session" | "project" | "global") {
+        function resolve(action: "abort" | "session" | "project" | "global" | "ssh-session") {
           done(action);
         }
 
@@ -820,7 +1114,7 @@ export default function (pi: ExtensionAPI) {
       ctx,
       `🌐 Network blocked: "${domain}" is not in allowedDomains`,
       PERMISSION_OPTIONS,
-    );
+    ) as Promise<"abort" | "session" | "project" | "global">;
   }
 
   async function promptReadBlock(
@@ -831,7 +1125,7 @@ export default function (pi: ExtensionAPI) {
       ctx,
       `📖 Read blocked: "${filePath}" is not in allowRead`,
       PERMISSION_OPTIONS,
-    );
+    ) as Promise<"abort" | "session" | "project" | "global">;
   }
 
   async function promptWriteBlock(
@@ -842,7 +1136,18 @@ export default function (pi: ExtensionAPI) {
       ctx,
       `📝 Write blocked: "${filePath}" is not in allowWrite`,
       PERMISSION_OPTIONS,
-    );
+    ) as Promise<"abort" | "session" | "project" | "global">;
+  }
+
+  async function promptSshAuthBlock(ctx: ExtensionContext): Promise<"abort" | "ssh-session"> {
+    return showPermissionPrompt(ctx, "🔐 SSH auth blocked: allow SSH use for this session?", [
+      {
+        label: "Allow SSH use for this session",
+        key: "s",
+        action: "ssh-session",
+      },
+      { label: "Abort", key: "esc", action: "abort" },
+    ]) as Promise<"abort" | "ssh-session">;
   }
 
   function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxConfig): void {
@@ -850,6 +1155,18 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.notify(
       '⚠️ Network sandbox allows all domains because network.allowedDomains contains "*". ' +
         'Only use this intentionally; remove "*" to restore per-domain prompts.',
+      "warning",
+    );
+  }
+
+  function hasBroadUnixSocketAccess(config: SandboxConfig): boolean {
+    return config.network?.allowAllUnixSockets ?? false;
+  }
+
+  function maybeWarnAboutBroadUnixSocketAccess(ctx: ExtensionContext, config: SandboxConfig): void {
+    if (!hasBroadUnixSocketAccess(config)) return;
+    ctx.ui.notify(
+      "⚠️ Broad Unix socket access is enabled (allowAllUnixSockets=true). Narrow SSH-agent prompting may be less meaningful.",
       "warning",
     );
   }
@@ -892,31 +1209,59 @@ export default function (pi: ExtensionAPI) {
     await reinitializeSandbox(cwd);
   }
 
-  async function requestDomainAccess(ctx: ExtensionContext, domain: string): Promise<boolean> {
+  async function applySshAuthChoice(socketPath: string, cwd: string): Promise<void> {
+    if (!sessionAllowedUnixSockets.includes(socketPath)) sessionAllowedUnixSockets.push(socketPath);
+    await reinitializeSandbox(cwd);
+  }
+
+  function configMutationForChoice(
+    choice: SandboxPromptChoice,
+  ): "none" | ".pi/sandbox.json" | "~/.pi/agent/sandbox.json" {
+    if (choice === "project") return ".pi/sandbox.json";
+    if (choice === "global") return "~/.pi/agent/sandbox.json";
+    return "none";
+  }
+
+  async function requestDomainAccess(
+    ctx: ExtensionContext,
+    domain: string,
+  ): Promise<PermissionChoice> {
     pendingPermissionRequest = { kind: "domain", value: domain };
     const choice = await promptDomainBlock(ctx, domain);
-    if (choice === "abort") return false;
-    await applyDomainChoice(choice, domain, ctx.cwd);
+    if (choice !== "abort") await applyDomainChoice(choice, domain, ctx.cwd);
     pendingPermissionRequest = null;
-    return true;
+    return choice;
   }
 
-  async function requestReadAccess(ctx: ExtensionContext, filePath: string): Promise<boolean> {
+  async function requestReadAccess(
+    ctx: ExtensionContext,
+    filePath: string,
+  ): Promise<PermissionChoice> {
     pendingPermissionRequest = { kind: "read", value: filePath };
     const choice = await promptReadBlock(ctx, filePath);
-    if (choice === "abort") return false;
-    await applyReadChoice(choice, filePath, ctx.cwd);
+    if (choice !== "abort") await applyReadChoice(choice, filePath, ctx.cwd);
     pendingPermissionRequest = null;
-    return true;
+    return choice;
   }
 
-  async function requestWriteAccess(ctx: ExtensionContext, filePath: string): Promise<boolean> {
+  async function requestWriteAccess(
+    ctx: ExtensionContext,
+    filePath: string,
+  ): Promise<PermissionChoice> {
     pendingPermissionRequest = { kind: "write", value: filePath };
     const choice = await promptWriteBlock(ctx, filePath);
-    if (choice === "abort") return false;
-    await applyWriteChoice(choice, filePath, ctx.cwd);
+    if (choice !== "abort") await applyWriteChoice(choice, filePath, ctx.cwd);
     pendingPermissionRequest = null;
-    return true;
+    return choice;
+  }
+
+  async function requestSshAuthAccess(
+    ctx: ExtensionContext,
+    socketPath: string,
+  ): Promise<"abort" | "ssh-session"> {
+    const choice = await promptSshAuthBlock(ctx);
+    if (choice === "ssh-session") await applySshAuthChoice(socketPath, ctx.cwd);
+    return choice;
   }
 
   async function redirectSandboxConfigMutationToPrompt(
@@ -931,146 +1276,327 @@ export default function (pi: ExtensionAPI) {
       };
     }
 
-    const approved =
+    const choice =
       pending.kind === "domain"
         ? await requestDomainAccess(ctx, pending.value)
         : pending.kind === "read"
           ? await requestReadAccess(ctx, pending.value)
           : await requestWriteAccess(ctx, pending.value);
 
-    if (!approved) {
+    if (choice === "abort") {
       return {
         block: true,
-        reason:
-          `Sandbox config files cannot be edited directly. Permission for "${pending.value}" was not approved.`,
+        reason: `Sandbox config files cannot be edited directly. Permission for "${pending.value}" was not approved.`,
       };
     }
 
     return {
       block: true,
-      reason:
-        `Sandbox permissions updated via prompt for "${pending.value}". Direct edits to sandbox config files remain blocked.`,
+      reason: `Sandbox permissions updated via prompt for "${pending.value}". Direct edits to sandbox config files remain blocked.`,
     };
   }
 
-  // ── Bash tool — with write-block detection and retry ───────────────────────
+  function createIncident(source: BashIncidentSource, command: string): SandboxIncident {
+    incidentCounter += 1;
+    return {
+      id: `incident-${incidentCounter}`,
+      timestamp: new Date(),
+      source: source === "bash" ? "bash" : "user_bash",
+      commandPreview: formatCommandPreview(command),
+      commandKey: command,
+      attributed: false,
+      violations: [],
+      primaryViolation: undefined,
+      promptShown: false,
+      promptChoice: "none",
+      promptCount: 0,
+      retried: false,
+      finalOutcome: "failure",
+      configMutation: "none",
+    };
+  }
+
+  function storeIncident(incident: SandboxIncident): void {
+    if (!retainIncident(incident)) return;
+    sandboxIncidents.push(incident);
+    const trimmed = trimIncidents(sandboxIncidents, MAX_DEBUG_INCIDENTS);
+    sandboxIncidents.splice(0, sandboxIncidents.length, ...trimmed);
+  }
+
+  function updateIncidentPrimary(incident: SandboxIncident): void {
+    incident.primaryViolation = selectPrimaryViolation(incident.violations);
+    incident.attributed = incident.violations.length > 0;
+  }
+
+  async function maybePromptForDiagnostic(
+    ctx: ExtensionContext,
+    incident: SandboxIncident,
+    diagnostic: SandboxDiagnostic,
+  ): Promise<SandboxPromptChoice> {
+    if (!ctx.hasUI || !diagnostic.promptable || incident.promptCount >= MAX_PROMPT_ATTEMPTS) {
+      return "none";
+    }
+    if (!isMateriallyDifferent(incident.primaryViolation, diagnostic) && incident.promptCount > 0) {
+      return "none";
+    }
+
+    incident.promptShown = true;
+    incident.promptCount += 1;
+
+    if (diagnostic.type === "ssh-auth") {
+      const choice = await requestSshAuthAccess(
+        ctx,
+        diagnostic.rawTarget ?? process.env.SSH_AUTH_SOCK ?? "",
+      );
+      incident.promptChoice = choice;
+      incident.configMutation = configMutationForChoice(choice);
+      return choice;
+    }
+
+    if (diagnostic.type === "network") {
+      const choice = await requestDomainAccess(ctx, diagnostic.rawTarget ?? diagnostic.target);
+      incident.promptChoice = choice;
+      incident.configMutation = configMutationForChoice(choice);
+      return choice;
+    }
+
+    if (diagnostic.type === "write") {
+      const choice = await requestWriteAccess(ctx, diagnostic.rawTarget ?? diagnostic.target);
+      incident.promptChoice = choice;
+      incident.configMutation = configMutationForChoice(choice);
+      return choice;
+    }
+
+    if (diagnostic.type === "read") {
+      const choice = await requestReadAccess(ctx, diagnostic.rawTarget ?? diagnostic.target);
+      incident.promptChoice = choice;
+      incident.configMutation = configMutationForChoice(choice);
+      return choice;
+    }
+
+    return "none";
+  }
+
+  function createInstrumentedSandboxedBashOps(
+    ctx: ExtensionContext,
+    source: BashIncidentSource,
+    shellPath?: string,
+    options?: { recordDiagnosticInContext?: boolean },
+  ): BashOperations {
+    const baseOps = createSandboxedBashOps(shellPath);
+
+    return {
+      async exec(command, cwd, execOptions) {
+        const incident = createIncident(source, command);
+        const originalOnData = execOptions.onData;
+        let attempt = 0;
+        let lastPrompted: SandboxDiagnostic | undefined;
+        let finalExitCode = 1;
+
+        while (true) {
+          const { allowed, denied } = getEffectiveDomains(cwd);
+          const domains = extractDomainsFromCommand(command);
+          let precheckBlocked = false;
+
+          for (const domain of domains) {
+            const verdict = checkPermission(
+              domain,
+              denied,
+              allowed,
+              domainSpecificity,
+              domainMatchesPattern,
+            );
+            if (verdict === "allowed") continue;
+
+            const diagnostic: SandboxDiagnostic = {
+              type: "network",
+              target: domain,
+              rawTarget: domain,
+              rule: verdict === "denied" ? "deniedDomains" : "allowedDomains",
+              promptable: verdict === "ask",
+              action: makeNetworkAction(verdict === "denied" ? "deniedDomains" : "allowedDomains"),
+            };
+            incident.violations = addUniqueDiagnostics(incident.violations, [diagnostic]);
+            updateIncidentPrimary(incident);
+
+            if (verdict === "denied") {
+              incident.finalOutcome = "failure";
+              const diagnosticBlock = renderDiagnosticBlock(incident);
+              const diagnosticData = getDiagnosticBlockData(incident);
+              emitOutput(
+                originalOnData,
+                source === "user_bash" && diagnosticData
+                  ? `Blocked: "${domain}" is in deniedDomains.\n${renderDiagnosticNotice(diagnosticData)}\n`
+                  : `Blocked: "${domain}" is in deniedDomains.\n${diagnosticBlock ?? ""}\n`,
+              );
+              if (source === "user_bash" && options?.recordDiagnosticInContext && diagnosticBlock) {
+                pi.sendMessage({
+                  customType: "sandbox-diagnostic",
+                  content: diagnosticBlock,
+                  display: false,
+                });
+              }
+              storeIncident(incident);
+              return { exitCode: 1 };
+            }
+
+            const choice = await maybePromptForDiagnostic(ctx, incident, diagnostic);
+            lastPrompted = diagnostic;
+            if (choice === "abort" || choice === "none") {
+              incident.finalOutcome = "failure";
+              const diagnosticBlock = renderDiagnosticBlock(incident);
+              const diagnosticData = getDiagnosticBlockData(incident);
+              emitOutput(
+                originalOnData,
+                source === "user_bash" && diagnosticData
+                  ? `Blocked: "${domain}" is not in allowedDomains. Use /sandbox to review your config.\n${renderDiagnosticNotice(diagnosticData)}\n`
+                  : `Blocked: "${domain}" is not in allowedDomains. Use /sandbox to review your config.\n${diagnosticBlock ?? ""}\n`,
+              );
+              if (source === "user_bash" && options?.recordDiagnosticInContext && diagnosticBlock) {
+                pi.sendMessage({
+                  customType: "sandbox-diagnostic",
+                  content: diagnosticBlock,
+                  display: false,
+                });
+              }
+              storeIncident(incident);
+              return { exitCode: 1 };
+            }
+
+            precheckBlocked = true;
+          }
+
+          let outputText = "";
+          const beforeCount =
+            SandboxManager.getSandboxViolationStore().getViolationsForCommand(command).length;
+          const result = await baseOps.exec(command, cwd, {
+            ...execOptions,
+            onData(data) {
+              outputText += data.toString();
+              originalOnData?.(data);
+            },
+          });
+          finalExitCode = result.exitCode ?? 1;
+
+          const annotatedOutput = SandboxManager.annotateStderrWithSandboxFailures(
+            command,
+            outputText,
+          );
+          const afterViolations =
+            SandboxManager.getSandboxViolationStore().getViolationsForCommand(command);
+          const newViolations = afterViolations.slice(beforeCount);
+          const diagnostics = newViolations
+            .map((violation) => parseViolationEvent(violation, process.env.SSH_AUTH_SOCK))
+            .filter((item): item is SandboxDiagnostic => item !== null)
+            .map((item) => finalizePathDiagnostic(cwd, item));
+          if (diagnostics.length === 0) {
+            const fallback = parseFallbackDiagnosticFromOutput(command, annotatedOutput);
+            if (fallback) diagnostics.push(finalizePathDiagnostic(cwd, fallback));
+          }
+
+          incident.violations = addUniqueDiagnostics(incident.violations, diagnostics);
+          updateIncidentPrimary(incident);
+          incident.finalOutcome = finalExitCode === 0 ? "success" : "failure";
+
+          const nextDiagnostic = incident.primaryViolation;
+          const canRetry =
+            finalExitCode !== 0 &&
+            nextDiagnostic &&
+            nextDiagnostic.promptable &&
+            (lastPrompted === undefined || isMateriallyDifferent(lastPrompted, nextDiagnostic)) &&
+            incident.promptCount < MAX_PROMPT_ATTEMPTS;
+
+          if (canRetry) {
+            const choice = await maybePromptForDiagnostic(ctx, incident, nextDiagnostic);
+            lastPrompted = nextDiagnostic;
+            if (choice !== "abort" && choice !== "none") {
+              incident.retried = true;
+              attempt += 1;
+              emitOutput(originalOnData, `\n--- Sandbox permission granted, retrying ---\n`);
+              continue;
+            }
+          }
+
+          const block = renderDiagnosticBlock(incident);
+          if (block && (incident.attributed || precheckBlocked)) {
+            if (source === "user_bash") {
+              const diagnosticData = getDiagnosticBlockData(incident);
+              if (diagnosticData)
+                emitOutput(originalOnData, `\n${renderDiagnosticNotice(diagnosticData)}\n`);
+              if (options?.recordDiagnosticInContext) {
+                pi.sendMessage({
+                  customType: "sandbox-diagnostic",
+                  content: block,
+                  display: false,
+                });
+              }
+            } else {
+              emitOutput(originalOnData, `\n${block}\n`);
+            }
+          }
+          storeIncident(incident);
+          return { exitCode: finalExitCode };
+        }
+      },
+    };
+  }
+
+  // ── Bash tool — instrumented diagnostics and retry ───────────────────────
 
   pi.registerTool({
     ...localBash,
     label: "bash (sandboxed)",
     async execute(id, params, signal, onUpdate, ctx) {
-      const runBash = () => {
-        if (!sandboxEnabled || !sandboxInitialized) {
-          return localBash.execute(id, params, signal, onUpdate, ctx);
-        }
-        const sandboxedBash = createBashToolDefinition(localCwd, {
-          operations: createSandboxedBashOps(userShellPath),
-          shellPath: userShellPath,
-        });
-        return sandboxedBash.execute(id, params, signal, onUpdate, ctx);
-      };
-
-      let result: AgentToolResult<any>;
-      try {
-        result = await runBash();
-      } catch (e) {
-        if (!(e instanceof Error)) throw e;
-        if (!e.message.includes("Operation not permitted")) throw e;
-
-        result = {
-          content: [
-            {
-              type: "text",
-              text: `Error: Command failed with OS-level sandbox restriction: ${e.message}`,
-            },
-          ],
-          details: {},
-        };
+      if (!sandboxEnabled || !sandboxInitialized) {
+        return localBash.execute(id, params, signal, onUpdate, ctx);
       }
 
-      // Post-execution: detect OS-level write block and offer to allow.
-      if (sandboxEnabled && sandboxInitialized && ctx?.hasUI) {
-        const outputText = result.content
-          .filter((c: any) => c.type === "text")
-          .map((c: any) => c.text)
-          .join("\n");
-
-        const blockedPath = extractBlockedWritePath(outputText);
-        if (blockedPath) {
-          const approved = await requestWriteAccess(ctx, blockedPath);
-          if (approved) {
-            // Check if denyWrite would still block it even after allowing.
-            const config = loadConfig(ctx.cwd);
-            const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
-            if (matchesPattern(blockedPath, config.filesystem?.denyWrite ?? [])) {
-              ctx.ui.notify(
-                `⚠️ "${blockedPath}" was added to allowWrite, but it is also in denyWrite and will remain blocked.\n` +
-                  `Check denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
-                "warning",
-              );
-              return result;
-            }
-
-            onUpdate?.({
-              content: [
-                {
-                  type: "text",
-                  text: `\n--- Write access granted for "${blockedPath}", retrying ---\n`,
-                },
-              ],
-              details: {},
-            });
-            return runBash();
-          }
-        }
+      const sandboxedBash = createBashToolDefinition(localCwd, {
+        operations: createInstrumentedSandboxedBashOps(ctx, "bash", userShellPath),
+        shellPath: userShellPath,
+      });
+      return sandboxedBash.execute(id, params, signal, onUpdate, ctx);
+    },
+    renderResult(result, options, theme, context) {
+      const details = (result.details ?? {}) as SandboxedBashResultDetails;
+      if (!details.sandboxDiagnostic) {
+        return localBash.renderResult
+          ? localBash.renderResult(result as never, options as never, theme, context)
+          : new Text("", 0, 0);
       }
-
-      return result;
+      return renderSandboxedBashResult(result, options.expanded, theme);
     },
   });
 
-  // ── user_bash — network pre-check ──────────────────────────────────────────
+  // ── user_bash — instrumented sandboxed execution ──────────────────────────
 
   pi.on("user_bash", async (event, ctx) => {
     if (!sandboxEnabled || !sandboxInitialized) return;
-
-    const domains = extractDomainsFromCommand(event.command);
-    const { allowed, denied } = getEffectiveDomains(ctx.cwd);
-
-    for (const domain of domains) {
-      const verdict = checkPermission(
-        domain, denied, allowed, domainSpecificity, domainMatchesPattern,
-      );
-      if (verdict === "denied") {
-        return {
-          result: {
-            output: `Blocked: "${domain}" is in deniedDomains.`,
-            exitCode: 1,
-            cancelled: false,
-            truncated: false,
-          },
-        };
-      }
-      if (verdict === "ask") {
-        const choice = await promptDomainBlock(ctx, domain);
-        if (choice === "abort") {
-          return {
-            result: {
-              output: `Blocked: "${domain}" is not in allowedDomains. Use /sandbox to review your config.`,
-              exitCode: 1,
-              cancelled: false,
-              truncated: false,
-            },
-          };
-        }
-        await applyDomainChoice(choice, domain, ctx.cwd);
-      }
-    }
-
-    return { operations: createSandboxedBashOps(userShellPath) };
+    return {
+      operations: createInstrumentedSandboxedBashOps(ctx, "user_bash", userShellPath, {
+        recordDiagnosticInContext: !event.excludeFromContext,
+      }),
+    };
   });
 
-    pi.on("tool_call", async (event, ctx) => {
+  pi.on("tool_result", async (event) => {
+    if (!isBashToolResult(event)) return;
+    const textContent = event.content.find((content) => content.type === "text");
+    if (!textContent || textContent.type !== "text") return;
+
+    const parsed = parseDiagnosticBlock(textContent.text);
+    if (!parsed) return;
+
+    return {
+      details: {
+        ...(event.details as Record<string, unknown> | undefined),
+        sandboxDiagnostic: parsed.data,
+        sandboxVisibleText: parsed.visibleText,
+      },
+    };
+  });
+
+  pi.on("tool_call", async (event, ctx) => {
     if (!sandboxEnabled) return;
 
     const config = loadConfig(ctx.cwd);
@@ -1093,41 +1619,13 @@ export default function (pi: ExtensionAPI) {
       return redirectSandboxConfigMutationToPrompt(ctx);
     }
 
-    // Network pre-check for bash tool calls.
-    if (sandboxInitialized && isToolCallEventType("bash", event)) {
-      const domains = extractDomainsFromCommand(event.input.command);
-      const { allowed, denied } = getEffectiveDomains(ctx.cwd);
-      for (const domain of domains) {
-        const verdict = checkPermission(
-          domain, denied, allowed, domainSpecificity, domainMatchesPattern,
-        );
-        if (verdict === "denied") {
-          return {
-            block: true,
-            reason: `Network access to "${domain}" is blocked (in deniedDomains).`,
-          };
-        }
-        if (verdict === "ask") {
-          const approved = await requestDomainAccess(ctx, domain);
-          if (!approved) {
-            return {
-              block: true,
-              reason: `Network access to "${domain}" is blocked (not in allowedDomains).`,
-            };
-          }
-        }
-      }
-    }
-
     // Path policy: read tool.
     //   denyRead is a hard block, but a strictly more specific allowRead wins.
     if (isToolCallEventType("read", event)) {
       const filePath = canonicalizePath(event.input.path);
       const { allow, deny } = getEffectiveRead(ctx.cwd);
 
-      const verdict = checkPermission(
-        filePath, deny, allow, pathSpecificity, matchSinglePath,
-      );
+      const verdict = checkPermission(filePath, deny, allow, pathSpecificity, matchSinglePath);
 
       if (verdict === "denied") {
         return {
@@ -1138,14 +1636,13 @@ export default function (pi: ExtensionAPI) {
         };
       }
       if (verdict === "ask") {
-        const approved = await requestReadAccess(ctx, filePath);
-        if (!approved) {
+        const choice = await requestReadAccess(ctx, filePath);
+        if (choice === "abort") {
           return {
             block: true,
             reason: `Sandbox: read access denied for "${filePath}"`,
           };
         }
-        // Allowed — fall through, tool runs.
         return;
       }
       // verdict === "allowed" → silently proceed
@@ -1156,9 +1653,7 @@ export default function (pi: ExtensionAPI) {
       const path = canonicalizePath((event.input as { path: string }).path);
       const { allow, deny } = getEffectiveWrite(ctx.cwd);
 
-      const verdict = checkPermission(
-        path, deny, allow, pathSpecificity, matchSinglePath,
-      );
+      const verdict = checkPermission(path, deny, allow, pathSpecificity, matchSinglePath);
 
       if (verdict === "denied") {
         return {
@@ -1170,14 +1665,13 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (verdict === "ask") {
-        const approved = await requestWriteAccess(ctx, path);
-        if (!approved) {
+        const choice = await requestWriteAccess(ctx, path);
+        if (choice === "abort") {
           return {
             block: true,
             reason: `Sandbox: write access denied for "${path}" (not in allowWrite)`,
           };
         }
-        // Allowed — fall through, tool runs.
         return;
       }
     }
@@ -1243,6 +1737,7 @@ export default function (pi: ExtensionAPI) {
       sandboxInitialized = true;
 
       warnIfAllDomainsAllowed(ctx, config);
+      maybeWarnAboutBroadUnixSocketAccess(ctx, config);
 
       const networkLabel = allowsAllDomains(config.network?.allowedDomains)
         ? "all domains"
@@ -1313,6 +1808,7 @@ export default function (pi: ExtensionAPI) {
         sandboxInitialized = true;
 
         warnIfAllDomainsAllowed(ctx, config);
+        maybeWarnAboutBroadUnixSocketAccess(ctx, config);
 
         const networkLabel = allowsAllDomains(config.network?.allowedDomains)
           ? "all domains"
@@ -1376,9 +1872,16 @@ export default function (pi: ExtensionAPI) {
         ...(allowsAllDomains(config.network?.allowedDomains)
           ? ['  ⚠️ "*" allows all domains and disables per-domain prompts.']
           : []),
+        ...(hasBroadUnixSocketAccess(config)
+          ? ["  ⚠️ allowAllUnixSockets=true enables broad local IPC access."]
+          : []),
         `  Denied domains:  ${config.network?.deniedDomains?.join(", ") || "(none)"}`,
+        `  Allow sockets:   ${config.network?.allowUnixSockets?.join(", ") || "(none)"}`,
         ...(sessionAllowedDomains.length > 0
           ? [`  Session allowed: ${sessionAllowedDomains.join(", ")}`]
+          : []),
+        ...(sessionAllowedUnixSockets.length > 0
+          ? [`  Session SSH use: ${sessionAllowedUnixSockets.join(", ")}`]
           : []),
         "",
         "Filesystem (bash + read/write/edit tools):",
@@ -1398,6 +1901,50 @@ export default function (pi: ExtensionAPI) {
         "Note: deniedDomains block takes precedence over allowedDomains.",
         "Note: Specificity = more path segments or domain labels; wildcards carry no weight.",
       ];
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  pi.registerCommand("sandbox-debug", {
+    description: "Show recent sandbox incidents for bash and !cmd",
+    handler: async (_args, ctx) => {
+      if (!sandboxEnabled) {
+        ctx.ui.notify("Sandbox is disabled", "info");
+        return;
+      }
+
+      const incidents = [...sandboxIncidents].reverse();
+      if (incidents.length === 0) {
+        ctx.ui.notify(
+          "Sandbox debug: no attributed incidents in this session.\nSession-local, last 5 incidents.",
+          "info",
+        );
+        return;
+      }
+
+      const lines = ["Sandbox Debug", "Session-local, last 5 incidents.", ""];
+      for (const incident of incidents) {
+        lines.push(`${incident.timestamp.toISOString()}  ${incident.commandPreview}`);
+        lines.push(`  outcome: ${incident.finalOutcome}`);
+        if (incident.primaryViolation) {
+          lines.push(
+            `  primary: ${incident.primaryViolation.type} ${incident.primaryViolation.target} (${incident.primaryViolation.rule})`,
+          );
+        }
+        lines.push(`  other violations: ${Math.max(0, incident.violations.length - 1)}`);
+        lines.push(`  prompted: ${incident.promptShown ? "yes" : "no"}`);
+        lines.push(`  choice: ${incident.promptChoice}`);
+        lines.push(`  config mutation: ${incident.configMutation}`);
+        lines.push(`  retried: ${incident.retried ? "yes" : "no"}`);
+        for (const violation of incident.violations) {
+          const target = violation.rawTarget ?? violation.target;
+          lines.push(
+            `    - ${violation.type}: ${target} [rule=${violation.rule}, promptable=${violation.promptable ? "yes" : "no"}]`,
+          );
+        }
+        lines.push("");
+      }
+
       ctx.ui.notify(lines.join("\n"), "info");
     },
   });
