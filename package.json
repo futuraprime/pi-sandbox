@@ -27,13 +27,15 @@
   },
   "homepage": "https://github.com/carderne/pi-sandbox",
   "scripts": {
-    "fmt": "oxfmt index.ts",
-    "lint": "oxlint index.ts",
+    "fmt": "./node_modules/.bin/oxfmt index.ts diagnostics.ts sandbox-command.ts diagnostics.test.ts sandbox-command.test.ts",
+    "lint": "./node_modules/.bin/oxlint index.ts diagnostics.ts sandbox-command.ts diagnostics.test.ts sandbox-command.test.ts",
     "check": "tsc --noEmit",
-    "all": "npm run fmt && npm run lint && npm run check",
-    "ci:fmt": "oxfmt --check index.ts",
+    "test": "vitest run",
+    "all": "npm run fmt && npm run lint && npm run check && npm run test",
+    "ci:fmt": "./node_modules/.bin/oxfmt --check index.ts diagnostics.ts sandbox-command.ts diagnostics.test.ts sandbox-command.test.ts",
     "ci:lint": "npm run lint",
-    "ci:check": "npm run check"
+    "ci:check": "npm run check",
+    "ci:test": "npm run test"
   },
   "dependencies": {
     "@carderne/sandbox-runtime": "^0.0.49"
@@ -51,7 +53,8 @@
     "@types/node": "^24",
     "oxfmt": "^0.47.0",
     "oxlint": "^1.62.0",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^3.2.4"
   },
   "overrides": {
     "minimatch": ">=10.2.1",
