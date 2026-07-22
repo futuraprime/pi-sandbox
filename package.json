@@ -27,12 +27,12 @@
   },
   "homepage": "https://github.com/carderne/pi-sandbox",
   "scripts": {
-    "fmt": "./node_modules/.bin/oxfmt index.ts diagnostics.ts sandbox-command.ts diagnostics.test.ts sandbox-command.test.ts",
-    "lint": "./node_modules/.bin/oxlint index.ts diagnostics.ts sandbox-command.ts diagnostics.test.ts sandbox-command.test.ts",
+    "fmt": "./node_modules/.bin/oxfmt index.ts diagnostics.ts sandbox-command.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts",
+    "lint": "./node_modules/.bin/oxlint index.ts diagnostics.ts sandbox-command.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts",
     "check": "tsc --noEmit",
     "test": "vitest run",
     "all": "npm run fmt && npm run lint && npm run check && npm run test",
-    "ci:fmt": "./node_modules/.bin/oxfmt --check index.ts diagnostics.ts sandbox-command.ts diagnostics.test.ts sandbox-command.test.ts",
+    "ci:fmt": "./node_modules/.bin/oxfmt --check index.ts diagnostics.ts sandbox-command.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts",
     "ci:lint": "npm run lint",
     "ci:check": "npm run check",
     "ci:test": "npm run test"

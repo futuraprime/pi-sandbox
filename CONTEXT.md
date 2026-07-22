@@ -1,5 +1,23 @@
 # pi-sandbox context
 
+## Sandbox config self-protection
+
+Changed:
+- Tool-driven `write`, `edit`, and direct bash attempts are checked before sandbox enablement/config state, so disabling the sandbox does not bypass config-file guards.
+- Relative tool paths are resolved from Pi's session cwd, protecting `<cwd>/.pi/sandbox.json` when the extension process has a different cwd.
+- The global path now follows `getAgentDir()/sandbox.json`, and both local and global config paths are forcibly included in the OS sandbox's `denyWrite` rules.
+- Added path-protection regressions in `sandbox-protection.test.ts` and a local-only `/sandbox` mutation regression in `sandbox-command.test.ts`.
+
+Why:
+- A relative local config path could miss the dedicated guard and flow into generic permission handling, which could then update the global config.
+- Sandbox configuration must remain writable through explicit user-controlled extension flows such as `/sandbox`, never directly through model tools.
+
+Verification:
+- `npm run all` passed: formatting, linting, type-checking, and 35 tests across 3 files.
+
+Follow-ups:
+- None known.
+
 ## Manual `/sandbox` config commands
 
 Changed:

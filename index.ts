@@ -674,20 +674,32 @@ function matchesPattern(filePath: string, patterns: string[]): boolean {
 
 // ── Config file updaters (Node.js process — not OS-sandboxed) ─────────────────
 
-function getConfigPaths(cwd: string): {
+export function getConfigPaths(cwd: string): {
   globalPath: string;
   projectPath: string;
 } {
   return {
-    globalPath: join(homedir(), ".pi", "agent", "sandbox.json"),
+    globalPath: join(getAgentDir(), "sandbox.json"),
     projectPath: join(cwd, ".pi", "sandbox.json"),
   };
 }
 
-function isSandboxConfigPath(filePath: string, cwd: string): boolean {
-  const canonical = canonicalizePath(filePath);
+export function isSandboxConfigPath(filePath: string, cwd: string): boolean {
+  const canonical = canonicalizePath(resolve(cwd, filePath.replace(/^~(?=$|\/)/, homedir())));
   const { globalPath, projectPath } = getConfigPaths(cwd);
   return canonical === canonicalizePath(projectPath) || canonical === canonicalizePath(globalPath);
+}
+
+function getProtectedFilesystem(config: SandboxConfig, cwd: string) {
+  const { globalPath, projectPath } = getConfigPaths(cwd);
+  return {
+    ...config.filesystem,
+    denyWrite: dedup([
+      ...(config.filesystem?.denyWrite ?? []),
+      canonicalizePath(projectPath),
+      canonicalizePath(globalPath),
+    ]),
+  };
 }
 
 function bashCommandMentionsSandboxConfig(command: string, cwd: string): boolean {
@@ -956,11 +968,10 @@ export default function (pi: ExtensionAPI) {
         {
           network,
           filesystem: {
-            ...config.filesystem,
+            ...getProtectedFilesystem(config, cwd),
             denyRead: config.filesystem?.denyRead ?? [],
             allowRead: [...(config.filesystem?.allowRead ?? []), ...sessionAllowedReadPaths],
             allowWrite: [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths],
-            denyWrite: config.filesystem?.denyWrite ?? [],
           },
           allowBrowserProcess: configExt.allowBrowserProcess,
           enableWeakerNetworkIsolation: true,
@@ -1603,13 +1614,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    if (!sandboxEnabled) return;
-
-    const config = loadConfig(ctx.cwd);
-    if (!config.enabled) return;
-
-    const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
-
     if (
       (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) &&
       isSandboxConfigPath((event.input as { path: string }).path, ctx.cwd)
@@ -1618,12 +1622,18 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (
-      sandboxInitialized &&
       isToolCallEventType("bash", event) &&
       bashCommandMentionsSandboxConfig(event.input.command, ctx.cwd)
     ) {
       return redirectSandboxConfigMutationToPrompt(ctx);
     }
+
+    if (!sandboxEnabled) return;
+
+    const config = loadConfig(ctx.cwd);
+    if (!config.enabled) return;
+
+    const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
 
     // Path policy: read tool.
     //   denyRead is a hard block, but a strictly more specific allowRead wins.
@@ -1719,7 +1729,7 @@ export default function (pi: ExtensionAPI) {
       await SandboxManager.initialize(
         {
           network: config.network,
-          filesystem: config.filesystem,
+          filesystem: getProtectedFilesystem(config, ctx.cwd),
           ignoreViolations: configExt.ignoreViolations,
           enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
           allowBrowserProcess: configExt.allowBrowserProcess,
@@ -1801,7 +1811,7 @@ export default function (pi: ExtensionAPI) {
         await SandboxManager.initialize(
           {
             network: config.network,
-            filesystem: config.filesystem,
+            filesystem: getProtectedFilesystem(config, ctx.cwd),
             ignoreViolations: configExt.ignoreViolations,
             enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
             allowBrowserProcess: configExt.allowBrowserProcess,
