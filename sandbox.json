@@ -2,8 +2,6 @@
   "enabled": true,
   "allowBrowserProcess": true,
   "network": {
-    "allowLocalBinding": true,
-    "allowAllUnixSockets": true,
     "allowedDomains": [
       "localhost",
       "127.0.0.1",

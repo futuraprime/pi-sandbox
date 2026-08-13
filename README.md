@@ -16,11 +16,7 @@ are also blocked and redirected back through the same approval flow.
 
 ## Notes
 
-There is an example config at [sandbox.json](./sandbox.json). It was quite a few things added to get this extension to work with [agent-browser](https://agent-browser.dev/) and other common tools.
-
-These open significant security loopholes, so shouldn't be used in a sensitive context or when you don't need browser support.
-
-You may need to trial and error to find additional things you need to allow.
+There is an example config at [sandbox.json](./sandbox.json). Browser mode grants the additional macOS process and IPC permissions Chromium needs, so only enable it when browser automation is required. Filesystem and remote-network restrictions remain enforced.
 
 ## Quickstart
 
@@ -69,15 +65,13 @@ pi install npm:pi-sandbox
 Add a config like this either to `~/.pi/agent/sandbox.json` (global) or to `.pi/sandbox.json` (local).
 Local config takes precedence over global.
 
-Note below that pi-sandbox treats reads and writes differently, and that broad Unix socket access is convenient but permissive.
+Note below that pi-sandbox treats reads and writes differently.
 
 ```json
 {
   "enabled": true,
-  "allowBrowserProcess": true, // If you want to use agent-browser or similar Chrome setup
+  "allowBrowserProcess": true, // Chromium/Playwright; includes required macOS loopback and path-scoped ProcessSingleton permissions
   "network": {
-    "allowLocalBinding": true, // ditto
-    "allowAllUnixSockets": true, // ditto
     "allowedDomains": ["github.com", "*.github.com"],
     "deniedDomains": []
   },
@@ -205,7 +199,21 @@ The history is in-memory only and is not persisted.
 
 If you want Git-over-SSH to work without making private keys directly readable, prefer SSH agent access over broad `allowRead` entries for `~/.ssh`.
 
-Be careful with `allowAllUnixSockets: true`: it is convenient for browser-heavy workflows, but it is much broader than narrowly allowing the current SSH agent socket.
+Be careful with `allowAllUnixSockets: true`: it allows every Unix socket and is much broader than narrowly allowing the current SSH agent socket. Chromium/Playwright browser mode does not require it.
+
+### Chromium and Playwright on macOS
+
+The minimum sandbox-specific setting is:
+
+```json
+{
+  "allowBrowserProcess": true
+}
+```
+
+On macOS this automatically permits Chromium's required `kern.hv_vmm_present` sysctl, loopback binding, and read/write plus Unix-socket operations scoped to the current user's canonical `DARWIN_USER_TEMP_DIR`. Chromium uses that directory for `ProcessSingleton` even when `TMPDIR` points into the project. Do not add the Darwin temp directory to filesystem rules or enable `allowAllUnixSockets` for this purpose.
+
+You still need normal read permission for the chosen Chromium application/executable and write permission for any explicit Playwright user-data directory outside the project. Remote browser traffic remains governed by `allowedDomains` and `deniedDomains`.
 
 ### Manual validation
 

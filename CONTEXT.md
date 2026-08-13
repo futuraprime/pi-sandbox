@@ -20,5 +20,18 @@ Verification:
 - Test result: 2 files, 30 tests passing.
 - Direct attempts by model/tool access to inspect sandbox config diff remain blocked by existing sandbox protection.
 
-Follow-ups:
-- None known.
+## macOS Chromium browser policy
+
+Changed:
+- Updated `@carderne/sandbox-runtime` to a pinned fix that makes `allowBrowserProcess` supply Chromium's required macOS policy as one browser-mode contract.
+- Browser mode now allows `sysctl-read` for `kern.hv_vmm_present`, loopback binding, and read/write plus AF_UNIX bind/connect access scoped to the canonical `getconf DARWIN_USER_TEMP_DIR`.
+- Added generated-policy regression coverage and documented the minimum Chromium/Playwright configuration.
+
+Why:
+- Chromium 147 aborts when `kern.hv_vmm_present` is denied and creates `ProcessSingleton` beneath Darwin's per-user temp directory regardless of project-local `TMPDIR`.
+- These are browser implementation requirements, so users should not need undocumented filesystem entries, `network.allowLocalBinding`, or the broad `network.allowAllUnixSockets` escape hatch.
+
+Security boundary:
+- The browser additions apply only when `allowBrowserProcess` is true.
+- Unix socket bind/connect access is limited to the current user's canonical Darwin temp directory; browser mode does not emit the all-path Unix socket rule.
+- Filesystem and remote-network restrictions remain in force.
