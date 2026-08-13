@@ -72,6 +72,8 @@ Note below that pi-sandbox treats reads and writes differently.
   "enabled": true,
   "allowBrowserProcess": true, // Chromium/Playwright; includes required macOS loopback and path-scoped ProcessSingleton permissions
   "network": {
+    // macOS: needed for git-over-SSH — see "Git over SSH on macOS" below
+    "allowUnauthenticatedSocksProxy": true,
     "allowedDomains": ["github.com", "*.github.com"],
     "deniedDomains": []
   },
@@ -200,6 +202,18 @@ The history is in-memory only and is not persisted.
 If you want Git-over-SSH to work without making private keys directly readable, prefer SSH agent access over broad `allowRead` entries for `~/.ssh`.
 
 Be careful with `allowAllUnixSockets: true`: it allows every Unix socket and is much broader than narrowly allowing the current SSH agent socket. Chromium/Playwright browser mode does not require it.
+
+### Git over SSH on macOS
+
+The sandbox routes git-over-SSH through a local SOCKS proxy by setting `GIT_SSH_COMMAND` to an `nc -X 5` ProxyCommand. Since sandbox-runtime 0.0.70 that proxy requires a per-session username/password token, but macOS BSD `nc` cannot send SOCKS5 credentials — so without the opt-out below, `git push`/`fetch`/`clone` over SSH fail at the handshake (`nc: authentication method negotiation failed`) _before_ the SSH-agent prompt can fire.
+
+```json
+{
+  "network": { "allowUnauthenticatedSocksProxy": true }
+}
+```
+
+This is the runtime's supported opt-out. It disables auth on the local SOCKS front-end only — the HTTP proxy (npm/curl and credential injection) stays authenticated, and `allowedDomains`/`deniedDomains` filtering still applies to every connect. The SSH-agent socket itself remains gated by the per-action approval prompt under `allowUnixSockets`/session allowance. Without this flag the token's job is to stop other local processes from using the SOCKS proxy while a session runs; on a single-user dev machine that risk is moot.
 
 ### Chromium and Playwright on macOS
 
