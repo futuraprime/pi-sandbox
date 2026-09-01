@@ -27,18 +27,19 @@
   },
   "homepage": "https://github.com/carderne/pi-sandbox",
   "scripts": {
-    "fmt": "./node_modules/.bin/oxfmt index.ts diagnostics.ts sandbox-command.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts",
-    "lint": "./node_modules/.bin/oxlint index.ts diagnostics.ts sandbox-command.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts",
+    "fmt": "./node_modules/.bin/oxfmt index.ts diagnostics.ts sandbox-command.ts git-upstream.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts git-upstream.test.ts",
+    "lint": "./node_modules/.bin/oxlint index.ts diagnostics.ts sandbox-command.ts git-upstream.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts git-upstream.test.ts",
     "check": "tsc --noEmit",
     "test": "vitest run",
     "all": "npm run fmt && npm run lint && npm run check && npm run test",
-    "ci:fmt": "./node_modules/.bin/oxfmt --check index.ts diagnostics.ts sandbox-command.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts",
+    "ci:fmt": "./node_modules/.bin/oxfmt --check index.ts diagnostics.ts sandbox-command.ts git-upstream.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts git-upstream.test.ts",
     "ci:lint": "npm run lint",
     "ci:check": "npm run check",
     "ci:test": "npm run test"
   },
   "dependencies": {
-    "@carderne/sandbox-runtime": "^0.0.49"
+    "@carderne/sandbox-runtime": "^0.0.49",
+    "typebox": "^1.1.24"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.0"

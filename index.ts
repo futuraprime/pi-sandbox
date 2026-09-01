@@ -85,6 +85,7 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Container, matchesKey, Key, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 
 import {
   diagnosticIdentity,
@@ -106,6 +107,7 @@ import {
   type SandboxIncident,
   type SandboxPromptChoice,
 } from "./diagnostics.js";
+import { runGitCommand, setGitUpstream } from "./git-upstream.js";
 import {
   describeSandboxCommandResult,
   formatSandboxCommandUsage,
@@ -1612,6 +1614,49 @@ export default function (pi: ExtensionAPI) {
       },
     };
   }
+
+  // ── Git upstream tool — narrowly scoped config mutation ───────────────────
+
+  pi.registerTool({
+    name: "set_git_upstream",
+    label: "Set Git upstream",
+    description:
+      "Set a local branch to track an existing branch on the origin remote. " +
+      "This tool accepts branch names only and cannot run arbitrary Git commands or modify other config.",
+    promptSnippet: "Set a local branch to track an existing origin branch",
+    parameters: Type.Object(
+      {
+        localBranch: Type.String({ description: "The existing local branch name" }),
+        remote: Type.Literal("origin", {
+          description: 'The only permitted remote; must be "origin"',
+        }),
+        remoteBranch: Type.String({ description: "The existing remote branch name" }),
+      },
+      { additionalProperties: false },
+    ),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      await setGitUpstream(
+        {
+          cwd: ctx.cwd,
+          localBranch: params.localBranch,
+          remote: params.remote,
+          remoteBranch: params.remoteBranch,
+        },
+        runGitCommand,
+        signal,
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Local branch "${params.localBranch}" now tracks "${params.remote}/${params.remoteBranch}".`,
+          },
+        ],
+        details: {},
+      };
+    },
+  });
 
   // ── Bash tool — instrumented diagnostics and retry ───────────────────────
 
