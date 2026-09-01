@@ -267,6 +267,11 @@ function isClearlySshTargetedCommand(command: string): boolean {
   );
 }
 
+export function shouldPreflightSshAuth(command: string): boolean {
+  const hasMultipleShellSteps = /&&|\|\||;|\n/.test(command);
+  return hasMultipleShellSteps && isClearlySshTargetedCommand(command);
+}
+
 export function makeSshAgentFallbackDiagnostic(
   sshAuthSock: string | undefined,
   command: string,

@@ -98,6 +98,7 @@ import {
   renderDiagnosticSummaryLines,
   retainIncident,
   selectPrimaryViolation,
+  shouldPreflightSshAuth,
   trimIncidents,
   type SandboxDiagnostic,
   type SandboxDiagnosticBlockData,
@@ -1411,9 +1412,54 @@ export default function (pi: ExtensionAPI) {
         let finalExitCode = 1;
 
         while (true) {
-          const { allowed, denied } = getEffectiveDomains(cwd);
+          const { allowed, denied, allowUnixSockets, allowAllUnixSockets } =
+            getEffectiveDomains(cwd);
           const domains = extractDomainsFromCommand(command);
           let precheckBlocked = false;
+          const sshAuthSock = process.env.SSH_AUTH_SOCK;
+
+          if (
+            sshAuthSock &&
+            shouldPreflightSshAuth(command) &&
+            !allowAllUnixSockets &&
+            !allowUnixSockets.includes(sshAuthSock)
+          ) {
+            const diagnostic: SandboxDiagnostic = {
+              type: "ssh-auth",
+              target: "current SSH agent",
+              rawTarget: sshAuthSock,
+              rule: "ssh agent socket blocked",
+              promptable: true,
+              action: "allow SSH use for this session",
+            };
+            incident.violations = addUniqueDiagnostics(incident.violations, [diagnostic]);
+            updateIncidentPrimary(incident);
+
+            const choice = await maybePromptForDiagnostic(ctx, incident, diagnostic);
+            lastPrompted = diagnostic;
+            if (choice === "abort" || choice === "none") {
+              incident.finalOutcome = "failure";
+              const diagnosticBlock = renderDiagnosticBlock(incident);
+              const diagnosticData = getDiagnosticBlockData(incident);
+              emitOutput(
+                originalOnData,
+                source === "user_bash" && diagnosticData
+                  ? `Blocked: SSH agent access is not allowed.\n${renderDiagnosticNotice(diagnosticData)}\n`
+                  : `Blocked: SSH agent access is not allowed.\n${diagnosticBlock ?? ""}\n`,
+              );
+              if (source === "user_bash" && options?.recordDiagnosticInContext && diagnosticBlock) {
+                pi.sendMessage({
+                  customType: "sandbox-diagnostic",
+                  content: diagnosticBlock,
+                  display: false,
+                });
+              }
+              storeIncident(incident);
+              return { exitCode: 1 };
+            }
+
+            precheckBlocked = true;
+          }
 
           for (const domain of domains) {
             const verdict = checkPermission(

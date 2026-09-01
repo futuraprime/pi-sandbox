@@ -11,6 +11,7 @@ import {
   renderDiagnosticSummaryLines,
   retainIncident,
   selectPrimaryViolation,
+  shouldPreflightSshAuth,
   trimIncidents,
   type SandboxDiagnostic,
   type SandboxIncident,
@@ -169,6 +170,18 @@ describe("formatCommandPreview", () => {
   it("squashes whitespace and truncates long commands", () => {
     expect(formatCommandPreview("git   push\norigin   main")).toBe("git push origin main");
     expect(formatCommandPreview(`echo ${"x".repeat(120)}`)).toMatch(/\.\.\.$/);
+  });
+});
+
+describe("shouldPreflightSshAuth", () => {
+  it("preflights compound Git commands that may need SSH", () => {
+    expect(shouldPreflightSshAuth('git commit -m "change" && git push origin main')).toBe(true);
+    expect(shouldPreflightSshAuth("echo ready; git fetch origin")).toBe(true);
+  });
+
+  it("leaves simple SSH and unrelated compound commands on the normal path", () => {
+    expect(shouldPreflightSshAuth("git push origin main")).toBe(false);
+    expect(shouldPreflightSshAuth("pnpm test && pnpm run check")).toBe(false);
   });
 });
 
