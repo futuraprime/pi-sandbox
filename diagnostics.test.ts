@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   diagnosticIdentity,
   formatCommandPreview,
+  grantSshSessionAccess,
   isMateriallyDifferent,
   makeSshAgentFallbackDiagnostic,
   parseDiagnosticBlock,
@@ -10,6 +11,7 @@ import {
   renderDiagnosticNotice,
   renderDiagnosticSummaryLines,
   retainIncident,
+  runSshAuthPreflight,
   selectPrimaryViolation,
   shouldPreflightSshAuth,
   trimIncidents,
@@ -174,14 +176,123 @@ describe("formatCommandPreview", () => {
 });
 
 describe("shouldPreflightSshAuth", () => {
-  it("preflights compound Git commands that may need SSH", () => {
-    expect(shouldPreflightSshAuth('git commit -m "change" && git push origin main')).toBe(true);
-    expect(shouldPreflightSshAuth("echo ready; git fetch origin")).toBe(true);
+  it.each([
+    'git commit -m "change" && git push origin main',
+    "echo ready; git fetch origin",
+    "pnpm test || ssh deploy@example.com",
+    "printf ready | git ls-remote git@example.com:team/repo.git",
+    "git clone ssh://git@example.com/team/repo.git & echo queued",
+    "echo ready\ngit pull origin main",
+    "build |& ssh-add -l",
+    "TOKEN=value /usr/bin/git push origin main && echo done",
+    "git -C ./repo push origin main && echo done",
+  ])("preflights compound SSH-capable command: %s", (command) => {
+    expect(shouldPreflightSshAuth(command)).toBe(true);
   });
 
-  it("leaves simple SSH and unrelated compound commands on the normal path", () => {
-    expect(shouldPreflightSshAuth("git push origin main")).toBe(false);
-    expect(shouldPreflightSshAuth("pnpm test && pnpm run check")).toBe(false);
+  it.each([
+    "git push origin main",
+    "ssh deploy@example.com",
+    "pnpm test && pnpm run check",
+    'echo "ssh" && npm test',
+    "printf 'git push' && echo done",
+    'echo "a; ssh host"',
+    "git clone https://example.com/team/repo.git && echo done",
+    "git fetch 'https://example.com/team/repo.git' || echo failed",
+    "ssh-agent && echo ready",
+    "git commit -m push && npm test",
+    "echo ready 2>&1",
+    "echo ready &>output.log",
+    "echo ready <&0",
+    "git push origin main >|output.log",
+  ])("leaves commands that do not need compound SSH preflight alone: %s", (command) => {
+    expect(shouldPreflightSshAuth(command)).toBe(false);
+  });
+});
+
+describe("grantSshSessionAccess", () => {
+  const socket = "/tmp/ssh-agent.sock";
+
+  it("adds the socket before reinitialising the sandbox", async () => {
+    const allowedSockets: string[] = [];
+    const granted = await grantSshSessionAccess({
+      socketPath: socket,
+      allowedSockets,
+      reinitialize: async () => allowedSockets.includes(socket),
+    });
+
+    expect(granted).toBe(true);
+    expect(allowedSockets).toEqual([socket]);
+  });
+
+  it.each([
+    async () => false,
+    async () => {
+      throw new Error("reset failed");
+    },
+  ])("rolls back a new allowance when reinitialisation fails", async (reinitialize) => {
+    const allowedSockets: string[] = [];
+    const granted = await grantSshSessionAccess({
+      socketPath: socket,
+      allowedSockets,
+      reinitialize,
+    });
+
+    expect(granted).toBe(false);
+    expect(allowedSockets).toEqual([]);
+  });
+});
+
+describe("runSshAuthPreflight", () => {
+  const command = "git commit -m change && git push origin main";
+  const socket = "/tmp/ssh-agent.sock";
+
+  it("requests and grants access once before continuing", async () => {
+    const events: string[] = [];
+    const result = await runSshAuthPreflight({
+      command,
+      sshAuthSock: socket,
+      allowedSockets: [],
+      allowAllSockets: false,
+      requestAccess: async (socketPath) => {
+        events.push(`grant:${socketPath}`);
+        return true;
+      },
+    });
+
+    expect(result).toBe("allowed");
+    expect(events).toEqual([`grant:${socket}`]);
+  });
+
+  it("blocks when access is denied", async () => {
+    const result = await runSshAuthPreflight({
+      command,
+      sshAuthSock: socket,
+      allowedSockets: [],
+      allowAllSockets: false,
+      requestAccess: async () => false,
+    });
+
+    expect(result).toBe("blocked");
+  });
+
+  it.each([
+    { allowedSockets: [socket], allowAllSockets: false },
+    { allowedSockets: [], allowAllSockets: true },
+  ])("does not prompt when socket access already exists", async (access) => {
+    let prompts = 0;
+    const result = await runSshAuthPreflight({
+      command,
+      sshAuthSock: socket,
+      ...access,
+      requestAccess: async () => {
+        prompts++;
+        return true;
+      },
+    });
+
+    expect(result).toBe("not-needed");
+    expect(prompts).toBe(0);
   });
 });
 

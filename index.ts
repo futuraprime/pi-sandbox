@@ -90,6 +90,7 @@ import {
   diagnosticIdentity,
   formatCommandPreview,
   getDiagnosticBlockData,
+  grantSshSessionAccess,
   isMateriallyDifferent,
   makeSshAgentFallbackDiagnostic,
   parseDiagnosticBlock,
@@ -97,8 +98,8 @@ import {
   renderDiagnosticNotice,
   renderDiagnosticSummaryLines,
   retainIncident,
+  runSshAuthPreflight,
   selectPrimaryViolation,
-  shouldPreflightSshAuth,
   trimIncidents,
   type SandboxDiagnostic,
   type SandboxDiagnosticBlockData,
@@ -950,8 +951,8 @@ export default function (pi: ExtensionAPI) {
   // Called after granting a session/permanent allowance so the OS-level sandbox
   // picks up the new rules before the next bash subprocess starts.
 
-  async function reinitializeSandbox(cwd: string): Promise<void> {
-    if (!sandboxInitialized) return;
+  async function reinitializeSandbox(cwd: string): Promise<boolean> {
+    if (!sandboxInitialized) return true;
     const config = loadConfig(cwd);
     const configExt = config as unknown as { allowBrowserProcess?: boolean };
     try {
@@ -979,8 +980,10 @@ export default function (pi: ExtensionAPI) {
         },
         createNetworkAskCallback(network.allowedDomains),
       );
+      return true;
     } catch (e) {
       console.error(`Warning: Failed to reinitialize sandbox: ${e}`);
+      return false;
     }
   }
 
@@ -1227,9 +1230,12 @@ export default function (pi: ExtensionAPI) {
     await reinitializeSandbox(cwd);
   }
 
-  async function applySshAuthChoice(socketPath: string, cwd: string): Promise<void> {
-    if (!sessionAllowedUnixSockets.includes(socketPath)) sessionAllowedUnixSockets.push(socketPath);
-    await reinitializeSandbox(cwd);
+  async function applySshAuthChoice(socketPath: string, cwd: string): Promise<boolean> {
+    return grantSshSessionAccess({
+      socketPath,
+      allowedSockets: sessionAllowedUnixSockets,
+      reinitialize: () => reinitializeSandbox(cwd),
+    });
   }
 
   function configMutationForChoice(
@@ -1276,10 +1282,12 @@ export default function (pi: ExtensionAPI) {
   async function requestSshAuthAccess(
     ctx: ExtensionContext,
     socketPath: string,
-  ): Promise<"abort" | "ssh-session"> {
+  ): Promise<"abort" | "ssh-session" | "none"> {
     const choice = await promptSshAuthBlock(ctx);
-    if (choice === "ssh-session") await applySshAuthChoice(socketPath, ctx.cwd);
-    return choice;
+    if (choice !== "ssh-session") return choice;
+    if (await applySshAuthChoice(socketPath, ctx.cwd)) return choice;
+    ctx.ui.notify("Failed to reinitialise the sandbox; SSH-agent access was not granted.", "error");
+    return "none";
   }
 
   async function redirectSandboxConfigMutationToPrompt(
@@ -1418,48 +1426,49 @@ export default function (pi: ExtensionAPI) {
           let precheckBlocked = false;
           const sshAuthSock = process.env.SSH_AUTH_SOCK;
 
-          if (
-            sshAuthSock &&
-            shouldPreflightSshAuth(command) &&
-            !allowAllUnixSockets &&
-            !allowUnixSockets.includes(sshAuthSock)
-          ) {
-            const diagnostic: SandboxDiagnostic = {
-              type: "ssh-auth",
-              target: "current SSH agent",
-              rawTarget: sshAuthSock,
-              rule: "ssh agent socket blocked",
-              promptable: true,
-              action: "allow SSH use for this session",
-            };
-            incident.violations = addUniqueDiagnostics(incident.violations, [diagnostic]);
-            updateIncidentPrimary(incident);
+          const sshPreflight = await runSshAuthPreflight({
+            command,
+            sshAuthSock,
+            allowedSockets: allowUnixSockets,
+            allowAllSockets: allowAllUnixSockets,
+            requestAccess: async (socketPath) => {
+              const diagnostic: SandboxDiagnostic = {
+                type: "ssh-auth",
+                target: "current SSH agent",
+                rawTarget: socketPath,
+                rule: "ssh agent socket blocked",
+                promptable: true,
+                action: "allow SSH use for this session",
+              };
+              incident.violations = addUniqueDiagnostics(incident.violations, [diagnostic]);
+              updateIncidentPrimary(incident);
+              const choice = await maybePromptForDiagnostic(ctx, incident, diagnostic);
+              lastPrompted = diagnostic;
+              return choice === "ssh-session";
+            },
+          });
 
-            const choice = await maybePromptForDiagnostic(ctx, incident, diagnostic);
-            lastPrompted = diagnostic;
-            if (choice === "abort" || choice === "none") {
-              incident.finalOutcome = "failure";
-              const diagnosticBlock = renderDiagnosticBlock(incident);
-              const diagnosticData = getDiagnosticBlockData(incident);
-              emitOutput(
-                originalOnData,
-                source === "user_bash" && diagnosticData
-                  ? `Blocked: SSH agent access is not allowed.\n${renderDiagnosticNotice(diagnosticData)}\n`
-                  : `Blocked: SSH agent access is not allowed.\n${diagnosticBlock ?? ""}\n`,
-              );
-              if (source === "user_bash" && options?.recordDiagnosticInContext && diagnosticBlock) {
-                pi.sendMessage({
-                  customType: "sandbox-diagnostic",
-                  content: diagnosticBlock,
-                  display: false,
-                });
-              }
-              storeIncident(incident);
-              return { exitCode: 1 };
+          if (sshPreflight === "blocked") {
+            incident.finalOutcome = "failure";
+            const diagnosticBlock = renderDiagnosticBlock(incident);
+            const diagnosticData = getDiagnosticBlockData(incident);
+            emitOutput(
+              originalOnData,
+              source === "user_bash" && diagnosticData
+                ? `Blocked: SSH agent access is not allowed.\n${renderDiagnosticNotice(diagnosticData)}\n`
+                : `Blocked: SSH agent access is not allowed.\n${diagnosticBlock ?? ""}\n`,
+            );
+            if (source === "user_bash" && options?.recordDiagnosticInContext && diagnosticBlock) {
+              pi.sendMessage({
+                customType: "sandbox-diagnostic",
+                content: diagnosticBlock,
+                display: false,
+              });
             }
-
-            precheckBlocked = true;
+            storeIncident(incident);
+            return { exitCode: 1 };
           }
+          if (sshPreflight === "allowed") precheckBlocked = true;
 
           for (const domain of domains) {
             const verdict = checkPermission(

@@ -257,19 +257,123 @@ export function formatCommandPreview(command: string): string {
   return `${squashed.slice(0, 77)}...`;
 }
 
+function shellCommandWords(command: string): string[][] {
+  const segments: string[][] = [[]];
+  let word = "";
+  let quote = "";
+  let escaped = false;
+
+  const finishWord = (): void => {
+    if (word) segments.at(-1)?.push(word);
+    word = "";
+  };
+  const finishSegment = (): void => {
+    finishWord();
+    segments.push([]);
+  };
+
+  for (let i = 0; i < command.length; i++) {
+    const character = command[i];
+    if (escaped) {
+      word += character;
+      escaped = false;
+    } else if (character === "\\" && quote !== "'") {
+      escaped = true;
+    } else if (quote) {
+      if (character === quote) quote = "";
+      else word += character;
+    } else if (character === "'" || character === '"') {
+      quote = character;
+    } else if (/\s/.test(character) && character !== "\n") {
+      finishWord();
+    } else if (
+      character === ";" ||
+      character === "\n" ||
+      (character === "|" && command[i - 1] !== ">")
+    ) {
+      finishSegment();
+      if ((character === "|" && command[i + 1] === "|") || command[i + 1] === "&") i++;
+    } else if (
+      character === "&" &&
+      command[i - 1] !== ">" &&
+      command[i - 1] !== "<" &&
+      command[i + 1] !== ">"
+    ) {
+      finishSegment();
+      if (command[i + 1] === "&") i++;
+    } else {
+      word += character;
+    }
+  }
+
+  if (escaped) word += "\\";
+  finishWord();
+  return segments;
+}
+
+function isSshCommandSegment(words: string[]): boolean {
+  const executableIndex = words.findIndex((word) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word));
+  const executable = words[executableIndex]?.split("/").pop();
+  if (executable === "ssh" || executable === "ssh-add") return true;
+  if (executable !== "git") return false;
+
+  let operationIndex = executableIndex + 1;
+  const optionsWithValues = new Set(["-C", "-c", "--git-dir", "--work-tree", "--namespace"]);
+  while (words[operationIndex]?.startsWith("-")) {
+    operationIndex += optionsWithValues.has(words[operationIndex]) ? 2 : 1;
+  }
+  if (!/^(clone|fetch|pull|push|ls-remote)$/.test(words[operationIndex] ?? "")) return false;
+
+  const operationArguments = words.slice(operationIndex + 1);
+  if (operationArguments.some((word) => /^(?:ssh|git\+ssh):\/\//i.test(word))) return true;
+  if (operationArguments.some((word) => /^[^@\s]+@[^\s:]+:/.test(word))) return true;
+  if (operationArguments.some((word) => /^https?:\/\//i.test(word))) return false;
+  return true;
+}
+
 function isClearlySshTargetedCommand(command: string): boolean {
-  return (
-    /\bssh\b/.test(command) ||
-    (/\bgit\b/.test(command) &&
-      (/\b(?:ls-remote|fetch|pull|push|clone)\b/.test(command) ||
-        /git@[^\s:]+:/.test(command) ||
-        /ssh:\/\//.test(command)))
-  );
+  return shellCommandWords(command).some(isSshCommandSegment);
 }
 
 export function shouldPreflightSshAuth(command: string): boolean {
-  const hasMultipleShellSteps = /&&|\|\||;|\n/.test(command);
-  return hasMultipleShellSteps && isClearlySshTargetedCommand(command);
+  const segments = shellCommandWords(command);
+  return segments.length > 1 && segments.some(isSshCommandSegment);
+}
+
+export async function grantSshSessionAccess(options: {
+  socketPath: string;
+  allowedSockets: string[];
+  reinitialize: () => Promise<boolean>;
+}): Promise<boolean> {
+  const { socketPath, allowedSockets, reinitialize } = options;
+  const added = !allowedSockets.includes(socketPath);
+  if (added) allowedSockets.push(socketPath);
+  try {
+    if (await reinitialize()) return true;
+  } catch {
+    // Treat reset/initialisation errors as a denied grant and restore session state.
+  }
+  if (added) allowedSockets.splice(allowedSockets.indexOf(socketPath), 1);
+  return false;
+}
+
+export async function runSshAuthPreflight(options: {
+  command: string;
+  sshAuthSock?: string;
+  allowedSockets: string[];
+  allowAllSockets: boolean;
+  requestAccess: (socketPath: string) => Promise<boolean>;
+}): Promise<"not-needed" | "allowed" | "blocked"> {
+  const { command, sshAuthSock, allowedSockets, allowAllSockets, requestAccess } = options;
+  if (
+    !sshAuthSock ||
+    !shouldPreflightSshAuth(command) ||
+    allowAllSockets ||
+    allowedSockets.includes(sshAuthSock)
+  ) {
+    return "not-needed";
+  }
+  return (await requestAccess(sshAuthSock)) ? "allowed" : "blocked";
 }
 
 export function makeSshAgentFallbackDiagnostic(
