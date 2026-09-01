@@ -5,6 +5,7 @@ import {
   formatCommandPreview,
   grantSshSessionAccess,
   isMateriallyDifferent,
+  isGitUpstreamMutationCommand,
   makeSshAgentFallbackDiagnostic,
   parseDiagnosticBlock,
   renderDiagnosticBlock,
@@ -172,6 +173,59 @@ describe("formatCommandPreview", () => {
   it("squashes whitespace and truncates long commands", () => {
     expect(formatCommandPreview("git   push\norigin   main")).toBe("git push origin main");
     expect(formatCommandPreview(`echo ${"x".repeat(120)}`)).toMatch(/\.\.\.$/);
+  });
+});
+
+describe("isGitUpstreamMutationCommand", () => {
+  it.each([
+    "git branch -u origin/main main",
+    "git branch -uorigin/main main",
+    "git branch --set-upstream-to origin/main main",
+    "git branch --set-upstream-to=origin/main main",
+    "git -C ./repo branch -u origin/main main",
+    "GIT_DIR=.git /usr/bin/git branch --set-upstream-to=origin/main main",
+    "git -c alias.branch=!bad branch -u origin/main main",
+    "git push -u origin main",
+    "git push --set-upstream origin main",
+    "git push origin main --set-upstream",
+    "echo ready && git push -u origin main",
+    "git branch -u origin/main main; echo done",
+    "env git push -u origin main",
+    "command git branch --set-upstream-to=origin/main main",
+    "(git push -u origin main)",
+    'sh -c "git branch -u origin/main main"',
+    "git branch --unset-upstream main",
+    "git config branch.main.remote origin",
+    "git config --unset branch.main.merge",
+    "git config unset Branch.main.Remote",
+  ])("identifies tracking mutations: %s", (command) => {
+    expect(isGitUpstreamMutationCommand(command)).toBe(true);
+  });
+
+  it.each([
+    "git push origin main",
+    "git branch main",
+    "git branch --track feature origin/feature",
+    "git switch --track -c feature origin/feature",
+    "git checkout --track -b feature origin/feature",
+    "git config --get branch.main.remote",
+    "git config branch.main.remote",
+    "git config unrelated.setting value",
+    "git remote set-head origin -a",
+    'printf "git push -u origin main"',
+    "echo 'git branch -u origin/main main'",
+  ])("leaves non-tracking commands alone: %s", (command) => {
+    expect(isGitUpstreamMutationCommand(command)).toBe(false);
+  });
+
+  it("expands configured Git aliases", () => {
+    const aliases = new Map([
+      ["track", "branch --set-upstream-to=origin/main"],
+      ["publish", "!git push -u origin main"],
+    ]);
+
+    expect(isGitUpstreamMutationCommand("git track main", aliases)).toBe(true);
+    expect(isGitUpstreamMutationCommand("env git publish", aliases)).toBe(true);
   });
 });
 

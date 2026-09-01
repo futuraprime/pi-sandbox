@@ -90,6 +90,8 @@ import { Type } from "typebox";
 import {
   diagnosticIdentity,
   formatCommandPreview,
+  gitOperationNames,
+  isGitUpstreamMutationCommand,
   getDiagnosticBlockData,
   grantSshSessionAccess,
   isMateriallyDifferent,
@@ -850,6 +852,24 @@ function createSandboxedBashOps(shellPath?: string): BashOperations {
 }
 
 // ── Extension ─────────────────────────────────────────────────────────────────
+
+async function shouldRedirectGitUpstreamMutation(command: string, cwd: string): Promise<boolean> {
+  if (isGitUpstreamMutationCommand(command)) return true;
+  if (gitOperationNames(command).length === 0) return false;
+
+  const result = await runGitCommand({
+    cwd,
+    args: ["-c", "alias.config=", "config", "--get-regexp", "^alias\\."],
+  }).catch(() => null);
+  if (!result || result.exitCode !== 0) return false;
+
+  const aliases = new Map<string, string>();
+  for (const line of result.stdout.split(/\r?\n/)) {
+    const match = /^alias\.([^\s]+)\s+(.*)$/.exec(line);
+    if (match) aliases.set(match[1], match[2]);
+  }
+  return isGitUpstreamMutationCommand(command, aliases);
+}
 
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("no-sandbox", {
@@ -1714,6 +1734,18 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    if (
+      isToolCallEventType("bash", event) &&
+      (await shouldRedirectGitUpstreamMutation(event.input.command, ctx.cwd))
+    ) {
+      return {
+        block: true,
+        reason:
+          "Use the set_git_upstream tool for Git branch tracking instead of Bash. " +
+          "If git push -u is needed to publish the branch, push without -u first, then call set_git_upstream.",
+      };
+    }
+
     if (
       (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) &&
       isSandboxConfigPath((event.input as { path: string }).path, ctx.cwd)

@@ -311,6 +311,173 @@ function shellCommandWords(command: string): string[][] {
   return segments;
 }
 
+interface GitOperation {
+  name: string;
+  arguments: string[];
+}
+
+function trimShellGrouping(word: string): string {
+  return word.replace(/^[({]+/, "").replace(/[)}]+$/, "");
+}
+
+function commandExecutableIndex(words: string[]): number {
+  let index = words.findIndex((word) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word));
+  if (index < 0) return index;
+
+  while (index < words.length) {
+    const executable = trimShellGrouping(words[index]).split("/").pop();
+    if (executable === "command") {
+      index++;
+      while (words[index]?.startsWith("-")) {
+        if (words[index] === "-v" || words[index] === "-V") return -1;
+        index++;
+      }
+    } else if (executable === "env") {
+      index++;
+      while (index < words.length) {
+        const word = words[index];
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) index++;
+        else if (/^(?:-u|--unset|-C|--chdir|-S|--split-string)$/.test(word)) index += 2;
+        else if (word.startsWith("-") && word !== "--") index++;
+        else {
+          if (word === "--") index++;
+          break;
+        }
+      }
+    } else if (executable === "!") {
+      index++;
+    } else {
+      break;
+    }
+  }
+  return index;
+}
+
+function gitOperation(words: string[]): GitOperation | null {
+  const executableIndex = commandExecutableIndex(words);
+  const executable = trimShellGrouping(words[executableIndex] ?? "")
+    .split("/")
+    .pop();
+  if (executable !== "git") return null;
+
+  let operationIndex = executableIndex + 1;
+  const optionsWithValues = new Set([
+    "-C",
+    "-c",
+    "--config-env",
+    "--exec-path",
+    "--git-dir",
+    "--namespace",
+    "--super-prefix",
+    "--work-tree",
+  ]);
+  while (words[operationIndex]?.startsWith("-")) {
+    if (words[operationIndex] === "--") return null;
+    operationIndex += optionsWithValues.has(words[operationIndex]) ? 2 : 1;
+  }
+  const name = words[operationIndex];
+  if (!name) return null;
+  return { name, arguments: words.slice(operationIndex + 1) };
+}
+
+function isGitUpstreamOption(word: string): boolean {
+  return (
+    word.startsWith("-u") ||
+    word === "--set-upstream" ||
+    word.startsWith("--set-upstream=") ||
+    word === "--set-upstream-to" ||
+    word.startsWith("--set-upstream-to=")
+  );
+}
+
+function isTrackingConfigKey(word: string): boolean {
+  return /^branch\..+\.(?:remote|merge)$/i.test(word);
+}
+
+function isTrackingConfigMutation(arguments_: string[]): boolean {
+  const keyIndex = arguments_.findIndex(isTrackingConfigKey);
+  if (keyIndex < 0) return false;
+
+  const readOptions = new Set(["--get", "--get-all", "--get-regexp", "--get-urlmatch"]);
+  if (arguments_.some((word) => readOptions.has(word))) return false;
+
+  const mutationOptions = new Set([
+    "--add",
+    "--replace-all",
+    "--unset",
+    "--unset-all",
+    "set",
+    "unset",
+  ]);
+  return (
+    arguments_.some((word) => mutationOptions.has(word)) ||
+    arguments_.slice(keyIndex + 1).some((word) => word !== "--")
+  );
+}
+
+function isGitUpstreamMutationSegment(
+  words: string[],
+  aliases: ReadonlyMap<string, string>,
+  visitedAliases: ReadonlySet<string> = new Set(),
+): boolean {
+  const operation = gitOperation(words);
+  if (!operation) return false;
+  if (
+    (operation.name === "branch" || operation.name === "push") &&
+    operation.arguments.some((word) => isGitUpstreamOption(word) || word === "--unset-upstream")
+  ) {
+    return true;
+  }
+  if (operation.name === "config" && isTrackingConfigMutation(operation.arguments)) return true;
+
+  const alias = aliases.get(operation.name);
+  if (!alias || visitedAliases.has(operation.name)) return false;
+  const nextVisited = new Set(visitedAliases).add(operation.name);
+  if (alias.startsWith("!")) {
+    return isGitUpstreamMutationCommand(alias.slice(1), aliases, nextVisited);
+  }
+
+  const aliasWords = shellCommandWords(alias)[0] ?? [];
+  return isGitUpstreamMutationSegment(
+    ["git", ...aliasWords, ...operation.arguments],
+    aliases,
+    nextVisited,
+  );
+}
+
+function nestedShellCommand(words: string[]): string | null {
+  const executableIndex = commandExecutableIndex(words);
+  const executable = trimShellGrouping(words[executableIndex] ?? "")
+    .split("/")
+    .pop();
+  if (!/^(?:ba|da|k|z)?sh$/.test(executable ?? "")) return null;
+  const commandOptionIndex = words.findIndex(
+    (word, index) => index > executableIndex && /^-[a-zA-Z]*c[a-zA-Z]*$/.test(word),
+  );
+  return commandOptionIndex < 0 ? null : (words[commandOptionIndex + 1] ?? null);
+}
+
+export function gitOperationNames(command: string): string[] {
+  return shellCommandWords(command).flatMap((words) => {
+    const operation = gitOperation(words);
+    if (operation) return [operation.name];
+    const nested = nestedShellCommand(words);
+    return nested ? gitOperationNames(nested) : [];
+  });
+}
+
+export function isGitUpstreamMutationCommand(
+  command: string,
+  aliases: ReadonlyMap<string, string> = new Map(),
+  visitedAliases: ReadonlySet<string> = new Set(),
+): boolean {
+  return shellCommandWords(command).some((words) => {
+    if (isGitUpstreamMutationSegment(words, aliases, visitedAliases)) return true;
+    const nested = nestedShellCommand(words);
+    return nested ? isGitUpstreamMutationCommand(nested, aliases, visitedAliases) : false;
+  });
+}
+
 function isSshCommandSegment(words: string[]): boolean {
   const executableIndex = words.findIndex((word) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(word));
   const executable = words[executableIndex]?.split("/").pop();
