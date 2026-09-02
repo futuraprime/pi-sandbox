@@ -37,6 +37,14 @@ function fakeRunner(
 ): (command: GitCommand) => Promise<GitCommandResult> {
   return async (command) => {
     commands.push(command);
+    if (command.args[2] === "check-ref-format") {
+      try {
+        execFileSync("git", [...command.args], { stdio: "ignore" });
+        return { exitCode: 0, stdout: "", stderr: "" };
+      } catch {
+        return { exitCode: 1, stdout: "", stderr: "" };
+      }
+    }
     if (command.args[2] === "remote") {
       return { exitCode: 0, stdout: remoteOutput, stderr: "" };
     }
@@ -103,6 +111,14 @@ describe("setGitUpstream", () => {
     await setGitUpstream(input({ remoteBranch: "feature/topic" }), fakeRunner(commands));
 
     expect(commands).toEqual([
+      {
+        cwd: "/tmp/repository",
+        args: ["-c", "alias.check-ref-format=", "check-ref-format", "--branch", "main"],
+      },
+      {
+        cwd: "/tmp/repository",
+        args: ["-c", "alias.check-ref-format=", "check-ref-format", "--branch", "feature/topic"],
+      },
       { cwd: "/tmp/repository", args: ["-c", "alias.remote=", "remote"] },
       {
         cwd: "/tmp/repository",
@@ -128,13 +144,12 @@ describe("setGitUpstream", () => {
     ["remote-branch path", { remoteBranch: "../main" }],
     ["remote-branch command", { remoteBranch: "main; touch escaped" }],
     ["remote-branch option", { remoteBranch: "--upload-pack=escaped" }],
-  ] as const)("rejects an invalid $0 before running Git", async (_label, overrides) => {
+  ] as const)("rejects an invalid $0", async (_label, overrides) => {
     const commands: GitCommand[] = [];
 
     await expect(
       setGitUpstream(input(overrides as Partial<GitUpstreamInput>), fakeRunner(commands)),
     ).rejects.toThrow(/invalid/i);
-    expect(commands).toEqual([]);
   });
 
   it("refuses the upstream remote explicitly", async () => {
@@ -152,7 +167,41 @@ describe("setGitUpstream", () => {
     await expect(setGitUpstream(input(), fakeRunner(commands, "backup\n"))).rejects.toThrow(
       /origin/i,
     );
-    expect(commands).toEqual([{ cwd: "/tmp/repository", args: ["-c", "alias.remote=", "remote"] }]);
+    expect(commands).toEqual([
+      {
+        cwd: "/tmp/repository",
+        args: ["-c", "alias.check-ref-format=", "check-ref-format", "--branch", "main"],
+      },
+      {
+        cwd: "/tmp/repository",
+        args: ["-c", "alias.check-ref-format=", "check-ref-format", "--branch", "main"],
+      },
+      { cwd: "/tmp/repository", args: ["-c", "alias.remote=", "remote"] },
+    ]);
+  });
+
+  it.each(["_foo", "foo_", "föo"])("accepts Git branch name %s", async (branch) => {
+    const commands: GitCommand[] = [];
+
+    await setGitUpstream(
+      input({ localBranch: branch, remoteBranch: branch }),
+      fakeRunner(commands),
+    );
+
+    expect(commands[0].args).toEqual([
+      "-c",
+      "alias.check-ref-format=",
+      "check-ref-format",
+      "--branch",
+      branch,
+    ]);
+    expect(commands[1].args).toEqual([
+      "-c",
+      "alias.check-ref-format=",
+      "check-ref-format",
+      "--branch",
+      branch,
+    ]);
   });
 
   it("does not evaluate shell syntax in Git arguments", async () => {

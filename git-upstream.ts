@@ -31,8 +31,6 @@ export class GitUpstreamError extends Error {
   }
 }
 
-const MAX_REF_LENGTH = 255;
-const SAFE_REF_COMPONENT = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 const REDIRECTING_GIT_ENVIRONMENT = new Set([
   "GIT_ALTERNATE_OBJECT_DIRECTORIES",
   "GIT_COMMON_DIR",
@@ -49,17 +47,8 @@ const REDIRECTING_GIT_ENVIRONMENT = new Set([
   "GIT_WORK_TREE",
 ]);
 
-function isSafeRef(value: unknown): value is string {
-  if (typeof value !== "string" || value.length === 0 || value.length > MAX_REF_LENGTH) {
-    return false;
-  }
-  if (value === "@" || value.includes("..") || value.includes("//") || value.includes("@{")) {
-    return false;
-  }
-
-  return value.split("/").every((component) => {
-    return SAFE_REF_COMPONENT.test(component) && !component.endsWith(".lock");
-  });
+function isRefInput(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && !value.includes("\0");
 }
 
 function isValidCwd(value: unknown): value is string {
@@ -81,14 +70,33 @@ export function validateGitUpstreamInput(input: unknown): asserts input is GitUp
   if (!isValidCwd(candidate.cwd)) {
     throw new GitUpstreamError("Invalid repository working directory.");
   }
-  if (!isSafeRef(candidate.localBranch)) {
+  if (!isRefInput(candidate.localBranch)) {
     throw new GitUpstreamError("Invalid local branch name.");
   }
   if (candidate.remote !== "origin") {
     throw new GitUpstreamError('Invalid remote: only the existing "origin" remote is permitted.');
   }
-  if (!isSafeRef(candidate.remoteBranch)) {
+  if (!isRefInput(candidate.remoteBranch)) {
     throw new GitUpstreamError("Invalid remote branch name.");
+  }
+}
+
+async function validateGitRef(
+  cwd: string,
+  branch: string,
+  label: "local" | "remote",
+  runGit: GitCommandRunner,
+  signal?: AbortSignal,
+): Promise<void> {
+  const result = await runGit(
+    {
+      cwd,
+      args: ["-c", "alias.check-ref-format=", "check-ref-format", "--branch", branch],
+    },
+    signal,
+  );
+  if (result.exitCode !== 0) {
+    throw new GitUpstreamError(`Invalid ${label} branch name.`);
   }
 }
 
@@ -167,6 +175,8 @@ export async function setGitUpstream(
   signal?: AbortSignal,
 ): Promise<void> {
   validateGitUpstreamInput(input);
+  await validateGitRef(input.cwd, input.localBranch, "local", runGit, signal);
+  await validateGitRef(input.cwd, input.remoteBranch, "remote", runGit, signal);
 
   const remoteCommand: GitCommand = {
     cwd: input.cwd,

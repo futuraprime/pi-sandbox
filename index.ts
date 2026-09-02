@@ -90,7 +90,6 @@ import { Type } from "typebox";
 import {
   diagnosticIdentity,
   formatCommandPreview,
-  gitOperationNames,
   isGitUpstreamMutationCommand,
   getDiagnosticBlockData,
   grantSshSessionAccess,
@@ -853,22 +852,8 @@ function createSandboxedBashOps(shellPath?: string): BashOperations {
 
 // ── Extension ─────────────────────────────────────────────────────────────────
 
-async function shouldRedirectGitUpstreamMutation(command: string, cwd: string): Promise<boolean> {
-  if (isGitUpstreamMutationCommand(command)) return true;
-  if (gitOperationNames(command).length === 0) return false;
-
-  const result = await runGitCommand({
-    cwd,
-    args: ["-c", "alias.config=", "config", "--get-regexp", "^alias\\."],
-  }).catch(() => null);
-  if (!result || result.exitCode !== 0) return false;
-
-  const aliases = new Map<string, string>();
-  for (const line of result.stdout.split(/\r?\n/)) {
-    const match = /^alias\.([^\s]+)\s+(.*)$/.exec(line);
-    if (match) aliases.set(match[1], match[2]);
-  }
-  return isGitUpstreamMutationCommand(command, aliases);
+function shouldRedirectGitUpstreamMutation(command: string): boolean {
+  return isGitUpstreamMutationCommand(command);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -1305,6 +1290,14 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     socketPath: string,
   ): Promise<"abort" | "ssh-session" | "none"> {
+    if (process.platform === "linux") {
+      ctx.ui.notify(
+        "Path-specific SSH-agent access is not supported on Linux. Set network.allowAllUnixSockets=true to allow Unix sockets.",
+        "warning",
+      );
+      return "none";
+    }
+
     const choice = await promptSshAuthBlock(ctx);
     if (choice !== "ssh-session") return choice;
     if (await applySshAuthChoice(socketPath, ctx.cwd)) return choice;
@@ -1472,13 +1465,17 @@ export default function (pi: ExtensionAPI) {
 
           if (sshPreflight === "blocked") {
             incident.finalOutcome = "failure";
+            const reason =
+              process.platform === "linux"
+                ? "Blocked: path-specific SSH-agent access is not supported on Linux. Set network.allowAllUnixSockets=true to allow Unix sockets."
+                : "Blocked: SSH agent access is not allowed.";
             const diagnosticBlock = renderDiagnosticBlock(incident);
             const diagnosticData = getDiagnosticBlockData(incident);
             emitOutput(
               originalOnData,
               source === "user_bash" && diagnosticData
-                ? `Blocked: SSH agent access is not allowed.\n${renderDiagnosticNotice(diagnosticData)}\n`
-                : `Blocked: SSH agent access is not allowed.\n${diagnosticBlock ?? ""}\n`,
+                ? `${reason}\n${renderDiagnosticNotice(diagnosticData)}\n`
+                : `${reason}\n${diagnosticBlock ?? ""}\n`,
             );
             if (source === "user_bash" && options?.recordDiagnosticInContext && diagnosticBlock) {
               pi.sendMessage({
@@ -1736,7 +1733,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     if (
       isToolCallEventType("bash", event) &&
-      (await shouldRedirectGitUpstreamMutation(event.input.command, ctx.cwd))
+      shouldRedirectGitUpstreamMutation(event.input.command)
     ) {
       return {
         block: true,

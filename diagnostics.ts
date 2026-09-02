@@ -1,3 +1,7 @@
+import { realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { relative, resolve } from "node:path";
+
 export type SandboxDiagnosticType = "ssh-auth" | "read" | "write" | "network" | "ambiguous";
 
 export type SandboxPromptChoice =
@@ -381,13 +385,17 @@ function gitOperation(words: string[]): GitOperation | null {
 }
 
 function isGitUpstreamOption(word: string): boolean {
-  return (
-    word.startsWith("-u") ||
+  if (
     word === "--set-upstream" ||
     word.startsWith("--set-upstream=") ||
     word === "--set-upstream-to" ||
     word.startsWith("--set-upstream-to=")
-  );
+  ) {
+    return true;
+  }
+
+  // Git accepts short-option clusters, for example `git push -vu`.
+  return /^-[^-]*u/.test(word);
 }
 
 function isTrackingConfigKey(word: string): boolean {
@@ -415,11 +423,7 @@ function isTrackingConfigMutation(arguments_: string[]): boolean {
   );
 }
 
-function isGitUpstreamMutationSegment(
-  words: string[],
-  aliases: ReadonlyMap<string, string>,
-  visitedAliases: ReadonlySet<string> = new Set(),
-): boolean {
+function isGitUpstreamMutationSegment(words: string[]): boolean {
   const operation = gitOperation(words);
   if (!operation) return false;
   if (
@@ -428,21 +432,7 @@ function isGitUpstreamMutationSegment(
   ) {
     return true;
   }
-  if (operation.name === "config" && isTrackingConfigMutation(operation.arguments)) return true;
-
-  const alias = aliases.get(operation.name);
-  if (!alias || visitedAliases.has(operation.name)) return false;
-  const nextVisited = new Set(visitedAliases).add(operation.name);
-  if (alias.startsWith("!")) {
-    return isGitUpstreamMutationCommand(alias.slice(1), aliases, nextVisited);
-  }
-
-  const aliasWords = shellCommandWords(alias)[0] ?? [];
-  return isGitUpstreamMutationSegment(
-    ["git", ...aliasWords, ...operation.arguments],
-    aliases,
-    nextVisited,
-  );
+  return operation.name === "config" && isTrackingConfigMutation(operation.arguments);
 }
 
 function nestedShellCommand(words: string[]): string | null {
@@ -457,24 +447,11 @@ function nestedShellCommand(words: string[]): string | null {
   return commandOptionIndex < 0 ? null : (words[commandOptionIndex + 1] ?? null);
 }
 
-export function gitOperationNames(command: string): string[] {
-  return shellCommandWords(command).flatMap((words) => {
-    const operation = gitOperation(words);
-    if (operation) return [operation.name];
-    const nested = nestedShellCommand(words);
-    return nested ? gitOperationNames(nested) : [];
-  });
-}
-
-export function isGitUpstreamMutationCommand(
-  command: string,
-  aliases: ReadonlyMap<string, string> = new Map(),
-  visitedAliases: ReadonlySet<string> = new Set(),
-): boolean {
+export function isGitUpstreamMutationCommand(command: string): boolean {
   return shellCommandWords(command).some((words) => {
-    if (isGitUpstreamMutationSegment(words, aliases, visitedAliases)) return true;
+    if (isGitUpstreamMutationSegment(words)) return true;
     const nested = nestedShellCommand(words);
-    return nested ? isGitUpstreamMutationCommand(nested, aliases, visitedAliases) : false;
+    return nested ? isGitUpstreamMutationCommand(nested) : false;
   });
 }
 
@@ -507,13 +484,41 @@ export function shouldPreflightSshAuth(command: string): boolean {
   return segments.length > 1 && segments.some(isSshCommandSegment);
 }
 
+export function normaliseSocketPath(socketPath: string): string {
+  const expanded =
+    socketPath === "~"
+      ? homedir()
+      : socketPath.startsWith("~/")
+        ? `${homedir()}${socketPath.slice(1)}`
+        : socketPath;
+  const normalised = resolve(expanded);
+  try {
+    return realpathSync(normalised);
+  } catch {
+    return normalised;
+  }
+}
+
+export function socketPathMatches(allowedSocket: string, socketPath: string): boolean {
+  const relativePath = relative(
+    normaliseSocketPath(allowedSocket),
+    normaliseSocketPath(socketPath),
+  );
+  return relativePath === "" || (!relativePath.startsWith("..") && !relativePath.startsWith("/"));
+}
+
 export async function grantSshSessionAccess(options: {
   socketPath: string;
   allowedSockets: string[];
   reinitialize: () => Promise<boolean>;
+  platform?: NodeJS.Platform;
 }): Promise<boolean> {
-  const { socketPath, allowedSockets, reinitialize } = options;
-  const added = !allowedSockets.includes(socketPath);
+  const { socketPath, allowedSockets, reinitialize, platform = process.platform } = options;
+  if (platform === "linux") return false;
+
+  const added = !allowedSockets.some((allowedSocket) =>
+    socketPathMatches(allowedSocket, socketPath),
+  );
   if (added) allowedSockets.push(socketPath);
   try {
     if (await reinitialize()) return true;
@@ -530,14 +535,19 @@ export async function runSshAuthPreflight(options: {
   allowedSockets: string[];
   allowAllSockets: boolean;
   requestAccess: (socketPath: string) => Promise<boolean>;
+  platform?: NodeJS.Platform;
 }): Promise<"not-needed" | "allowed" | "blocked"> {
-  const { command, sshAuthSock, allowedSockets, allowAllSockets, requestAccess } = options;
-  if (
-    !sshAuthSock ||
-    !shouldPreflightSshAuth(command) ||
-    allowAllSockets ||
-    allowedSockets.includes(sshAuthSock)
-  ) {
+  const {
+    command,
+    sshAuthSock,
+    allowedSockets,
+    allowAllSockets,
+    requestAccess,
+    platform = process.platform,
+  } = options;
+  if (!sshAuthSock || !shouldPreflightSshAuth(command) || allowAllSockets) return "not-needed";
+  if (platform === "linux") return "blocked";
+  if (allowedSockets.some((allowedSocket) => socketPathMatches(allowedSocket, sshAuthSock))) {
     return "not-needed";
   }
   return (await requestAccess(sshAuthSock)) ? "allowed" : "blocked";

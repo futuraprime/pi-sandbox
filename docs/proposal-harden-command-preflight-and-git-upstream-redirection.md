@@ -1,190 +1,91 @@
-# Proposal: Harden command preflight and Git upstream redirection
+# Proposal: Focused command preflight and Git upstream fixes
 
 - **Status:** Proposed
 - **Date:** 2026-04-02
 
 ## Context
 
-The `ssh-compound-preflight` branch adds two related safeguards:
+The `ssh-compound-preflight` branch adds convenience behaviour around the existing OS-level sandbox:
 
-1. preflight SSH-agent access before compound shell commands run; and
-2. redirect Git branch-tracking mutations from the general Bash tool to the narrowly scoped `set_git_upstream` tool.
+- direct Git branch-tracking mutations are redirected from Bash to `set_git_upstream`;
+- compound commands that may use SSH are preflighted so the agent can approve SSH-agent access before retrying.
 
-The implementation currently uses a small custom shell tokenizer and partial Git argument parsing. Review found several cases where the preflight does not model the command that the shell or Git will actually execute. Some cases bypass the intended policy; others block valid operations or prompt when access is already allowed.
+Review found that a small command scanner cannot reliably understand every shell construct, and that reproducing Git's complete alias/configuration behaviour would add substantial complexity.
 
-These checks form a security boundary. False negatives can allow a protected mutation through Bash, while false positives can leave users without a supported way to complete a valid operation.
+These checks are **not** a security boundary. If detection misses a command, it still runs through the existing sandbox. The sandbox remains responsible for enforcing filesystem, network, and Unix-socket restrictions.
 
-## Decision drivers
+## Decision
 
-- Git upstream mutations must not bypass `set_git_upstream` through ordinary shell syntax, Git option forms, or aliases.
-- SSH preflight must inspect every command that the shell can execute before earlier parts of a compound command cause side effects.
-- Detection should fail closed when syntax cannot be interpreted safely.
-- The scoped tool should accept every valid Git branch name that can be passed safely as a fixed argument.
-- SSH socket checks should match the sandbox runtime's effective path semantics.
-- Tests should cover both accepted commands and bypass attempts.
+Keep the implementation focused on common cases and fix only the two correctness issues that affect the supported paths:
 
-## Findings and proposed fixes
+1. use Git itself to validate branch names for `set_git_upstream`; and
+2. make SSH socket approval agree with the sandbox's platform-specific path behaviour.
 
-### 1. Shell substitutions are not inspected
+Retain direct command detection as best effort. Do not build a shell parser or a complete Git alias resolver.
 
-The tokenizer splits top-level separators but does not parse command substitutions such as `$()` or backticks. For example:
+## Scope
 
-```sh
-echo "$(git push -u origin main)"
-echo "$(ssh host)"
-```
+### Direct Git detection
 
-The current checks see `echo` as the executable and do not inspect the nested command. The first example can mutate branch tracking through Bash; the second can run SSH without preflight.
-
-#### Proposed fix
-
-Replace the ad hoc tokenizer with a shell parser that produces an abstract syntax tree and recursively inspect:
-
-- command substitutions;
-- pipelines and logical lists;
-- grouped commands and subshells;
-- nested `sh -c` commands;
-- process substitutions, if supported by the configured shell; and
-- commands in assignments and redirections.
-
-If the parser cannot represent syntax accepted by the configured shell, fail closed for commands that may contain Git or SSH execution rather than treating them as safe. Do not keep extending the current character scanner one construct at a time: partial shell parsing is difficult to make reliable as a security boundary.
-
-Add tests for quoted and unquoted `$()`, backticks, nested substitutions, grouped commands, and malformed or unsupported syntax.
-
-### 2. Combined Git short options bypass upstream detection
-
-Git accepts short-option clusters. The current check recognises `-u` and options beginning with `-u`, but misses forms such as:
+Continue recognising ordinary direct commands such as:
 
 ```sh
-git push -vu origin main
+git push -u origin main
+git branch --set-upstream-to=origin/main main
+git config branch.main.remote origin
+git config --unset branch.main.merge
 ```
 
-Git interprets this as `-v -u`, so it sets the upstream even though the redirect does not trigger.
+Recognise short-option clusters such as `git push -vu origin main`, since Git treats `-vu` as including `-u`.
 
-#### Proposed fix
+The scanner does not need to understand command substitutions, every shell grammar feature, or context-dependent aliases. Commands using those forms may be missed by the redirect and will be handled by the sandbox as normal Bash commands.
 
-Parse short-option clusters for the relevant Git subcommands and treat `u` as `--set-upstream` wherever Git permits it. Keep long-option handling explicit and account for `--`, options with attached values, and options with separate values.
+### Git upstream tool
 
-Prefer a small Git-specific argument parser with per-subcommand option tables over string-prefix checks. Add positive tests for `-u`, `-uv`, `-vu`, and attached or separated values, plus negative tests for unrelated options.
-
-### 3. Invocation-specific and repository-specific aliases are resolved incorrectly
-
-Alias discovery runs `git config` in the tool context's working directory. It does not reproduce repository selection or temporary configuration from the original invocation. These examples can therefore evade detection:
-
-```sh
-git -c alias.publish='!git push -u origin main' publish
-git -C /other/repository publish
-```
-
-The first defines the alias only for that invocation. The second may use a repository-local alias that is not present in the original working directory.
-
-#### Proposed fix
-
-Parse Git's global options before resolving the operation:
-
-- apply each `-C` in order to determine the effective working directory;
-- include supported `-c name=value` and `--config-env` settings when determining the effective alias;
-- continue removing environment variables that can redirect Git to unrelated repositories or configuration; and
-- resolve aliases recursively with cycle and depth limits.
-
-Shell aliases beginning with `!` must be passed through the same shell-command inspection as the original command. If an alias cannot be resolved or parsed safely, block it and direct the caller to use `set_git_upstream` or a non-alias Git command.
-
-Tests should create aliases in different repositories, supply aliases with `-c`, cover chained and cyclic aliases, and verify that alias shell bodies cannot hide an upstream mutation.
-
-### 4. The scoped tool rejects valid Git branch names
-
-`set_git_upstream` uses a custom ASCII-only regular expression for refs. Git permits names that this expression rejects, including `_foo`, `foo_`, and Unicode names such as `föo`.
-
-Because Bash tracking mutations are redirected, users with these valid names have no supported fallback.
-
-#### Proposed fix
-
-Use Git itself for ref validation through fixed, non-shell arguments:
+Replace the custom branch-name regular expression with fixed-argument calls to:
 
 ```text
 git check-ref-format --branch <local-branch>
-git check-ref-format refs/heads/<remote-branch>
+git check-ref-format --branch <remote-branch>
 ```
 
-Continue passing branch names after `--` to mutation commands and retain the literal `origin` restriction. Where practical, separately verify that the local branch and `refs/remotes/origin/<remote-branch>` exist so error messages distinguish invalid names from missing refs.
+Keep the existing restrictions:
 
-Tests should include underscores at component boundaries, Unicode, nested names, maximum lengths, and Git-invalid forms such as `..`, `@{`, control characters, and `.lock` suffixes.
+- only the literal `origin` remote is accepted;
+- Git is spawned with `shell: false`;
+- Git environment variables that redirect repository/configuration access are removed;
+- Git aliases are disabled for the tool's own commands; and
+- branch arguments remain separated with `--` where applicable.
 
-### 5. SSH socket preflight does not match sandbox path semantics
+This delegates branch-name grammar to Git and supports valid names such as `_foo`, `foo_`, and `föo` without weakening argument handling.
 
-The preflight checks configured sockets with exact string equality:
+### SSH socket approval
 
-```text
-allowedSockets.includes(SSH_AUTH_SOCK)
-```
+Use normalised path matching for configured socket allowances. A configured path should match itself and descendants, but not a sibling sharing the same prefix; for example, `/tmp/ssh` matches `/tmp/ssh/agent.123` but not `/tmp/ssh-other/agent.123`.
 
-On macOS, the sandbox runtime normalises each configured socket path and grants it using `subpath` semantics. A configured `/tmp/ssh` can therefore permit `/tmp/ssh/agent.123` at runtime while the preflight still prompts or blocks it.
+On macOS, retain path-scoped SSH-agent approval.
 
-#### Proposed fix
+On Linux, do not offer path-scoped session approval because the sandbox runtime cannot enforce `allowUnixSockets` by path there. Explain that explicit `network.allowAllUnixSockets=true` is required for broad Unix-socket access.
 
-Use one shared socket-path policy for both preflight and sandbox initialisation. Prefer exposing or importing a matching helper from the sandbox runtime. If that is not possible, implement a local helper that mirrors the runtime's:
+No default sandbox permissions are changed by this work.
 
-- tilde and absolute-path normalisation;
-- exact-path and descendant matching;
-- path-boundary handling, so `/tmp/ssh` does not match `/tmp/ssh-other`; and
-- platform-specific behaviour.
+## Non-goals
 
-Document that `allowUnixSockets` is path-based on macOS but ignored by the Linux seccomp implementation. Ensure the preflight does not report a grant as effective on platforms where the runtime cannot apply that grant.
+- A complete shell parser or shell interpreter.
+- Complete Git alias/configuration resolution, including `-C`, `-c`, and `--config-env` contexts.
+- Fail-closed handling for syntax the scanner does not understand.
+- Changes to `@carderne/sandbox-runtime`.
+- Changes to default filesystem or network restrictions.
+- Automatic broad Unix-socket access on Linux.
 
-Add tests for exact paths, descendants, sibling prefixes, relative or tilde paths, normalised `.` and `..` components, and Linux/macOS behaviour.
+## Verification
 
-## Proposed decision
+Add focused regression tests for:
 
-Adopt a fail-closed, structured parsing approach:
+- combined Git short options;
+- valid and invalid Git branch names, including Unicode and boundary underscores;
+- fixed, non-shell Git argument handling;
+- exact, descendant, normalised, and sibling-prefix socket paths; and
+- refusal of path-scoped SSH approval on Linux.
 
-1. replace the custom shell tokenizer with recursive shell syntax inspection;
-2. introduce explicit Git global-option and subcommand-option parsing;
-3. resolve aliases in the effective Git invocation context;
-4. delegate ref validity to `git check-ref-format`; and
-5. share socket normalisation and matching semantics with the sandbox runtime.
-
-Until structured parsing is available, unsupported shell constructs that may execute Git or SSH should be blocked rather than allowed optimistically.
-
-## Consequences
-
-### Positive
-
-- The documented Git redirection becomes difficult to bypass through normal shell or Git syntax.
-- SSH preflight occurs before nested SSH commands can execute.
-- Valid branch names remain usable through the scoped tool.
-- Preflight prompts agree with effective sandbox permissions.
-- Parsing responsibilities become explicit and independently testable.
-
-### Negative
-
-- A shell parser may add a dependency and must be checked against the shells pi supports.
-- Fail-closed handling can reject unusual commands until their syntax is supported.
-- Alias resolution requires careful handling of Git's ordered global options and configuration environment.
-- Platform-specific socket behaviour adds test and maintenance cost.
-
-## Rejected alternatives
-
-### Continue extending regular expressions and the current tokenizer
-
-Rejected because each added shell construct leaves other execution forms unmodelled. This is not a reliable security boundary.
-
-### Remove Bash interception and rely only on instructions
-
-Rejected because model instructions do not enforce the restriction and cannot prevent accidental or indirect upstream mutations.
-
-### Reject all Git aliases
-
-This is safe but unnecessarily disruptive. It may be used as a temporary fail-closed measure, but the target behaviour is to allow aliases that can be resolved and proven not to mutate tracking configuration.
-
-### Keep custom ref validation
-
-Rejected because duplicating Git's ref grammar is unnecessary and risks both false positives and false negatives.
-
-## Verification plan
-
-- Add table-driven unit tests for every command and ref form described above.
-- Add integration tests that execute accepted Git forms in temporary repositories and assert whether tracking changed.
-- Add regression tests proving every bypass is blocked before execution.
-- Test alias resolution with `-C`, multiple ordered `-C` options, `-c`, repository-local config, and shell aliases.
-- Test SSH path matching against representative sandbox-runtime profiles on macOS and the documented Linux behaviour.
-- Run formatting, linting, TypeScript checking, and the complete test suite.
+Run formatting, linting, TypeScript checking, and the complete test suite.

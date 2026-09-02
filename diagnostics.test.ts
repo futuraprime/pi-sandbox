@@ -15,6 +15,7 @@ import {
   runSshAuthPreflight,
   selectPrimaryViolation,
   shouldPreflightSshAuth,
+  socketPathMatches,
   trimIncidents,
   type SandboxDiagnostic,
   type SandboxIncident,
@@ -186,6 +187,7 @@ describe("isGitUpstreamMutationCommand", () => {
     "GIT_DIR=.git /usr/bin/git branch --set-upstream-to=origin/main main",
     "git -c alias.branch=!bad branch -u origin/main main",
     "git push -u origin main",
+    "git push -vu origin main",
     "git push --set-upstream origin main",
     "git push origin main --set-upstream",
     "echo ready && git push -u origin main",
@@ -216,16 +218,6 @@ describe("isGitUpstreamMutationCommand", () => {
     "echo 'git branch -u origin/main main'",
   ])("leaves non-tracking commands alone: %s", (command) => {
     expect(isGitUpstreamMutationCommand(command)).toBe(false);
-  });
-
-  it("expands configured Git aliases", () => {
-    const aliases = new Map([
-      ["track", "branch --set-upstream-to=origin/main"],
-      ["publish", "!git push -u origin main"],
-    ]);
-
-    expect(isGitUpstreamMutationCommand("git track main", aliases)).toBe(true);
-    expect(isGitUpstreamMutationCommand("env git publish", aliases)).toBe(true);
   });
 });
 
@@ -273,10 +265,24 @@ describe("grantSshSessionAccess", () => {
       socketPath: socket,
       allowedSockets,
       reinitialize: async () => allowedSockets.includes(socket),
+      platform: "darwin",
     });
 
     expect(granted).toBe(true);
     expect(allowedSockets).toEqual([socket]);
+  });
+
+  it("does not add a path-scoped allowance on Linux", async () => {
+    const allowedSockets: string[] = [];
+    const granted = await grantSshSessionAccess({
+      socketPath: socket,
+      allowedSockets,
+      reinitialize: async () => true,
+      platform: "linux",
+    });
+
+    expect(granted).toBe(false);
+    expect(allowedSockets).toEqual([]);
   });
 
   it.each([
@@ -290,10 +296,22 @@ describe("grantSshSessionAccess", () => {
       socketPath: socket,
       allowedSockets,
       reinitialize,
+      platform: "darwin",
     });
 
     expect(granted).toBe(false);
     expect(allowedSockets).toEqual([]);
+  });
+});
+
+describe("socketPathMatches", () => {
+  it.each([
+    ["the same socket", "/tmp/ssh-agent.sock", "/tmp/ssh-agent.sock", true],
+    ["a socket below an allowed directory", "/tmp/ssh", "/tmp/ssh/agent.123", true],
+    ["a sibling with a shared prefix", "/tmp/ssh", "/tmp/ssh-other/agent.123", false],
+    ["a normalised path", "/tmp/ssh/./agent", "/tmp/ssh/agent", true],
+  ])("matches %s", (_label, allowed, actual, expected) => {
+    expect(socketPathMatches(allowed, actual)).toBe(expected);
   });
 });
 
@@ -312,6 +330,7 @@ describe("runSshAuthPreflight", () => {
         events.push(`grant:${socketPath}`);
         return true;
       },
+      platform: "darwin",
     });
 
     expect(result).toBe("allowed");
@@ -325,9 +344,41 @@ describe("runSshAuthPreflight", () => {
       allowedSockets: [],
       allowAllSockets: false,
       requestAccess: async () => false,
+      platform: "darwin",
     });
 
     expect(result).toBe("blocked");
+  });
+
+  it("recognises a configured socket directory", async () => {
+    const result = await runSshAuthPreflight({
+      command,
+      sshAuthSock: "/tmp/ssh-agent/agent.123",
+      allowedSockets: ["/tmp/ssh-agent"],
+      allowAllSockets: false,
+      requestAccess: async () => true,
+      platform: "darwin",
+    });
+
+    expect(result).toBe("not-needed");
+  });
+
+  it("does not offer path-scoped access on Linux", async () => {
+    let prompts = 0;
+    const result = await runSshAuthPreflight({
+      command,
+      sshAuthSock: socket,
+      allowedSockets: [socket],
+      allowAllSockets: false,
+      requestAccess: async () => {
+        prompts++;
+        return true;
+      },
+      platform: "linux",
+    });
+
+    expect(result).toBe("blocked");
+    expect(prompts).toBe(0);
   });
 
   it.each([
@@ -339,6 +390,7 @@ describe("runSshAuthPreflight", () => {
       command,
       sshAuthSock: socket,
       ...access,
+      platform: "darwin",
       requestAccess: async () => {
         prompts++;
         return true;
