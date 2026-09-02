@@ -571,7 +571,8 @@ function makeBrowserProcessDiagnostic(service: string): SandboxDiagnostic {
     rawTarget: service,
     rule: "allowBrowserProcess",
     promptable: false,
-    action: "enable allowBrowserProcess in trusted global config and restart Pi",
+    action:
+      "Pi sandbox blocked Chromium; enable allowBrowserProcess in trusted global config and restart Pi",
   };
 }
 

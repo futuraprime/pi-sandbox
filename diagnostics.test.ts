@@ -417,6 +417,7 @@ describe("browser process diagnostics", () => {
       rule: "allowBrowserProcess",
       promptable: false,
     });
+    expect(diagnostic?.action).toContain("Pi sandbox blocked Chromium");
     expect(diagnostic?.action).toContain("trusted global config");
   });
 
