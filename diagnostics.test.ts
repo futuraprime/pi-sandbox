@@ -6,6 +6,8 @@ import {
   grantSshSessionAccess,
   isMateriallyDifferent,
   isGitUpstreamMutationCommand,
+  makeBrowserProcessFallbackDiagnostic,
+  makeBrowserProcessViolationDiagnostic,
   makeSshAgentFallbackDiagnostic,
   parseDiagnosticBlock,
   renderDiagnosticBlock,
@@ -399,6 +401,55 @@ describe("runSshAuthPreflight", () => {
 
     expect(result).toBe("not-needed");
     expect(prompts).toBe(0);
+  });
+});
+
+describe("browser process diagnostics", () => {
+  it("classifies Chromium Mach service registration violations", () => {
+    const diagnostic = makeBrowserProcessViolationDiagnostic(
+      'Sandbox: Chromium deny(1) mach-register "org.chromium.Chromium.MachPortRendezvousServer.4312"',
+    );
+
+    expect(diagnostic).toMatchObject({
+      type: "browser-process",
+      target: "Chromium Mach service",
+      rawTarget: "org.chromium.Chromium.MachPortRendezvousServer.4312",
+      rule: "allowBrowserProcess",
+      promptable: false,
+    });
+    expect(diagnostic?.action).toContain("trusted global config");
+  });
+
+  it("does not classify unrelated Mach violations as browser failures", () => {
+    expect(
+      makeBrowserProcessViolationDiagnostic(
+        'Sandbox: node deny(1) mach-lookup "com.apple.example.service"',
+      ),
+    ).toBeNull();
+  });
+
+  it("classifies Chromium bootstrap error 1100 output as a fallback", () => {
+    const diagnostic = makeBrowserProcessFallbackDiagnostic(
+      "org.chromium.Chromium.MachPortRendezvousServer.4312: " +
+        "bootstrap_check_in failed: BOOTSTRAP_NOT_PRIVILEGED (error 1100)",
+    );
+
+    expect(diagnostic).toMatchObject({
+      type: "browser-process",
+      rule: "allowBrowserProcess",
+      rawTarget: "org.chromium.Chromium.MachPortRendezvousServer.4312",
+    });
+  });
+
+  it("requires both the Chromium service and bootstrap denial in fallback output", () => {
+    expect(
+      makeBrowserProcessFallbackDiagnostic("unrelated process failed with error 1100"),
+    ).toBeNull();
+    expect(
+      makeBrowserProcessFallbackDiagnostic(
+        "org.chromium.Chromium.MachPortRendezvousServer.4312 started",
+      ),
+    ).toBeNull();
   });
 });
 

@@ -2,7 +2,13 @@ import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { relative, resolve } from "node:path";
 
-export type SandboxDiagnosticType = "ssh-auth" | "read" | "write" | "network" | "ambiguous";
+export type SandboxDiagnosticType =
+  | "ssh-auth"
+  | "browser-process"
+  | "read"
+  | "write"
+  | "network"
+  | "ambiguous";
 
 export type SandboxPromptChoice =
   | "abort"
@@ -58,10 +64,11 @@ export interface ParsedSandboxDiagnosticBlock {
 
 const PRIMARY_PRIORITY: Record<SandboxDiagnosticType, number> = {
   "ssh-auth": 0,
-  read: 1,
-  write: 2,
-  network: 3,
-  ambiguous: 4,
+  "browser-process": 1,
+  read: 2,
+  write: 3,
+  network: 4,
+  ambiguous: 5,
 };
 
 export function selectPrimaryViolation(
@@ -172,6 +179,8 @@ function diagnosticTypeLabel(type: SandboxDiagnosticType): string {
   switch (type) {
     case "ssh-auth":
       return "SSH auth";
+    case "browser-process":
+      return "browser process";
     case "read":
       return "read access";
     case "write":
@@ -551,6 +560,37 @@ export async function runSshAuthPreflight(options: {
     return "not-needed";
   }
   return (await requestAccess(sshAuthSock)) ? "allowed" : "blocked";
+}
+
+const CHROMIUM_MACH_SERVICE = "org.chromium.Chromium.MachPortRendezvousServer";
+
+function makeBrowserProcessDiagnostic(service: string): SandboxDiagnostic {
+  return {
+    type: "browser-process",
+    target: "Chromium Mach service",
+    rawTarget: service,
+    rule: "allowBrowserProcess",
+    promptable: false,
+    action: "enable allowBrowserProcess in trusted global config and restart Pi",
+  };
+}
+
+export function makeBrowserProcessViolationDiagnostic(line: string): SandboxDiagnostic | null {
+  const operation = line.match(/\bmach-(?:register|lookup)\s+(?:"([^"]+)"|([^\s)]+))/);
+  const service = operation?.[1] ?? operation?.[2];
+  if (!service?.startsWith(CHROMIUM_MACH_SERVICE)) return null;
+  return makeBrowserProcessDiagnostic(service);
+}
+
+export function makeBrowserProcessFallbackDiagnostic(output: string): SandboxDiagnostic | null {
+  const hasRendezvousService = output.includes("MachPortRendezvousServer");
+  const hasBootstrapDenial =
+    output.includes("BOOTSTRAP_NOT_PRIVILEGED") ||
+    /(?:bootstrap_check_in|bootstrap).*\b(?:error\s*)?1100\b/i.test(output);
+  if (!hasRendezvousService || !hasBootstrapDenial) return null;
+
+  const service = output.match(/org\.chromium\.Chromium\.MachPortRendezvousServer\.\d+/)?.[0];
+  return makeBrowserProcessDiagnostic(service ?? CHROMIUM_MACH_SERVICE);
 }
 
 export function makeSshAgentFallbackDiagnostic(

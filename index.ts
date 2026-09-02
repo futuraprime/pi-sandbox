@@ -94,6 +94,8 @@ import {
   getDiagnosticBlockData,
   grantSshSessionAccess,
   isMateriallyDifferent,
+  makeBrowserProcessFallbackDiagnostic,
+  makeBrowserProcessViolationDiagnostic,
   makeSshAgentFallbackDiagnostic,
   parseDiagnosticBlock,
   renderDiagnosticBlock,
@@ -478,6 +480,9 @@ function parseViolationEvent(
     };
   }
 
+  const browserProcessDiagnostic = makeBrowserProcessViolationDiagnostic(line);
+  if (browserProcessDiagnostic) return browserProcessDiagnostic;
+
   const readMatch = line.match(/\b(file-read[^\s]*)\s+(.+)$/);
   if (readMatch?.[2]) {
     const filePath = extractPathFromViolationRemainder(readMatch[2]);
@@ -533,6 +538,9 @@ function parseFallbackDiagnosticFromOutput(
   command: string,
   output: string,
 ): SandboxDiagnostic | null {
+  const browserProcessFallback = makeBrowserProcessFallbackDiagnostic(output);
+  if (browserProcessFallback) return browserProcessFallback;
+
   const sshFallback = makeSshAgentFallbackDiagnostic(process.env.SSH_AUTH_SOCK, command, output);
   if (sshFallback) return sshFallback;
 
