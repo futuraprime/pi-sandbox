@@ -1833,6 +1833,8 @@ export default function (pi: ExtensionAPI) {
   // ── session_start ───────────────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
+    ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", "ꗃ"));
+
     const noSandbox = pi.getFlag("no-sandbox") as boolean;
 
     if (noSandbox) {
@@ -1892,14 +1894,7 @@ export default function (pi: ExtensionAPI) {
       warnIfAllDomainsAllowed(ctx, config);
       maybeWarnAboutBroadUnixSocketAccess(ctx, config);
 
-      const networkLabel = allowsAllDomains(config.network?.allowedDomains)
-        ? "all domains"
-        : `${config.network?.allowedDomains?.length ?? 0} domains`;
-      const writeCount = config.filesystem?.allowWrite?.length ?? 0;
-      ctx.ui.setStatus(
-        "sandbox",
-        ctx.ui.theme.fg("accent", `🔒 Sandbox: ${networkLabel}, ${writeCount} write paths`),
-      );
+      ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", "🔒"));
     } catch (err) {
       sandboxEnabled = false;
       ctx.ui.notify(
@@ -1963,14 +1958,7 @@ export default function (pi: ExtensionAPI) {
         warnIfAllDomainsAllowed(ctx, config);
         maybeWarnAboutBroadUnixSocketAccess(ctx, config);
 
-        const networkLabel = allowsAllDomains(config.network?.allowedDomains)
-          ? "all domains"
-          : `${config.network?.allowedDomains?.length ?? 0} domains`;
-        const writeCount = config.filesystem?.allowWrite?.length ?? 0;
-        ctx.ui.setStatus(
-          "sandbox",
-          ctx.ui.theme.fg("accent", `🔒 Sandbox: ${networkLabel}, ${writeCount} write paths`),
-        );
+        ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", "🔒"));
         ctx.ui.notify("Sandbox enabled", "info");
       } catch (err) {
         ctx.ui.notify(
@@ -1999,7 +1987,7 @@ export default function (pi: ExtensionAPI) {
 
       sandboxEnabled = false;
       sandboxInitialized = false;
-      ctx.ui.setStatus("sandbox", "");
+      ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", "ꗃ"));
       ctx.ui.notify("Sandbox disabled", "info");
     },
   });
