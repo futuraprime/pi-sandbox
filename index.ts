@@ -1833,7 +1833,7 @@ export default function (pi: ExtensionAPI) {
   // ── session_start ───────────────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", "ꗃ"));
+    ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("error", "ꗃ"));
 
     const noSandbox = pi.getFlag("no-sandbox") as boolean;
 
@@ -1987,7 +1987,7 @@ export default function (pi: ExtensionAPI) {
 
       sandboxEnabled = false;
       sandboxInitialized = false;
-      ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", "ꗃ"));
+      ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("error", "ꗃ"));
       ctx.ui.notify("Sandbox disabled", "info");
     },
   });
