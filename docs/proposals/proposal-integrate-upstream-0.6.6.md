@@ -15,7 +15,7 @@ After fast-forwarding the local branch to `origin/main`, the fork and `upstream/
 
 Several upstream changes independently implement features that originally motivated the fork, particularly composed global and project configuration and commands for adding allowed paths. Their intent overlaps with the fork, but their policy and persistence semantics differ.
 
-A mechanical merge would risk replacing deliberate downstream security behaviour while also making it difficult to adopt upstream's runtime fixes and modular `src/` architecture. Integration should therefore be treated as a migration: use the upstream architecture, then deliberately retain or adapt downstream behaviour.
+A mechanical merge would risk replacing deliberate downstream security behaviour while also making it difficult to adopt upstream's runtime fixes and modular `src/` architecture. Integration should therefore be treated as a migration. First refactor the working downstream implementation into module boundaries aligned with upstream while preserving behaviour and dependencies; then integrate upstream changes module by module.
 
 ## Goals
 
@@ -24,6 +24,19 @@ A mechanical merge would risk replacing deliberate downstream security behaviour
 - Preserve sandbox diagnostics, protected configuration mutation, Git/SSH preflight, and downstream status behaviour.
 - Remove duplicated implementations once their intended semantics have been reconciled.
 - Keep project configuration portable between checkouts and machines.
+- Leave a structure in which future upstream releases can be integrated without reopening unrelated downstream modules.
+
+## Module boundaries and ownership
+
+Use upstream's broad module boundaries, but do not treat every resulting file as wholly upstream-owned. Record ownership and intentional divergence at the level of behaviour and integration seams.
+
+The expected split is:
+
+- **upstream-aligned core:** configuration loading and validation, the runtime wrapper, base prompt UI, and extension lifecycle orchestration;
+- **downstream-owned behaviour:** cumulative configuration semantics, specificity-aware policy, project-relative persistence, sandbox diagnostics, protected configuration mutation, Git/SSH preflight and fallback, secure Git upstream mutation, scoped Chromium policy, and downstream status presentation; and
+- **shared integration seams:** effective-policy resolution, permission-prompt results, sanctioned configuration persistence, runtime diagnostic events, and command preflight hooks.
+
+Keep these seams narrow, typed, and covered by contract tests. Prefer separate downstream modules over embedding downstream behaviour throughout upstream-aligned code. When a module necessarily contains both, identify the intentional behavioural differences in tests rather than relying on comments tied to one upstream commit.
 
 ## Configuration composition
 
@@ -179,18 +192,37 @@ Version-only commits should not be cherry-picked independently of the behaviour 
 
 Treat this as a staged migration between two independently evolved implementations, not as one large merge-resolution exercise. Complete each phase with passing focused tests and a reviewable intermediate commit before beginning the next phase. These checkpoints should leave usable stopping points and make regressions attributable to one class of change.
 
-1. **Architecture baseline:** create an integration branch in the downstream repository and establish upstream 0.6.6's modular source layout without blindly replacing the pinned downstream runtime fork, scoped Chromium policy, macOS Git-over-SSH configuration, or existing Bubblewrap cleanup. Avoid intentional behavioural changes. Never push to the upstream remote.
-2. **Policy port:** move cumulative configuration, specificity-aware precedence, project-relative persistence, and configuration protection into the new modules.
-3. **Runtime fixes:** integrate upstream's subprocess, seccomp-helper, Bash-prompting, and PTY fixes in dependency order, while verifying that the already-integrated Bubblewrap cleanup still runs on success, failure, timeout, and abort paths.
-4. **Prompt improvements:** add editable and validated rules, prompt timeout, and attention events while retaining downstream persistence semantics.
-5. **Downstream features:** restore and verify diagnostics, Git/SSH preflight and fallback handling, secure Git upstream mutation, and status behaviour.
-6. **Optional features:** decide separately whether to adopt SSH proxying, `sandboxUserShell`, the toggle shortcut, package/test-runner changes not required by the baseline, and any command consolidation.
-7. Remove superseded duplicate implementations only after their replacement behaviour has focused test coverage.
-8. Review README and configuration examples against the final semantics rather than resolving documentation conflicts mechanically.
-
-Before implementation, produce a feature-and-test mapping between both branches so every upstream and downstream behaviour has an explicit disposition: retain, adapt, replace, defer, or reject.
+1. **Feature and test mapping:** before implementation, classify every upstream and downstream behaviour as retain, adapt, replace, defer, or reject. Map each behaviour to existing or required tests and to its intended module owner.
+2. **Downstream-first modularisation:** create an integration branch in the downstream repository and mechanically split the current working implementation into module boundaries aligned with upstream. Preserve current dependencies, runtime pin, behaviour, and test runner. Do not introduce upstream semantic changes in this phase. Never push to the upstream remote.
+3. **Architecture comparison:** compare each newly separated downstream module with its upstream 0.6.6 counterpart. Reconcile public types and integration seams while keeping the downstream test suite green. This produces a reviewable structural baseline before behaviour changes begin.
+4. **Configuration and policy integration:** adopt upstream validation and tests while retaining cumulative composition, specificity-aware precedence, project-relative persistence, and configuration protection.
+5. **Runtime fixes:** integrate upstream's subprocess, seccomp-helper, Bash-prompting, and PTY fixes in dependency order without blindly replacing the pinned downstream runtime fork. Verify that the already-integrated Bubblewrap cleanup still runs on success, failure, timeout, and abort paths.
+6. **Prompt improvements:** add editable and validated rules, prompt timeout, and attention events while retaining downstream persistence semantics.
+7. **Downstream integration verification:** verify that diagnostics, Git/SSH preflight and fallback handling, secure Git upstream mutation, scoped Chromium behaviour, and status presentation remain connected through the new architecture. These features should not need to be restored from scratch because downstream-first modularisation preserves them throughout.
+8. **Optional features:** decide separately whether to adopt SSH proxying, `sandboxUserShell`, the toggle shortcut, package/test-runner changes, and any command consolidation.
+9. Remove superseded duplicate implementations only after their replacement behaviour has focused test coverage.
+10. Review README and configuration examples against the final semantics rather than resolving documentation conflicts mechanically.
 
 Prefer adaptation over isolated cherry-picks where commits depend on upstream's refactor.
+
+## Ongoing upstream maintenance
+
+After this migration, maintain a local branch that exactly mirrors `upstream/main` and contains no downstream commits. Update it on each upstream release, or more frequently when upstream changes affect runtime or security behaviour.
+
+For each update:
+
+1. create an origin-only integration branch;
+2. compare the upstream mirror with the last integrated upstream version;
+3. update the behavioural ledger with a retain, adapt, replace, defer, or reject disposition for every material change;
+4. integrate through the documented module seams;
+5. run downstream contract tests and platform checks; and
+6. merge only into the downstream repository, never into or through the upstream remote.
+
+Automate fetching and divergence reporting where practical, but do not automate semantic conflict resolution. Git `rerere` may be used locally to reuse recurring textual conflict resolutions; every reused resolution still requires review and tests.
+
+Integration cadence is part of the maintenance contract: do not allow multiple upstream releases to accumulate without an explicit review. Keep upstream-aligned changes separate from downstream feature work in intermediate commits so future comparisons remain intelligible.
+
+The migration is complete only when both the current release and the update workflow are demonstrated. Before closing the work, simulate a small upstream change in an upstream-aligned module and verify that it can be integrated without modifying unrelated downstream-owned modules.
 
 ## Verification
 
@@ -212,7 +244,9 @@ Add or retain focused tests for:
 - Bubblewrap cleanup on success, failure, timeout, and abort paths;
 - scoped macOS Chromium policy without broad Unix-socket access;
 - macOS Git-over-SSH through the unauthenticated SOCKS compatibility mode while retaining domain and SSH-agent controls; and
-- all retained diagnostics and Git/SSH workflows.
+- all retained diagnostics and Git/SSH workflows;
+- module-level contract tests for each shared integration seam; and
+- a synthetic upstream update integrating without changes to unrelated downstream-owned modules.
 
 Run formatting, linting, TypeScript checking, unit tests, and platform-specific sandbox integration tests on macOS and Linux.
 
