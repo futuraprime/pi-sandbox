@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -126,5 +126,21 @@ describe("updateSandboxConfigFile", () => {
       enabled: true,
       filesystem: { denyRead: ["/Users"], denyWrite: ["*.pem"] },
     });
+  });
+
+  it("updates only the explicitly selected project config", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-sandbox-command-"));
+    tempDirs.push(dir);
+    const projectPath = join(dir, "project", ".pi", "sandbox.json");
+    const globalPath = join(dir, "home", ".pi", "agent", "sandbox.json");
+    mkdirSync(dirname(globalPath), { recursive: true });
+    writeFileSync(globalPath, '{"filesystem":{"allowWrite":["/existing"]}}\n', "utf-8");
+
+    updateSandboxConfigFile(projectPath, { key: "allowWrite", value: "./tmp" });
+
+    expect(JSON.parse(readFileSync(projectPath, "utf-8"))).toEqual({
+      filesystem: { allowWrite: ["./tmp"] },
+    });
+    expect(readFileSync(globalPath, "utf-8")).toBe('{"filesystem":{"allowWrite":["/existing"]}}\n');
   });
 });

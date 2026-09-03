@@ -85,18 +85,24 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Container, matchesKey, Key, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 
 import {
   diagnosticIdentity,
   formatCommandPreview,
+  isGitUpstreamMutationCommand,
   getDiagnosticBlockData,
+  grantSshSessionAccess,
   isMateriallyDifferent,
+  makeBrowserProcessFallbackDiagnostic,
+  makeBrowserProcessViolationDiagnostic,
   makeSshAgentFallbackDiagnostic,
   parseDiagnosticBlock,
   renderDiagnosticBlock,
   renderDiagnosticNotice,
   renderDiagnosticSummaryLines,
   retainIncident,
+  runSshAuthPreflight,
   selectPrimaryViolation,
   trimIncidents,
   type SandboxDiagnostic,
@@ -104,6 +110,7 @@ import {
   type SandboxIncident,
   type SandboxPromptChoice,
 } from "./diagnostics.js";
+import { runGitCommand, setGitUpstream } from "./git-upstream.js";
 import {
   describeSandboxCommandResult,
   formatSandboxCommandUsage,
@@ -473,6 +480,9 @@ function parseViolationEvent(
     };
   }
 
+  const browserProcessDiagnostic = makeBrowserProcessViolationDiagnostic(line);
+  if (browserProcessDiagnostic) return browserProcessDiagnostic;
+
   const readMatch = line.match(/\b(file-read[^\s]*)\s+(.+)$/);
   if (readMatch?.[2]) {
     const filePath = extractPathFromViolationRemainder(readMatch[2]);
@@ -528,6 +538,9 @@ function parseFallbackDiagnosticFromOutput(
   command: string,
   output: string,
 ): SandboxDiagnostic | null {
+  const browserProcessFallback = makeBrowserProcessFallbackDiagnostic(output);
+  if (browserProcessFallback) return browserProcessFallback;
+
   const sshFallback = makeSshAgentFallbackDiagnostic(process.env.SSH_AUTH_SOCK, command, output);
   if (sshFallback) return sshFallback;
 
@@ -674,20 +687,32 @@ function matchesPattern(filePath: string, patterns: string[]): boolean {
 
 // ── Config file updaters (Node.js process — not OS-sandboxed) ─────────────────
 
-function getConfigPaths(cwd: string): {
+export function getConfigPaths(cwd: string): {
   globalPath: string;
   projectPath: string;
 } {
   return {
-    globalPath: join(homedir(), ".pi", "agent", "sandbox.json"),
+    globalPath: join(getAgentDir(), "sandbox.json"),
     projectPath: join(cwd, ".pi", "sandbox.json"),
   };
 }
 
-function isSandboxConfigPath(filePath: string, cwd: string): boolean {
-  const canonical = canonicalizePath(filePath);
+export function isSandboxConfigPath(filePath: string, cwd: string): boolean {
+  const canonical = canonicalizePath(resolve(cwd, filePath.replace(/^~(?=$|\/)/, homedir())));
   const { globalPath, projectPath } = getConfigPaths(cwd);
   return canonical === canonicalizePath(projectPath) || canonical === canonicalizePath(globalPath);
+}
+
+function getProtectedFilesystem(config: SandboxConfig, cwd: string) {
+  const { globalPath, projectPath } = getConfigPaths(cwd);
+  return {
+    ...config.filesystem,
+    denyWrite: dedup([
+      ...(config.filesystem?.denyWrite ?? []),
+      canonicalizePath(projectPath),
+      canonicalizePath(globalPath),
+    ]),
+  };
 }
 
 function bashCommandMentionsSandboxConfig(command: string, cwd: string): boolean {
@@ -838,6 +863,10 @@ function createSandboxedBashOps(shellPath?: string): BashOperations {
 
 // ── Extension ─────────────────────────────────────────────────────────────────
 
+function shouldRedirectGitUpstreamMutation(command: string): boolean {
+  return isGitUpstreamMutationCommand(command);
+}
+
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("no-sandbox", {
     description: "Disable OS-level sandboxing for bash commands",
@@ -940,8 +969,8 @@ export default function (pi: ExtensionAPI) {
   // Called after granting a session/permanent allowance so the OS-level sandbox
   // picks up the new rules before the next bash subprocess starts.
 
-  async function reinitializeSandbox(cwd: string): Promise<void> {
-    if (!sandboxInitialized) return;
+  async function reinitializeSandbox(cwd: string): Promise<boolean> {
+    if (!sandboxInitialized) return true;
     const config = loadConfig(cwd);
     const configExt = config as unknown as { allowBrowserProcess?: boolean };
     try {
@@ -959,19 +988,20 @@ export default function (pi: ExtensionAPI) {
         {
           network,
           filesystem: {
-            ...config.filesystem,
+            ...getProtectedFilesystem(config, cwd),
             denyRead: config.filesystem?.denyRead ?? [],
             allowRead: [...(config.filesystem?.allowRead ?? []), ...sessionAllowedReadPaths],
             allowWrite: [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths],
-            denyWrite: config.filesystem?.denyWrite ?? [],
           },
           allowBrowserProcess: configExt.allowBrowserProcess,
           enableWeakerNetworkIsolation: true,
         },
         createNetworkAskCallback(network.allowedDomains),
       );
+      return true;
     } catch (e) {
       console.error(`Warning: Failed to reinitialize sandbox: ${e}`);
+      return false;
     }
   }
 
@@ -1218,9 +1248,12 @@ export default function (pi: ExtensionAPI) {
     await reinitializeSandbox(cwd);
   }
 
-  async function applySshAuthChoice(socketPath: string, cwd: string): Promise<void> {
-    if (!sessionAllowedUnixSockets.includes(socketPath)) sessionAllowedUnixSockets.push(socketPath);
-    await reinitializeSandbox(cwd);
+  async function applySshAuthChoice(socketPath: string, cwd: string): Promise<boolean> {
+    return grantSshSessionAccess({
+      socketPath,
+      allowedSockets: sessionAllowedUnixSockets,
+      reinitialize: () => reinitializeSandbox(cwd),
+    });
   }
 
   function configMutationForChoice(
@@ -1267,10 +1300,20 @@ export default function (pi: ExtensionAPI) {
   async function requestSshAuthAccess(
     ctx: ExtensionContext,
     socketPath: string,
-  ): Promise<"abort" | "ssh-session"> {
+  ): Promise<"abort" | "ssh-session" | "none"> {
+    if (process.platform === "linux") {
+      ctx.ui.notify(
+        "Path-specific SSH-agent access is not supported on Linux. Set network.allowAllUnixSockets=true to allow Unix sockets.",
+        "warning",
+      );
+      return "none";
+    }
+
     const choice = await promptSshAuthBlock(ctx);
-    if (choice === "ssh-session") await applySshAuthChoice(socketPath, ctx.cwd);
-    return choice;
+    if (choice !== "ssh-session") return choice;
+    if (await applySshAuthChoice(socketPath, ctx.cwd)) return choice;
+    ctx.ui.notify("Failed to reinitialise the sandbox; SSH-agent access was not granted.", "error");
+    return "none";
   }
 
   async function redirectSandboxConfigMutationToPrompt(
@@ -1403,9 +1446,59 @@ export default function (pi: ExtensionAPI) {
         let finalExitCode = 1;
 
         while (true) {
-          const { allowed, denied } = getEffectiveDomains(cwd);
+          const { allowed, denied, allowUnixSockets, allowAllUnixSockets } =
+            getEffectiveDomains(cwd);
           const domains = extractDomainsFromCommand(command);
           let precheckBlocked = false;
+          const sshAuthSock = process.env.SSH_AUTH_SOCK;
+
+          const sshPreflight = await runSshAuthPreflight({
+            command,
+            sshAuthSock,
+            allowedSockets: allowUnixSockets,
+            allowAllSockets: allowAllUnixSockets,
+            requestAccess: async (socketPath) => {
+              const diagnostic: SandboxDiagnostic = {
+                type: "ssh-auth",
+                target: "current SSH agent",
+                rawTarget: socketPath,
+                rule: "ssh agent socket blocked",
+                promptable: true,
+                action: "allow SSH use for this session",
+              };
+              incident.violations = addUniqueDiagnostics(incident.violations, [diagnostic]);
+              updateIncidentPrimary(incident);
+              const choice = await maybePromptForDiagnostic(ctx, incident, diagnostic);
+              lastPrompted = diagnostic;
+              return choice === "ssh-session";
+            },
+          });
+
+          if (sshPreflight === "blocked") {
+            incident.finalOutcome = "failure";
+            const reason =
+              process.platform === "linux"
+                ? "Blocked: path-specific SSH-agent access is not supported on Linux. Set network.allowAllUnixSockets=true to allow Unix sockets."
+                : "Blocked: SSH agent access is not allowed.";
+            const diagnosticBlock = renderDiagnosticBlock(incident);
+            const diagnosticData = getDiagnosticBlockData(incident);
+            emitOutput(
+              originalOnData,
+              source === "user_bash" && diagnosticData
+                ? `${reason}\n${renderDiagnosticNotice(diagnosticData)}\n`
+                : `${reason}\n${diagnosticBlock ?? ""}\n`,
+            );
+            if (source === "user_bash" && options?.recordDiagnosticInContext && diagnosticBlock) {
+              pi.sendMessage({
+                customType: "sandbox-diagnostic",
+                content: diagnosticBlock,
+                display: false,
+              });
+            }
+            storeIncident(incident);
+            return { exitCode: 1 };
+          }
+          if (sshPreflight === "allowed") precheckBlocked = true;
 
           for (const domain of domains) {
             const verdict = checkPermission(
@@ -1550,6 +1643,49 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
+  // ── Git upstream tool — narrowly scoped config mutation ───────────────────
+
+  pi.registerTool({
+    name: "set_git_upstream",
+    label: "Set Git upstream",
+    description:
+      "Set a local branch to track an existing branch on the origin remote. " +
+      "This tool accepts branch names only and cannot run arbitrary Git commands or modify other config.",
+    promptSnippet: "Set a local branch to track an existing origin branch",
+    parameters: Type.Object(
+      {
+        localBranch: Type.String({ description: "The existing local branch name" }),
+        remote: Type.Literal("origin", {
+          description: 'The only permitted remote; must be "origin"',
+        }),
+        remoteBranch: Type.String({ description: "The existing remote branch name" }),
+      },
+      { additionalProperties: false },
+    ),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      await setGitUpstream(
+        {
+          cwd: ctx.cwd,
+          localBranch: params.localBranch,
+          remote: params.remote,
+          remoteBranch: params.remoteBranch,
+        },
+        runGitCommand,
+        signal,
+      );
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Local branch "${params.localBranch}" now tracks "${params.remote}/${params.remoteBranch}".`,
+          },
+        ],
+        details: {},
+      };
+    },
+  });
+
   // ── Bash tool — instrumented diagnostics and retry ───────────────────────
 
   pi.registerTool({
@@ -1606,12 +1742,17 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    if (!sandboxEnabled) return;
-
-    const config = loadConfig(ctx.cwd);
-    if (!config.enabled) return;
-
-    const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
+    if (
+      isToolCallEventType("bash", event) &&
+      shouldRedirectGitUpstreamMutation(event.input.command)
+    ) {
+      return {
+        block: true,
+        reason:
+          "Use the set_git_upstream tool for Git branch tracking instead of Bash. " +
+          "If git push -u is needed to publish the branch, push without -u first, then call set_git_upstream.",
+      };
+    }
 
     if (
       (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) &&
@@ -1621,12 +1762,18 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (
-      sandboxInitialized &&
       isToolCallEventType("bash", event) &&
       bashCommandMentionsSandboxConfig(event.input.command, ctx.cwd)
     ) {
       return redirectSandboxConfigMutationToPrompt(ctx);
     }
+
+    if (!sandboxEnabled) return;
+
+    const config = loadConfig(ctx.cwd);
+    if (!config.enabled) return;
+
+    const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
 
     // Path policy: read tool.
     //   denyRead is a hard block, but a strictly more specific allowRead wins.
@@ -1689,6 +1836,8 @@ export default function (pi: ExtensionAPI) {
   // ── session_start ───────────────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
+    ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("error", "ꗃ"));
+
     const noSandbox = pi.getFlag("no-sandbox") as boolean;
 
     if (noSandbox) {
@@ -1722,7 +1871,7 @@ export default function (pi: ExtensionAPI) {
       await SandboxManager.initialize(
         {
           network: config.network,
-          filesystem: config.filesystem,
+          filesystem: getProtectedFilesystem(config, ctx.cwd),
           ignoreViolations: configExt.ignoreViolations,
           enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
           allowBrowserProcess: configExt.allowBrowserProcess,
@@ -1748,14 +1897,7 @@ export default function (pi: ExtensionAPI) {
       warnIfAllDomainsAllowed(ctx, config);
       maybeWarnAboutBroadUnixSocketAccess(ctx, config);
 
-      const networkLabel = allowsAllDomains(config.network?.allowedDomains)
-        ? "all domains"
-        : `${config.network?.allowedDomains?.length ?? 0} domains`;
-      const writeCount = config.filesystem?.allowWrite?.length ?? 0;
-      ctx.ui.setStatus(
-        "sandbox",
-        ctx.ui.theme.fg("accent", `🔒 Sandbox: ${networkLabel}, ${writeCount} write paths`),
-      );
+      ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", "🔒"));
     } catch (err) {
       sandboxEnabled = false;
       ctx.ui.notify(
@@ -1804,7 +1946,7 @@ export default function (pi: ExtensionAPI) {
         await SandboxManager.initialize(
           {
             network: config.network,
-            filesystem: config.filesystem,
+            filesystem: getProtectedFilesystem(config, ctx.cwd),
             ignoreViolations: configExt.ignoreViolations,
             enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
             allowBrowserProcess: configExt.allowBrowserProcess,
@@ -1819,14 +1961,7 @@ export default function (pi: ExtensionAPI) {
         warnIfAllDomainsAllowed(ctx, config);
         maybeWarnAboutBroadUnixSocketAccess(ctx, config);
 
-        const networkLabel = allowsAllDomains(config.network?.allowedDomains)
-          ? "all domains"
-          : `${config.network?.allowedDomains?.length ?? 0} domains`;
-        const writeCount = config.filesystem?.allowWrite?.length ?? 0;
-        ctx.ui.setStatus(
-          "sandbox",
-          ctx.ui.theme.fg("accent", `🔒 Sandbox: ${networkLabel}, ${writeCount} write paths`),
-        );
+        ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", "🔒"));
         ctx.ui.notify("Sandbox enabled", "info");
       } catch (err) {
         ctx.ui.notify(
@@ -1855,7 +1990,7 @@ export default function (pi: ExtensionAPI) {
 
       sandboxEnabled = false;
       sandboxInitialized = false;
-      ctx.ui.setStatus("sandbox", "");
+      ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("error", "ꗃ"));
       ctx.ui.notify("Sandbox disabled", "info");
     },
   });
