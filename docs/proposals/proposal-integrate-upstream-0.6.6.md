@@ -15,7 +15,7 @@ After fast-forwarding the local branch to `origin/main`, the fork and `upstream/
 
 Several upstream changes independently implement features that originally motivated the fork, particularly composed global and project configuration and commands for adding allowed paths. Their intent overlaps with the fork, but their policy and persistence semantics differ.
 
-A mechanical merge would risk replacing deliberate downstream security behaviour while also making it difficult to adopt upstream's runtime fixes and modular `src/` architecture. Integration should therefore be treated as a migration. First refactor the working downstream implementation into module boundaries aligned with upstream while preserving behaviour and dependencies; then integrate upstream changes module by module.
+A mechanical merge would risk replacing deliberate downstream security behaviour while also making it difficult to adopt upstream's runtime fixes and modular `src/` architecture. Integration should therefore be treated as a migration. Keep the current downstream branch intact as the behavioural reference, build an integration branch from upstream's modular implementation, and port downstream tests and behaviour onto it deliberately.
 
 ## Goals
 
@@ -193,15 +193,15 @@ Version-only commits should not be cherry-picked independently of the behaviour 
 Treat this as a staged migration between two independently evolved implementations, not as one large merge-resolution exercise. Complete each phase with passing focused tests and a reviewable intermediate commit before beginning the next phase. These checkpoints should leave usable stopping points and make regressions attributable to one class of change.
 
 1. **Feature and test mapping:** before implementation, classify every upstream and downstream behaviour as retain, adapt, replace, defer, or reject. Map each behaviour to existing or required tests and to its intended module owner.
-2. **Downstream-first modularisation:** create an integration branch in the downstream repository and mechanically split the current working implementation into module boundaries aligned with upstream. Preserve current dependencies, runtime pin, behaviour, and test runner. Do not introduce upstream semantic changes in this phase. Never push to the upstream remote.
-3. **Architecture comparison:** compare each newly separated downstream module with its upstream 0.6.6 counterpart. Reconcile public types and integration seams while keeping the downstream test suite green. This produces a reviewable structural baseline before behaviour changes begin.
-4. **Configuration and policy integration:** adopt upstream validation and tests while retaining cumulative composition, specificity-aware precedence, project-relative persistence, and configuration protection.
-5. **Runtime fixes:** integrate upstream's subprocess, seccomp-helper, Bash-prompting, and PTY fixes in dependency order without blindly replacing the pinned downstream runtime fork. Verify that the already-integrated Bubblewrap cleanup still runs on success, failure, timeout, and abort paths.
-6. **Prompt improvements:** add editable and validated rules, prompt timeout, and attention events while retaining downstream persistence semantics.
-7. **Downstream integration verification:** verify that diagnostics, Git/SSH preflight and fallback handling, secure Git upstream mutation, scoped Chromium behaviour, and status presentation remain connected through the new architecture. These features should not need to be restored from scratch because downstream-first modularisation preserves them throughout.
-8. **Optional features:** decide separately whether to adopt SSH proxying, `sandboxUserShell`, the toggle shortcut, package/test-runner changes, and any command consolidation.
-9. Remove superseded duplicate implementations only after their replacement behaviour has focused test coverage.
-10. Review README and configuration examples against the final semantics rather than resolving documentation conflicts mechanically.
+2. **Upstream architecture baseline:** create an integration branch from `upstream/main` in the downstream repository. Keep the current downstream `main` unchanged as the behavioural reference. Never reset downstream `main`, force-push it, or push to the upstream remote.
+3. **Downstream test import:** bring downstream tests onto the integration branch before their implementations. Adapt test imports to the upstream module boundaries and add missing characterisation tests for cumulative composition, specificity, persistence, and other behaviour currently embedded in `index.ts`. Expected failures form the implementation checklist.
+4. **Independent downstream modules:** port diagnostics, `/sandbox` commands, configuration protection, Git/SSH handling, secure Git upstream mutation, scoped Chromium policy, and status presentation through narrow integration seams.
+5. **Configuration and policy integration:** replace upstream's conflicting semantics with cumulative composition, specificity-aware precedence, project-relative persistence, and protected sanctioned writes while retaining upstream validation and useful tests.
+6. **Runtime reconciliation:** retain upstream's subprocess, seccomp-helper, Bash-prompting, and PTY fixes while restoring the pinned downstream runtime behaviour where upstream does not yet provide equivalent scoped Chromium and macOS Git-over-SSH support. Verify Bubblewrap cleanup on success, failure, timeout, and abort paths.
+7. **Prompt adaptation:** retain upstream's editable and validated rules, prompt timeout, and attention events while applying downstream scope and project-relative persistence semantics.
+8. **Behavioural parity review:** compare the completed branch with downstream `main` using the feature ledger, contract tests, and platform checks. Preserve both histories when integrating the completed work into downstream `main`.
+9. **Optional features:** decide separately whether to adopt SSH proxying, `sandboxUserShell`, the toggle shortcut, package/test-runner changes, and any command consolidation.
+10. Remove superseded duplicate implementations only after their replacement behaviour has focused test coverage, then reconcile README and configuration examples against the final semantics rather than resolving documentation conflicts mechanically.
 
 Prefer adaptation over isolated cherry-picks where commits depend on upstream's refactor.
 
@@ -258,3 +258,20 @@ Run formatting, linting, TypeScript checking, unit tests, and platform-specific 
 - Has the scoped Chromium policy from the pinned downstream sandbox-runtime fork reached an acceptable upstream release, or must the fork remain pinned during this migration?
 - Should `sandboxUserShell` be accepted, rejected, or exposed only through explicit per-session confirmation?
 - Should the pnpm and Node test-runner migration be adopted as part of this work or handled separately?
+
+## Strategy decision: upstream-first, test-led port
+
+The integration will use upstream as the architectural starting point rather than first refactoring the downstream monolith into the same shape.
+
+This decision is based on the following considerations:
+
+- upstream already contains the target five-module architecture and the later runtime and prompt work;
+- mechanically reproducing that architecture from the downstream `index.ts` before integrating upstream would duplicate structural work;
+- most substantial downstream additions already have focused tests or separable modules that can be ported onto explicit seams;
+- importing downstream tests first turns behavioural parity into a visible checklist rather than relying on manual comparison;
+- retaining the existing downstream branch as a reference prevents the upstream baseline from becoming an irreversible replacement; and
+- making the final implementation upstream-shaped reduces the expected cost of subsequent upstream releases.
+
+The trade-off is that an upstream-first branch will not preserve all downstream behaviour at every intermediate commit. It therefore depends on a complete feature ledger, additional characterisation tests for embedded policy, and explicit parity verification before integration. The current downstream `main` must remain intact until that verification passes.
+
+This is a source-integration strategy, not a history rewrite. The completed work must be merged into the downstream repository in a way that preserves both upstream and downstream ancestry. No downstream branch should be reset to upstream, and nothing may be pushed to the upstream remote.
