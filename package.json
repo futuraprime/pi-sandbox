@@ -27,12 +27,12 @@
   },
   "homepage": "https://github.com/carderne/pi-sandbox",
   "scripts": {
-    "fmt": "./node_modules/.bin/oxfmt index.ts diagnostics.ts sandbox-command.ts git-upstream.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts git-upstream.test.ts browser-process.test.ts",
-    "lint": "./node_modules/.bin/oxlint index.ts diagnostics.ts sandbox-command.ts git-upstream.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts git-upstream.test.ts browser-process.test.ts",
+    "fmt": "./node_modules/.bin/oxfmt index.ts diagnostics.ts sandbox-command.ts git-upstream.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts git-upstream.test.ts browser-process.test.ts lifecycle.test.ts",
+    "lint": "./node_modules/.bin/oxlint index.ts diagnostics.ts sandbox-command.ts git-upstream.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts git-upstream.test.ts browser-process.test.ts lifecycle.test.ts",
     "check": "tsc --noEmit",
     "test": "vitest run",
     "all": "npm run fmt && npm run lint && npm run check && npm run test",
-    "ci:fmt": "./node_modules/.bin/oxfmt --check index.ts diagnostics.ts sandbox-command.ts git-upstream.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts git-upstream.test.ts browser-process.test.ts",
+    "ci:fmt": "./node_modules/.bin/oxfmt --check index.ts diagnostics.ts sandbox-command.ts git-upstream.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts git-upstream.test.ts browser-process.test.ts lifecycle.test.ts",
     "ci:lint": "npm run lint",
     "ci:check": "npm run check",
     "ci:test": "npm run test"

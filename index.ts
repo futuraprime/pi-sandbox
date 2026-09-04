@@ -880,6 +880,7 @@ export default function (pi: ExtensionAPI) {
 
   let sandboxEnabled = false;
   let sandboxInitialized = false;
+  let initializationGeneration = 0;
 
   // Session-temporary allowances — held in JS memory, not accessible by the agent.
   // These are added on top of whatever is in the config files.
@@ -1189,9 +1190,9 @@ export default function (pi: ExtensionAPI) {
     ]) as Promise<"abort" | "ssh-session">;
   }
 
-  function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxConfig): void {
+  function warnIfAllDomainsAllowed(ui: ExtensionContext["ui"], config: SandboxConfig): void {
     if (!allowsAllDomains(config.network?.allowedDomains)) return;
-    ctx.ui.notify(
+    ui.notify(
       '⚠️ Network sandbox allows all domains because network.allowedDomains contains "*". ' +
         'Only use this intentionally; remove "*" to restore per-domain prompts.',
       "warning",
@@ -1202,9 +1203,12 @@ export default function (pi: ExtensionAPI) {
     return config.network?.allowAllUnixSockets ?? false;
   }
 
-  function maybeWarnAboutBroadUnixSocketAccess(ctx: ExtensionContext, config: SandboxConfig): void {
+  function maybeWarnAboutBroadUnixSocketAccess(
+    ui: ExtensionContext["ui"],
+    config: SandboxConfig,
+  ): void {
     if (!hasBroadUnixSocketAccess(config)) return;
-    ctx.ui.notify(
+    ui.notify(
       "⚠️ Broad Unix socket access is enabled (allowAllUnixSockets=true). Narrow SSH-agent prompting may be less meaningful.",
       "warning",
     );
@@ -1836,28 +1840,44 @@ export default function (pi: ExtensionAPI) {
   // ── session_start ───────────────────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
-    ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("error", "ꗃ"));
+    const startGeneration = ++initializationGeneration;
+
+    let cwd: string;
+    let ui: ExtensionContext["ui"];
+    let pendingStatus: string;
+    let enabledStatus: string;
+    try {
+      cwd = ctx.cwd;
+      ui = ctx.ui;
+      pendingStatus = ui.theme.fg("error", "ꗃ");
+      enabledStatus = ui.theme.fg("accent", "🔒");
+      ui.setStatus("sandbox", pendingStatus);
+    } catch {
+      // Session replacement or reload can make a context stale before this
+      // lifecycle handler starts.
+      return;
+    }
 
     const noSandbox = pi.getFlag("no-sandbox") as boolean;
 
     if (noSandbox) {
       sandboxEnabled = false;
-      ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
+      ui.notify("Sandbox disabled via --no-sandbox", "warning");
       return;
     }
 
-    const config = loadConfig(ctx.cwd);
+    const config = loadConfig(cwd);
 
     if (!config.enabled) {
       sandboxEnabled = false;
-      ctx.ui.notify("Sandbox disabled via config", "info");
+      ui.notify("Sandbox disabled via config", "info");
       return;
     }
 
     const platform = process.platform;
     if (platform !== "darwin" && platform !== "linux") {
       sandboxEnabled = false;
-      ctx.ui.notify(`Sandbox not supported on ${platform}`, "warning");
+      ui.notify(`Sandbox not supported on ${platform}`, "warning");
       return;
     }
 
@@ -1871,7 +1891,7 @@ export default function (pi: ExtensionAPI) {
       await SandboxManager.initialize(
         {
           network: config.network,
-          filesystem: getProtectedFilesystem(config, ctx.cwd),
+          filesystem: getProtectedFilesystem(config, cwd),
           ignoreViolations: configExt.ignoreViolations,
           enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
           allowBrowserProcess: configExt.allowBrowserProcess,
@@ -1879,6 +1899,8 @@ export default function (pi: ExtensionAPI) {
         },
         createNetworkAskCallback(config.network?.allowedDomains ?? []),
       );
+
+      if (startGeneration !== initializationGeneration) return;
 
       // Make Node's built-in fetch() honour HTTP_PROXY / HTTPS_PROXY in this
       // process and any child processes that inherit the environment.
@@ -1894,13 +1916,14 @@ export default function (pi: ExtensionAPI) {
       sandboxEnabled = true;
       sandboxInitialized = true;
 
-      warnIfAllDomainsAllowed(ctx, config);
-      maybeWarnAboutBroadUnixSocketAccess(ctx, config);
+      warnIfAllDomainsAllowed(ui, config);
+      maybeWarnAboutBroadUnixSocketAccess(ui, config);
 
-      ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", "🔒"));
+      ui.setStatus("sandbox", enabledStatus);
     } catch (err) {
+      if (startGeneration !== initializationGeneration) return;
       sandboxEnabled = false;
-      ctx.ui.notify(
+      ui.notify(
         `Sandbox initialization failed: ${err instanceof Error ? err.message : err}`,
         "error",
       );
@@ -1910,7 +1933,12 @@ export default function (pi: ExtensionAPI) {
   // ── session_shutdown ────────────────────────────────────────────────────────
 
   pi.on("session_shutdown", async () => {
-    if (sandboxInitialized) {
+    initializationGeneration += 1;
+    const wasInitialized = sandboxInitialized;
+    sandboxEnabled = false;
+    sandboxInitialized = false;
+
+    if (wasInitialized) {
       try {
         await SandboxManager.reset();
       } catch {
@@ -1958,8 +1986,8 @@ export default function (pi: ExtensionAPI) {
         sandboxEnabled = true;
         sandboxInitialized = true;
 
-        warnIfAllDomainsAllowed(ctx, config);
-        maybeWarnAboutBroadUnixSocketAccess(ctx, config);
+        warnIfAllDomainsAllowed(ctx.ui, config);
+        maybeWarnAboutBroadUnixSocketAccess(ctx.ui, config);
 
         ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", "🔒"));
         ctx.ui.notify("Sandbox enabled", "info");
