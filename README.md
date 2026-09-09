@@ -136,6 +136,26 @@ That SSH prompt grants auth capability for the current session without normalizi
 and the agent has no way to read or modify them. They are reset when the
 extension reloads or pi restarts.
 
+### Linked Git worktrees
+
+When the session starts in a standard Git linked worktree (or one of its
+subdirectories), pi-sandbox validates the reciprocal Git metadata and derives a
+runtime-only allowance for the repository's canonical common `.git` directory.
+That derived path is added to both `allowRead` and `allowWrite`, so commands
+such as `git status`, ref updates, and other normal metadata operations work
+without prompting. The allowance is recalculated from the active session cwd
+for initialization, reinitialization, diagnostics, and direct read/write/edit
+checks; it is not a configured rule or a session approval and is never written
+to either sandbox configuration file. `/sandbox` shows it separately as
+`Linked Git metadata`.
+
+Only the validated common Git metadata directory is granted. The original
+checkout, sibling worktrees' working files, and parent directories are not
+included. A broad deny can be crossed only when the derived path is more
+specific under the normal deny/allow precedence rules; an equal or more
+specific explicit deny still wins. Malformed, oversized, mismatched, or
+non-standard `.git` metadata fails closed and receives no derived allowance.
+
 If the agent later tries to modify `.pi/sandbox.json` or
 `~/.pi/agent/sandbox.json` directly, pi-sandbox blocks that write and reuses
 the most recent blocked read/write/network request as the thing being approved.
