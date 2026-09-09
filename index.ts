@@ -117,6 +117,7 @@ import {
   parseSandboxCommand,
   updateSandboxConfigFile,
 } from "./sandbox-command.js";
+import { getEffectiveFilesystemPolicy } from "./sandbox-filesystem.js";
 
 interface SandboxConfig extends SandboxRuntimeConfig {
   enabled?: boolean;
@@ -703,10 +704,21 @@ export function isSandboxConfigPath(filePath: string, cwd: string): boolean {
   return canonical === canonicalizePath(projectPath) || canonical === canonicalizePath(globalPath);
 }
 
-function getProtectedFilesystem(config: SandboxConfig, cwd: string) {
+function getProtectedFilesystem(
+  config: SandboxConfig,
+  cwd: string,
+  sessionAllowedReadPaths: string[] = [],
+  sessionAllowedWritePaths: string[] = [],
+) {
   const { globalPath, projectPath } = getConfigPaths(cwd);
+  const filesystem = getEffectiveFilesystemPolicy(cwd, config.filesystem ?? {}, {
+    allowRead: sessionAllowedReadPaths,
+    allowWrite: sessionAllowedWritePaths,
+  });
   return {
     ...config.filesystem,
+    allowRead: filesystem.allowRead,
+    allowWrite: filesystem.allowWrite,
     denyWrite: dedup([
       ...(config.filesystem?.denyWrite ?? []),
       canonicalizePath(projectPath),
@@ -915,8 +927,12 @@ export default function (pi: ExtensionAPI) {
     deny: string[];
   } {
     const config = loadConfig(cwd);
+    const filesystem = getEffectiveFilesystemPolicy(cwd, config.filesystem ?? {}, {
+      allowRead: sessionAllowedReadPaths,
+      allowWrite: sessionAllowedWritePaths,
+    });
     return {
-      allow: [...(config.filesystem?.allowRead ?? []), ...sessionAllowedReadPaths],
+      allow: filesystem.allowRead,
       deny: config.filesystem?.denyRead ?? [],
     };
   }
@@ -926,8 +942,12 @@ export default function (pi: ExtensionAPI) {
     deny: string[];
   } {
     const config = loadConfig(cwd);
+    const filesystem = getEffectiveFilesystemPolicy(cwd, config.filesystem ?? {}, {
+      allowRead: sessionAllowedReadPaths,
+      allowWrite: sessionAllowedWritePaths,
+    });
     return {
-      allow: [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths],
+      allow: filesystem.allowWrite,
       deny: config.filesystem?.denyWrite ?? [],
     };
   }
@@ -988,12 +1008,12 @@ export default function (pi: ExtensionAPI) {
       await SandboxManager.initialize(
         {
           network,
-          filesystem: {
-            ...getProtectedFilesystem(config, cwd),
-            denyRead: config.filesystem?.denyRead ?? [],
-            allowRead: [...(config.filesystem?.allowRead ?? []), ...sessionAllowedReadPaths],
-            allowWrite: [...(config.filesystem?.allowWrite ?? []), ...sessionAllowedWritePaths],
-          },
+          filesystem: getProtectedFilesystem(
+            config,
+            cwd,
+            sessionAllowedReadPaths,
+            sessionAllowedWritePaths,
+          ),
           allowBrowserProcess: configExt.allowBrowserProcess,
           enableWeakerNetworkIsolation: true,
         },
@@ -2048,6 +2068,10 @@ export default function (pi: ExtensionAPI) {
       }
 
       const config = loadConfig(ctx.cwd);
+      const filesystemPolicy = getEffectiveFilesystemPolicy(ctx.cwd, config.filesystem ?? {}, {
+        allowRead: sessionAllowedReadPaths,
+        allowWrite: sessionAllowedWritePaths,
+      });
 
       const lines = [
         "Sandbox Configuration",
@@ -2076,6 +2100,7 @@ export default function (pi: ExtensionAPI) {
         `  Allow Read:  ${config.filesystem?.allowRead?.join(", ") || "(none)"}`,
         `  Allow Write: ${config.filesystem?.allowWrite?.join(", ") || "(none)"}`,
         `  Deny Write:  ${config.filesystem?.denyWrite?.join(", ") || "(none)"}`,
+        `  Linked Git metadata: ${filesystemPolicy.derived.linkedGitMetadata.join(", ") || "(none)"}`,
         ...(sessionAllowedReadPaths.length > 0
           ? [`  Session read:  ${sessionAllowedReadPaths.join(", ")}`]
           : []),
