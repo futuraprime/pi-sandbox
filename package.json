@@ -18,14 +18,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/carderne/pi-sandbox.git"
+    "url": "git+https://github.com/futuraprime/pi-sandbox.git"
   },
   "author": "Chris Arderne <chris@rdrn.me>",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/carderne/pi-sandbox/issues"
+    "url": "https://github.com/futuraprime/pi-sandbox/issues"
   },
-  "homepage": "https://github.com/carderne/pi-sandbox",
+  "homepage": "https://github.com/futuraprime/pi-sandbox",
   "scripts": {
     "fmt": "./node_modules/.bin/oxfmt index.ts diagnostics.ts sandbox-command.ts git-upstream.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts git-upstream.test.ts browser-process.test.ts lifecycle.test.ts",
     "lint": "./node_modules/.bin/oxlint index.ts diagnostics.ts sandbox-command.ts git-upstream.ts diagnostics.test.ts sandbox-command.test.ts sandbox-protection.test.ts git-upstream.test.ts browser-process.test.ts lifecycle.test.ts",
