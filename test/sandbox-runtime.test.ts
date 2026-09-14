@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { canonicalizePath } from "../src/policy.ts";
 import { getProtectedSandboxConfigPaths } from "../src/sandbox-command.ts";
+import { resolveDerivedFilesystemAllowances } from "../src/sandbox-filesystem.ts";
 import {
   buildRuntimeConfig,
   createNetworkAskCallback,
@@ -89,22 +90,27 @@ test("buildRuntimeConfig adds session allowances without mutating config", () =>
 });
 
 test("buildRuntimeConfig canonicalizes non-glob filesystem paths", () => {
-  const runtime = buildRuntimeConfig({
-    ...DEFAULT_CONFIG,
-    filesystem: {
-      ...DEFAULT_CONFIG.filesystem!,
-      denyRead: ["/tmp"],
-      allowRead: [],
-      allowWrite: ["/tmp"],
-      denyWrite: ["*.key"],
+  const runtime = buildRuntimeConfig(
+    {
+      ...DEFAULT_CONFIG,
+      filesystem: {
+        ...DEFAULT_CONFIG.filesystem!,
+        denyRead: ["/tmp"],
+        allowRead: [],
+        allowWrite: ["/tmp"],
+        denyWrite: ["*.key"],
+      },
     },
-  });
+    undefined,
+    process.platform,
+    "/",
+  );
 
   assert.deepEqual(runtime.filesystem?.denyRead, [canonicalizePath("/tmp")]);
   assert.equal(runtime.filesystem?.allowRead?.includes(canonicalizePath("/tmp")), true);
   assert.deepEqual(runtime.filesystem?.allowWrite, [canonicalizePath("/tmp")]);
-  assert.deepEqual(runtime.filesystem?.denyWrite?.slice(0, 1), [join(process.cwd(), "*.key")]);
-  const protectedPaths = getProtectedSandboxConfigPaths(process.cwd());
+  assert.deepEqual(runtime.filesystem?.denyWrite?.slice(0, 1), [join("/", "*.key")]);
+  const protectedPaths = getProtectedSandboxConfigPaths("/");
   assert.equal(runtime.filesystem?.denyWrite?.includes(protectedPaths.projectPath), true);
   assert.equal(runtime.filesystem?.denyWrite?.includes(protectedPaths.globalPath), true);
 });
@@ -129,12 +135,14 @@ test("buildRuntimeConfig resolves relative glob rules against the project cwd", 
     cwd,
   );
 
+  const derived = resolveDerivedFilesystemAllowances(cwd).linkedGitMetadata;
   assert.deepEqual(runtime.filesystem?.allowRead, [
     join(cwd, "packages", "*"),
+    ...derived,
     join(cwd, "output", "*"),
   ]);
   assert.deepEqual(runtime.filesystem?.denyRead, [join(cwd, "private", "*")]);
-  assert.deepEqual(runtime.filesystem?.allowWrite, [join(cwd, "output", "*")]);
+  assert.deepEqual(runtime.filesystem?.allowWrite, [join(cwd, "output", "*"), ...derived]);
   assert.deepEqual(runtime.filesystem?.denyWrite?.slice(0, 1), [join(cwd, "output", "*.key")]);
   const protectedPaths = getProtectedSandboxConfigPaths(cwd);
   assert.equal(runtime.filesystem?.denyWrite?.includes(protectedPaths.projectPath), true);
@@ -150,7 +158,7 @@ test("runtime network callback applies shared specificity without deny-first sho
 });
 
 test("buildRuntimeConfig exposes the bundled seccomp helper on Linux", () => {
-  const runtime = buildRuntimeConfig(DEFAULT_CONFIG, undefined, "linux");
+  const runtime = buildRuntimeConfig(DEFAULT_CONFIG, undefined, "linux", "/");
   const runtimeEntryUrl = import.meta.resolve("@carderne/sandbox-runtime");
   const seccompPath = canonicalizePath(
     fileURLToPath(new URL("../vendor/seccomp", runtimeEntryUrl)),
@@ -168,11 +176,15 @@ test("characterizes upstream runtime read expansion for write allowances", () =>
       allowWrite: ["/configured-write"],
     },
   };
-  const effective = resolveAllowances(config, {
-    domains: [],
-    readPaths: [],
-    writePaths: ["/session-write"],
-  });
+  const effective = resolveAllowances(
+    config,
+    {
+      domains: [],
+      readPaths: [],
+      writePaths: ["/session-write"],
+    },
+    "/",
+  );
 
   // C-13 keeps the direct-tool and runtime meanings of allowWrite as an
   // explicit decision. Preserve the upstream result until that comparison.

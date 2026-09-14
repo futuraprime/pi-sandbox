@@ -27,6 +27,7 @@ import {
   parseSandboxCommand,
   updateSandboxConfigFile,
 } from "./sandbox-command.ts";
+import { resolveDerivedFilesystemAllowances } from "./sandbox-filesystem.ts";
 import {
   createSandboxedBashOps,
   extractBlockedWritePath,
@@ -67,9 +68,10 @@ export default function (pi: ExtensionAPI) {
 
   let sandboxEnabled = false;
   let sandboxInitialized = false;
+  let sandboxCwd: string | null = null;
   const allowances: SessionAllowances = { domains: [], readPaths: [], writePaths: [] };
 
-  const effectiveAllowances = (cwd: string) => resolveAllowances(loadConfig(cwd), allowances);
+  const effectiveAllowances = (cwd: string) => resolveAllowances(loadConfig(cwd), allowances, cwd);
   const effectiveDomains = (cwd: string) => effectiveAllowances(cwd).domains;
   const effectiveReadPaths = (cwd: string) => effectiveAllowances(cwd).readPaths;
   const effectiveWritePaths = (cwd: string) => effectiveAllowances(cwd).writePaths;
@@ -78,6 +80,7 @@ export default function (pi: ExtensionAPI) {
     if (!sandboxInitialized) return true;
     try {
       await reinitializeSandbox(loadConfig(cwd), allowances, cwd);
+      sandboxCwd = cwd;
       return true;
     } catch (error) {
       // Keep the sandbox state enabled so execution cannot fall back to local Bash.
@@ -148,6 +151,11 @@ export default function (pi: ExtensionAPI) {
     setProxyEnvironment: boolean,
   ): Promise<boolean> {
     if (sandboxEnabled) {
+      if (sandboxInitialized && sandboxCwd !== ctx.cwd) {
+        const refreshed = await refreshSandbox(ctx.cwd);
+        if (refreshed) updateStatus(ctx, loadConfig(ctx.cwd));
+        return refreshed;
+      }
       ctx.ui.notify("Sandbox is already enabled", "info");
       return false;
     }
@@ -166,11 +174,14 @@ export default function (pi: ExtensionAPI) {
       }
       sandboxEnabled = true;
       sandboxInitialized = true;
+      sandboxCwd = ctx.cwd;
       warnIfAllDomainsAllowed(ctx, config);
       updateStatus(ctx, config);
       return true;
     } catch (error) {
       sandboxEnabled = false;
+      sandboxInitialized = false;
+      sandboxCwd = null;
       ctx.ui.notify(
         `Sandbox initialization failed: ${error instanceof Error ? error.message : error}`,
         "error",
@@ -196,6 +207,7 @@ export default function (pi: ExtensionAPI) {
     }
     sandboxEnabled = false;
     sandboxInitialized = false;
+    sandboxCwd = null;
     ctx.ui.setStatus("sandbox", "");
     return true;
   }
@@ -212,10 +224,11 @@ export default function (pi: ExtensionAPI) {
     ...localBash,
     label: "bash (sandboxed)",
     async execute(id, params, signal, onUpdate, ctx) {
-      const runBash = () => {
+      const runBash = async () => {
         if (!sandboxEnabled || !sandboxInitialized) {
           return localBash.execute(id, params, signal, onUpdate, ctx);
         }
+        if (sandboxCwd !== ctx.cwd) await refreshSandbox(ctx.cwd);
         return createBashToolDefinition(localCwd, {
           operations: createSandboxedBashOps(
             userShellPath,
@@ -299,6 +312,7 @@ export default function (pi: ExtensionAPI) {
       };
     }
     if (!sandboxEnabled || !sandboxInitialized) return;
+    if (sandboxCwd !== ctx.cwd) await refreshSandbox(ctx.cwd);
 
     const config = loadConfig(ctx.cwd);
     if (config.sandboxUserShell === false) return;
@@ -452,11 +466,15 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     if (pi.getFlag("no-sandbox") as boolean) {
       sandboxEnabled = false;
+      sandboxInitialized = false;
+      sandboxCwd = null;
       ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
       return;
     }
     if (!loadConfig(ctx.cwd).enabled) {
       sandboxEnabled = false;
+      sandboxInitialized = false;
+      sandboxCwd = null;
       ctx.ui.notify("Sandbox disabled via config", "info");
       return;
     }
@@ -464,12 +482,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    if (!sandboxInitialized) return;
-    try {
-      await SandboxManager.reset();
-    } catch {
-      // Ignore cleanup errors.
+    if (sandboxInitialized) {
+      try {
+        await SandboxManager.reset();
+      } catch {
+        // Ignore cleanup errors.
+      }
     }
+    sandboxEnabled = false;
+    sandboxInitialized = false;
+    sandboxCwd = null;
   });
 
   pi.registerShortcut(Key.alt("s"), {
@@ -523,7 +545,12 @@ export default function (pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        formatSandboxConfiguration(loadConfig(ctx.cwd), getConfigPaths(ctx.cwd), allowances),
+        formatSandboxConfiguration(
+          loadConfig(ctx.cwd),
+          getConfigPaths(ctx.cwd),
+          allowances,
+          resolveDerivedFilesystemAllowances(ctx.cwd).linkedGitMetadata,
+        ),
         "info",
       );
     },

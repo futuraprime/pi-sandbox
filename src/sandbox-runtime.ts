@@ -12,6 +12,7 @@ import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-a
 import { type SandboxConfig } from "./config.ts";
 import { canonicalizePathPattern, decideDomainPolicy } from "./policy.ts";
 import { getProtectedSandboxConfigPaths } from "./sandbox-command.ts";
+import { getEffectiveFilesystemPolicy } from "./sandbox-filesystem.ts";
 
 export interface SessionAllowances {
   domains: string[];
@@ -47,19 +48,19 @@ function sandboxRuntimeReadPaths(platform: NodeJS.Platform): string[] {
 export function resolveAllowances(
   config: SandboxConfig,
   allowances?: SessionAllowances,
+  cwd = process.cwd(),
 ): EffectiveAllowances {
-  const writePaths = unique([
-    ...(config.filesystem?.allowWrite ?? []),
-    ...(allowances?.writePaths ?? []),
-  ]);
+  const filesystem = getEffectiveFilesystemPolicy(cwd, config.filesystem ?? {}, {
+    allowRead: allowances?.readPaths,
+    allowWrite: allowances?.writePaths,
+  });
+  const writePaths = unique(filesystem.allowWrite);
 
   return {
     domains: unique([...(config.network?.allowedDomains ?? []), ...(allowances?.domains ?? [])]),
-    readPaths: unique([
-      ...(config.filesystem?.allowRead ?? []),
-      ...(allowances?.readPaths ?? []),
-      ...writePaths,
-    ]),
+    // Preserve the existing runtime/direct-tool contract that write
+    // allowances also expand reads, while keeping linked metadata derived.
+    readPaths: unique([...filesystem.allowRead, ...writePaths]),
     writePaths,
   };
 }
@@ -77,7 +78,7 @@ export function buildRuntimeConfig(
   platform: NodeJS.Platform = process.platform,
   cwd = process.cwd(),
 ): SandboxRuntimeConfig {
-  const effective = resolveAllowances(config, allowances);
+  const effective = resolveAllowances(config, allowances, cwd);
   const protectedConfigPaths = getProtectedSandboxConfigPaths(cwd);
   return {
     network: {
@@ -119,7 +120,7 @@ export async function initializeSandbox(
   cwd = process.cwd(),
 ): Promise<void> {
   const runtimeConfig = buildRuntimeConfig(config, allowances, process.platform, cwd);
-  const effective = resolveAllowances(config, allowances);
+  const effective = resolveAllowances(config, allowances, cwd);
   await SandboxManager.initialize(
     runtimeConfig,
     createNetworkAskCallback(effective.domains, config.network?.deniedDomains ?? []),

@@ -1,6 +1,15 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import test, { mock } from "node:test";
 
@@ -35,6 +44,44 @@ function makePi() {
 
 function makeProjectTempDirectory(prefix: string): string {
   return mkdtempSync(join(process.cwd(), `.pi-sandbox-${prefix}-`));
+}
+
+function git(cwd: string, args: string[]): string {
+  return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" });
+}
+
+function makeLinkedWorktreeFixture(): {
+  firstRepository: string;
+  secondRepository: string;
+  first: string;
+  second: string;
+  sibling: string;
+  firstCommonDir: string;
+  secondCommonDir: string;
+} {
+  const firstRepository = makeProjectTempDirectory("linked-worktree-first");
+  const secondRepository = makeProjectTempDirectory("linked-worktree-second");
+  for (const repository of [firstRepository, secondRepository]) {
+    git(repository, ["init", "-q", "-b", "main"]);
+    git(repository, ["config", "user.name", "Test User"]);
+    git(repository, ["config", "user.email", "test@example.com"]);
+    git(repository, ["commit", "--allow-empty", "-m", "initial"]);
+  }
+  const first = join(firstRepository, "first-worktree");
+  const second = join(secondRepository, "second-worktree");
+  const sibling = join(secondRepository, "sibling-worktree");
+  git(firstRepository, ["worktree", "add", "--detach", first, "HEAD"]);
+  git(secondRepository, ["worktree", "add", "--detach", second, "HEAD"]);
+  git(secondRepository, ["worktree", "add", "--detach", sibling, "HEAD"]);
+  return {
+    firstRepository,
+    secondRepository,
+    first,
+    second,
+    sibling,
+    firstCommonDir: realpathSync(join(firstRepository, ".git")),
+    secondCommonDir: realpathSync(join(secondRepository, ".git")),
+  };
 }
 
 function makeContext(cwd: string, notices: string[]): ExtensionContext {
@@ -171,6 +218,76 @@ test("/sandbox warns when persistence succeeds but active runtime refresh fails"
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("replaces linked-worktree runtime allowances from the active cwd", async () => {
+  const fixture = makeLinkedWorktreeFixture();
+  const initialised: unknown[] = [];
+  const resets: string[] = [];
+  const managerMock = mock.method(SandboxManager, "initialize", async (config: unknown) => {
+    initialised.push(config);
+  });
+  const resetMock = mock.method(SandboxManager, "reset", async () => {
+    resets.push("reset");
+  });
+
+  try {
+    const { pi, commands, handlers } = makePi();
+    extension(pi);
+    const notices: string[] = [];
+    const ctx = makeContext(fixture.first, notices);
+
+    await handlers.get("session_start")?.({}, ctx);
+    const firstConfig = initialised[0] as any;
+    assert.equal(firstConfig.filesystem.allowRead.includes(fixture.firstCommonDir), true);
+    assert.equal(firstConfig.filesystem.allowRead.includes(fixture.secondCommonDir), false);
+
+    ctx.cwd = fixture.second;
+    await handlers.get("session_start")?.({}, ctx);
+    const secondConfig = initialised[1] as any;
+    assert.equal(secondConfig.filesystem.allowRead.includes(fixture.secondCommonDir), true);
+    assert.equal(secondConfig.filesystem.allowRead.includes(fixture.firstCommonDir), false);
+    assert.equal(resets.length, 1);
+
+    await commands.get("sandbox")?.("", ctx);
+    assert.match(
+      notices.at(-1) ?? "",
+      new RegExp(`Linked Git metadata: ${fixture.secondCommonDir}`),
+    );
+
+    ctx.hasUI = false;
+    const firstCheckout = await handlers.get("tool_call")?.(
+      { toolName: "read", input: { path: fixture.firstRepository } },
+      ctx,
+    );
+    const sibling = await handlers.get("tool_call")?.(
+      { toolName: "read", input: { path: join(fixture.sibling, "HEAD") } },
+      ctx,
+    );
+    const commonMetadata = await handlers.get("tool_call")?.(
+      { toolName: "read", input: { path: join(fixture.secondCommonDir, "HEAD") } },
+      ctx,
+    );
+    assert.equal(firstCheckout?.block, true);
+    assert.equal(sibling?.block, true);
+    assert.equal(commonMetadata, undefined);
+
+    mkdirSync(join(fixture.second, ".pi"));
+    writeFileSync(
+      join(fixture.second, ".pi", "sandbox.json"),
+      JSON.stringify({ filesystem: { denyRead: [fixture.secondCommonDir] } }),
+    );
+    const deniedCommonMetadata = await handlers.get("tool_call")?.(
+      { toolName: "read", input: { path: join(fixture.secondCommonDir, "HEAD") } },
+      ctx,
+    );
+    assert.equal(deniedCommonMetadata?.block, true);
+  } finally {
+    managerMock.mock.restore();
+    resetMock.mock.restore();
+    rmSync(fixture.firstRepository, { recursive: true, force: true });
+    rmSync(fixture.secondRepository, { recursive: true, force: true });
   }
 });
 

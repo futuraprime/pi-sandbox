@@ -366,6 +366,7 @@ export function formatSandboxConfiguration(
   config: SandboxConfig,
   paths: { globalPath: string; projectPath: string },
   allowances: SessionAllowances,
+  linkedGitMetadata: string[] = [],
 ): string {
   return [
     "Sandbox Configuration",
@@ -385,6 +386,7 @@ export function formatSandboxConfiguration(
     `  Allow Read:  ${config.filesystem?.allowRead?.join(", ") || "(none)"}`,
     `  Allow Write: ${config.filesystem?.allowWrite?.join(", ") || "(none)"}`,
     `  Deny Write:  ${config.filesystem?.denyWrite?.join(", ") || "(none)"}`,
+    `  Linked Git metadata: ${linkedGitMetadata.join(", ") || "(none)"}`,
     ...(allowances.readPaths.length ? [`  Session read:  ${allowances.readPaths.join(", ")}`] : []),
     ...(allowances.writePaths.length
       ? [`  Session write: ${allowances.writePaths.join(", ")}`]
