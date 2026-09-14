@@ -20,11 +20,14 @@ A mechanical merge would risk replacing deliberate downstream security behaviour
 ## Goals
 
 - Adopt worthwhile upstream runtime fixes, API compatibility changes, tests, and maintainability improvements.
+- Evaluate sandbox-runtime 0.0.72 as an explicit integration target and expose its credential masking only after downstream compatibility and security checks pass.
 - Preserve the fork's cumulative configuration and explicit permission-precedence model.
 - Preserve sandbox diagnostics, protected configuration mutation, Git/SSH preflight, and downstream status behaviour.
 - Remove duplicated implementations once their intended semantics have been reconciled.
 - Keep project configuration portable between checkouts and machines.
 - Leave a structure in which future upstream releases can be integrated without reopening unrelated downstream modules.
+
+macOS is the downstream deployment and acceptance target. Preserve upstream Linux behaviour where it comes for free and keep platform-neutral unit tests portable, but Linux-specific integration work is not a release blocker.
 
 ## Module boundaries and ownership
 
@@ -155,7 +158,7 @@ Upstream's configuration writers should be routed through this policy rather tha
 
 ## Current downstream baseline
 
-The fast-forwarded `origin/main` already contains upstream Bubblewrap cleanup commit `d14e15a`; the integration must preserve its `SandboxManager.cleanupAfterCommand()` behaviour rather than reimplement it. The downstream code also already uses `getAgentDir()` consistently for global configuration paths, satisfying the behavioural goal of upstream `87777d9` even though that later upstream commit is not in the fork's ancestry.
+The fast-forwarded `origin/main` already contains upstream Bubblewrap cleanup commit `d14e15a`; retain its `SandboxManager.cleanupAfterCommand()` path rather than reimplementing it, but do not make additional Linux-specific integration validation a release blocker. The downstream code also already uses `getAgentDir()` consistently for global configuration paths, satisfying the behavioural goal of upstream `87777d9` even though that later upstream commit is not in the fork's ancestry.
 
 Two additional origin changes are part of the baseline and must not be lost during migration:
 
@@ -164,6 +167,22 @@ Two additional origin changes are part of the baseline and must not be lost duri
 
 These changes are downstream compatibility and security work, not substitutes for all later upstream runtime fixes. Any move from the pinned runtime fork to an upstream release must first prove that its scoped Chromium policy and macOS Git-over-SSH behaviour are retained.
 
+Upstream pi-sandbox 0.6.6 declares `@carderne/sandbox-runtime: ^0.0.70` but locks version 0.0.70. Merely integrating pi-sandbox 0.6.6 therefore does not adopt the credential support present in sandbox-runtime 0.0.72. In addition, upstream pi-sandbox's `buildRuntimeConfig()` currently omits the runtime's `credentials` section. The runtime upgrade and pi-sandbox configuration plumbing must be treated as explicit integration work rather than an incidental dependency refresh.
+
+### Credential masking target
+
+Evaluate sandbox-runtime 0.0.72's credential controls as part of runtime reconciliation:
+
+- `credentials.envVars` and `credentials.files` support `mode: "deny"`, which withholds the declared source from sandboxed processes;
+- `mode: "mask"` exposes a per-session sentinel rather than plaintext and substitutes the real credential only through the runtime proxy on egress to the entry's effective `injectHosts`;
+- per-entry `injectHosts` must be explicitly narrowed for credentials rather than implicitly accepting every reachable host;
+- structured extraction must use `onExtractNoMatch: "deny"` or `"error"` for secret-bearing configuration so a failed match cannot expose plaintext through the default fail-open warning behaviour; and
+- file masking is Linux-only in 0.0.72 and degrades to deny on macOS, so it is out of scope for the initial downstream integration; use environment-variable masking on the macOS target instead.
+
+This is a capability for proxy-mediated network authentication, not a way to reveal plaintext to a trusted script inside the sandbox. The extension must not introduce a generic secret-bearing command runner. A sandboxed script may parse or pass a sentinel, while the proxy performs host-scoped substitution without exposing the real value to the process or agent.
+
+Add a validated, typed `credentials` section to pi-sandbox configuration and preserve it through configuration loading, composition, and `buildRuntimeConfig()`. Credential entries contain policy metadata, not secret values: real values remain in their declared host environment or protected source files. Credential configuration must not be editable through ordinary permission prompts or the existing `/sandbox` allow/deny commands in the first implementation.
+
 ## Upstream changes to integrate
 
 The first integration set should include these outstanding upstream fixes or their equivalent behaviour:
@@ -171,7 +190,6 @@ The first integration set should include these outstanding upstream fixes or the
 - `3fb50d6` — correct Bash write prompting;
 - `79b592b` — pass `allowPty` through to the sandbox extension;
 - `53bd1d6` — avoid hanging on inherited subprocess output handles;
-- `9103b38` — expose the bundled Linux seccomp helper;
 - `fcabc75` — editable and validated prompt rules;
 - `4ca354c` — interactive permission-prompt timeout; and
 - `d6f01db` — emit attention events for sandbox prompts.
@@ -186,6 +204,8 @@ The following require separate product or security review before inclusion:
 - package-manager and test-runner changes; and
 - any changed defaults introduced by newer sandbox-runtime versions.
 
+The Linux-only bundled seccomp-helper change (`9103b38`) may remain as inherited upstream behaviour, but it does not require downstream-specific integration work or acceptance coverage.
+
 Version-only commits should not be cherry-picked independently of the behaviour they describe.
 
 ## Migration approach
@@ -197,11 +217,12 @@ Treat this as a staged migration between two independently evolved implementatio
 3. **Downstream test import:** bring downstream tests onto the integration branch before their implementations. Adapt test imports to the upstream module boundaries and add missing characterisation tests for cumulative composition, specificity, persistence, and other behaviour currently embedded in `index.ts`. Expected failures form the implementation checklist.
 4. **Independent downstream modules:** port diagnostics, `/sandbox` commands, configuration protection, Git/SSH handling, secure Git upstream mutation, scoped Chromium policy, and status presentation through narrow integration seams.
 5. **Configuration and policy integration:** replace upstream's conflicting semantics with cumulative composition, specificity-aware precedence, project-relative persistence, and protected sanctioned writes while retaining upstream validation and useful tests.
-6. **Runtime reconciliation:** retain upstream's subprocess, seccomp-helper, Bash-prompting, and PTY fixes while restoring the pinned downstream runtime behaviour where upstream does not yet provide equivalent scoped Chromium and macOS Git-over-SSH support. Verify Bubblewrap cleanup on success, failure, timeout, and abort paths.
-7. **Prompt adaptation:** retain upstream's editable and validated rules, prompt timeout, and attention events while applying downstream scope and project-relative persistence semantics.
-8. **Behavioural parity review:** compare the completed branch with downstream `main` using the feature ledger, contract tests, and platform checks. Preserve both histories when integrating the completed work into downstream `main`.
-9. **Optional features:** decide separately whether to adopt SSH proxying, `sandboxUserShell`, the toggle shortcut, package/test-runner changes, and any command consolidation.
-10. Remove superseded duplicate implementations only after their replacement behaviour has focused test coverage, then reconcile README and configuration examples against the final semantics rather than resolving documentation conflicts mechanically.
+6. **Runtime reconciliation:** retain upstream's subprocess, Bash-prompting, and PTY fixes while restoring the pinned downstream runtime behaviour where upstream does not yet provide equivalent scoped Chromium and macOS Git-over-SSH support. Compare the pinned downstream runtime with sandbox-runtime 0.0.72, and upgrade only after scoped Chromium and macOS Git-over-SSH parity is demonstrated.
+7. **Credential integration:** expose a validated `credentials` configuration and pass it through the runtime seam. Implement and validate host-scoped environment-variable masking on macOS, including deny semantics and the macOS deny fallback for credential files. Do not add Linux-only file-masking work to the initial scope. Require fail-closed handling for structured secret extraction and verify that diagnostics, prompts, and command output never reveal registered plaintext credentials.
+8. **Prompt adaptation:** retain upstream's editable and validated rules, prompt timeout, and attention events while applying downstream scope and project-relative persistence semantics.
+9. **Behavioural parity review:** compare the completed branch with downstream `main` using the feature ledger, contract tests, and platform checks. Preserve both histories when integrating the completed work into downstream `main`.
+10. **Optional features:** decide separately whether to adopt SSH proxying, `sandboxUserShell`, the toggle shortcut, package/test-runner changes, and any command consolidation.
+11. Remove superseded duplicate implementations only after their replacement behaviour has focused test coverage, then reconcile README and configuration examples against the final semantics rather than resolving documentation conflicts mechanically.
 
 Prefer adaptation over isolated cherry-picks where commits depend on upstream's refactor.
 
@@ -241,21 +262,26 @@ Add or retain focused tests for:
 - prompt timeout aborting without persistence;
 - protected config files remaining inaccessible to direct tools and Bash mutation;
 - successful sandbox reinitialisation after an approved change;
-- Bubblewrap cleanup on success, failure, timeout, and abort paths;
 - scoped macOS Chromium policy without broad Unix-socket access;
-- macOS Git-over-SSH through the unauthenticated SOCKS compatibility mode while retaining domain and SSH-agent controls; and
+- macOS Git-over-SSH through the unauthenticated SOCKS compatibility mode while retaining domain and SSH-agent controls;
+- environment-variable deny and mask modes on macOS;
+- sentinel values being substituted only for explicitly configured credential hosts and remaining fake for other reachable hosts;
+- structured masking failing closed when extraction does not match;
+- credential files degrading safely to deny on macOS;
+- plaintext credentials remaining absent from sandboxed environment inspection, file reads, command output, diagnostics, and prompts;
 - all retained diagnostics and Git/SSH workflows;
 - module-level contract tests for each shared integration seam; and
 - a synthetic upstream update integrating without changes to unrelated downstream-owned modules.
 
-Run formatting, linting, TypeScript checking, unit tests, and platform-specific sandbox integration tests on macOS and Linux.
+Run formatting, linting, TypeScript checking, and unit tests. Run platform-specific sandbox integration tests on macOS. Linux CI and platform-neutral coverage should remain healthy where practical, but Linux-specific integration failures do not block this downstream migration unless they reveal a shared correctness or security defect.
 
 ## Open questions
 
 - Should an explicit `/sandbox-allow` command remain alongside `/sandbox`, or should `/sandbox` gain an optional interactive scope selector?
 - Should users be able to remove inherited rules through a separate explicit command, while keeping empty-array composition cumulative?
 - Which upstream SSH proxy behaviour complements the downstream preflight and existing macOS `allowUnauthenticatedSocksProxy` flow, and which parts duplicate or weaken them?
-- Has the scoped Chromium policy from the pinned downstream sandbox-runtime fork reached an acceptable upstream release, or must the fork remain pinned during this migration?
+- Does sandbox-runtime 0.0.72 preserve the scoped Chromium and macOS Git-over-SSH behaviour from the pinned downstream fork, or must those patches be ported before adopting its credential support?
+- Should credential policies compose cumulatively across global and project configuration, or should credential declarations be global-only initially to reduce the risk of project-controlled injection policy?
 - Should `sandboxUserShell` be accepted, rejected, or exposed only through explicit per-session confirmation?
 - Should the pnpm and Node test-runner migration be adopted as part of this work or handled separately?
 
