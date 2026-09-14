@@ -5,10 +5,12 @@ import test from "node:test";
 
 import assert from "node:assert/strict";
 
+import { DEFAULT_CONFIG } from "../src/config.ts";
 import {
   getEffectiveFilesystemPolicy,
   resolveDerivedFilesystemAllowances,
 } from "../src/sandbox-filesystem.ts";
+import { buildRuntimeConfig } from "../src/sandbox-runtime.ts";
 
 const temporaryDirectories: string[] = [];
 
@@ -96,6 +98,35 @@ test("recomputes replacement paths, fails closed, and does not mutate arrays", (
   const configured = { allowRead: ["."], allowWrite: ["."] };
   const sessionApproved = { allowRead: ["session"], allowWrite: ["session"] };
   getEffectiveFilesystemPolicy(firstWorktree, configured, sessionApproved);
+
+  const runtimeConfig = {
+    ...DEFAULT_CONFIG,
+    filesystem: {
+      ...DEFAULT_CONFIG.filesystem!,
+      allowRead: configured.allowRead,
+      allowWrite: configured.allowWrite,
+    },
+  };
+  const firstRuntime = buildRuntimeConfig(
+    runtimeConfig,
+    { domains: [], readPaths: sessionApproved.allowRead, writePaths: sessionApproved.allowWrite },
+    process.platform,
+    firstWorktree,
+  );
+  const secondRuntime = buildRuntimeConfig(
+    runtimeConfig,
+    { domains: [], readPaths: sessionApproved.allowRead, writePaths: sessionApproved.allowWrite },
+    process.platform,
+    secondWorktree,
+  );
+  assert.equal(firstRuntime.filesystem?.allowRead?.includes(firstCommon), true);
+  assert.equal(firstRuntime.filesystem?.allowRead?.includes(secondCommon), false);
+  assert.equal(firstRuntime.filesystem?.allowWrite?.includes(firstCommon), true);
+  assert.equal(firstRuntime.filesystem?.allowWrite?.includes(secondCommon), false);
+  assert.equal(secondRuntime.filesystem?.allowRead?.includes(secondCommon), true);
+  assert.equal(secondRuntime.filesystem?.allowRead?.includes(firstCommon), false);
+  assert.equal(secondRuntime.filesystem?.allowWrite?.includes(secondCommon), true);
+  assert.equal(secondRuntime.filesystem?.allowWrite?.includes(firstCommon), false);
   assert.deepEqual(configured, { allowRead: ["."], allowWrite: ["."] });
   assert.deepEqual(sessionApproved, { allowRead: ["session"], allowWrite: ["session"] });
 

@@ -73,6 +73,9 @@ function makeLinkedWorktreeFixture(): {
   git(firstRepository, ["worktree", "add", "--detach", first, "HEAD"]);
   git(secondRepository, ["worktree", "add", "--detach", second, "HEAD"]);
   git(secondRepository, ["worktree", "add", "--detach", sibling, "HEAD"]);
+  writeFileSync(join(first, "old-worktree.txt"), "old worktree");
+  writeFileSync(join(secondRepository, "original-checkout.txt"), "original checkout");
+  writeFileSync(join(sibling, "sibling-worktree.txt"), "sibling worktree");
   return {
     firstRepository,
     secondRepository,
@@ -241,13 +244,17 @@ test("replaces linked-worktree runtime allowances from the active cwd", async ()
     await handlers.get("session_start")?.({}, ctx);
     const firstConfig = initialised[0] as any;
     assert.equal(firstConfig.filesystem.allowRead.includes(fixture.firstCommonDir), true);
+    assert.equal(firstConfig.filesystem.allowWrite.includes(fixture.firstCommonDir), true);
     assert.equal(firstConfig.filesystem.allowRead.includes(fixture.secondCommonDir), false);
+    assert.equal(firstConfig.filesystem.allowWrite.includes(fixture.secondCommonDir), false);
 
     ctx.cwd = fixture.second;
     await handlers.get("session_start")?.({}, ctx);
     const secondConfig = initialised[1] as any;
     assert.equal(secondConfig.filesystem.allowRead.includes(fixture.secondCommonDir), true);
+    assert.equal(secondConfig.filesystem.allowWrite.includes(fixture.secondCommonDir), true);
     assert.equal(secondConfig.filesystem.allowRead.includes(fixture.firstCommonDir), false);
+    assert.equal(secondConfig.filesystem.allowWrite.includes(fixture.firstCommonDir), false);
     assert.equal(resets.length, 1);
 
     await commands.get("sandbox")?.("", ctx);
@@ -256,33 +263,81 @@ test("replaces linked-worktree runtime allowances from the active cwd", async ()
       new RegExp(`Linked Git metadata: ${fixture.secondCommonDir}`),
     );
 
-    ctx.hasUI = false;
-    const firstCheckout = await handlers.get("tool_call")?.(
-      { toolName: "read", input: { path: fixture.firstRepository } },
-      ctx,
-    );
-    const sibling = await handlers.get("tool_call")?.(
-      { toolName: "read", input: { path: join(fixture.sibling, "HEAD") } },
-      ctx,
-    );
-    const commonMetadata = await handlers.get("tool_call")?.(
-      { toolName: "read", input: { path: join(fixture.secondCommonDir, "HEAD") } },
-      ctx,
-    );
-    assert.equal(firstCheckout?.block, true);
-    assert.equal(sibling?.block, true);
-    assert.equal(commonMetadata, undefined);
-
+    // A broader deny still permits the more-specific derived common Git path,
+    // while checked-out files in the original and sibling worktrees remain
+    // outside the derived allowance.
     mkdirSync(join(fixture.second, ".pi"));
     writeFileSync(
       join(fixture.second, ".pi", "sandbox.json"),
-      JSON.stringify({ filesystem: { denyRead: [fixture.secondCommonDir] } }),
+      JSON.stringify({
+        filesystem: {
+          denyRead: [fixture.firstRepository, fixture.secondRepository],
+          denyWrite: [fixture.firstRepository, fixture.secondRepository],
+        },
+      }),
     );
-    const deniedCommonMetadata = await handlers.get("tool_call")?.(
-      { toolName: "read", input: { path: join(fixture.secondCommonDir, "HEAD") } },
+
+    ctx.hasUI = false;
+    const ordinaryPaths = [
+      join(fixture.first, "old-worktree.txt"),
+      join(fixture.secondRepository, "original-checkout.txt"),
+      join(fixture.sibling, "sibling-worktree.txt"),
+    ];
+    for (const path of ordinaryPaths) {
+      const read = await handlers.get("tool_call")?.({ toolName: "read", input: { path } }, ctx);
+      const write = await handlers.get("tool_call")?.({ toolName: "write", input: { path } }, ctx);
+      const edit = await handlers.get("tool_call")?.({ toolName: "edit", input: { path } }, ctx);
+      assert.equal(read?.block, true);
+      assert.equal(write?.block, true);
+      assert.equal(edit?.block, true);
+    }
+
+    const commonMetadataPath = join(fixture.secondCommonDir, "HEAD");
+    const commonRead = await handlers.get("tool_call")?.(
+      { toolName: "read", input: { path: commonMetadataPath } },
       ctx,
     );
-    assert.equal(deniedCommonMetadata?.block, true);
+    const commonWrite = await handlers.get("tool_call")?.(
+      { toolName: "write", input: { path: commonMetadataPath } },
+      ctx,
+    );
+    const commonEdit = await handlers.get("tool_call")?.(
+      { toolName: "edit", input: { path: commonMetadataPath } },
+      ctx,
+    );
+    assert.equal(commonRead, undefined);
+    assert.equal(commonWrite, undefined);
+    assert.equal(commonEdit, undefined);
+
+    // Equal-specificity explicit denies retain precedence over the derived
+    // allowance for both direct read and write/edit hooks.
+    writeFileSync(
+      join(fixture.second, ".pi", "sandbox.json"),
+      JSON.stringify({
+        filesystem: {
+          denyRead: [fixture.secondCommonDir],
+          denyWrite: [fixture.secondCommonDir],
+        },
+      }),
+    );
+    const deniedCommonRead = await handlers.get("tool_call")?.(
+      { toolName: "read", input: { path: commonMetadataPath } },
+      ctx,
+    );
+    const deniedCommonWrite = await handlers.get("tool_call")?.(
+      { toolName: "write", input: { path: commonMetadataPath } },
+      ctx,
+    );
+    const deniedCommonEdit = await handlers.get("tool_call")?.(
+      { toolName: "edit", input: { path: commonMetadataPath } },
+      ctx,
+    );
+    assert.equal(deniedCommonRead?.block, true);
+    assert.equal(deniedCommonWrite?.block, true);
+    assert.equal(deniedCommonEdit?.block, true);
+    assert.match(deniedCommonRead?.reason ?? "", /denyRead/);
+    assert.match(deniedCommonWrite?.reason ?? "", /denyWrite/);
+    assert.match(deniedCommonEdit?.reason ?? "", /denyWrite/);
   } finally {
     managerMock.mock.restore();
     resetMock.mock.restore();
