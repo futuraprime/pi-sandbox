@@ -1,8 +1,9 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** Proposed
+- **Status:** In progress — slices 1 and 2 complete
 - **Date:** 2026-09-03
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
+- **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
 
 ## Context
 
@@ -231,7 +232,7 @@ Prefer adaptation over isolated cherry-picks where commits depend on upstream's 
 
 Plan the migration as nine expected `/execute`-sized slices, plus one conditional runtime-adaptation slice. Keep each slice independently verifiable, reviewable, and committed before beginning the next. A slice may use parallel agents for bounded work, but it must finish with one coherent outcome and a green or explicitly characterised test state.
 
-### Slice 1: Feature ledger and test map
+### Slice 1: Feature ledger and test map (complete)
 
 - Classify each material upstream and downstream behaviour as retain, adapt, replace, defer, or reject.
 - Assign an intended module owner and integration seam to each behaviour.
@@ -240,7 +241,7 @@ Plan the migration as nine expected `/execute`-sized slices, plus one conditiona
 
 **Exit condition:** the ledger accounts for the proposal's required behaviours, named upstream commits, downstream baseline commits, optional features, and verification requirements.
 
-### Slice 2: Upstream baseline and downstream test import
+### Slice 2: Upstream baseline and downstream test import (complete)
 
 - Create the integration branch from the current `upstream/main`, leaving downstream `main` unchanged.
 - Establish upstream's five-module architecture and test harness as the structural baseline.
@@ -248,6 +249,8 @@ Plan the migration as nine expected `/execute`-sized slices, plus one conditiona
 - Add the highest-priority missing characterisation tests for behaviour still embedded in downstream `index.ts`.
 
 **Exit condition:** upstream tests pass, imported downstream tests compile where their seams exist, and expected behavioural failures form an explicit implementation checklist.
+
+**Completed:** commit `51d1bab` retains the upstream five-module baseline, adds runnable characterisation coverage and 12 explicit TODO gates, and records tests blocked on later seams. Verification passed with 37 passing tests, 12 TODOs, and no failures using `node --import tsx --test test/**/*.test.ts`; `pnpm verify` is not defined, and the equivalent `pnpm test` command could not run inside the review sandbox because the `tsx` CLI could not create its IPC socket. TypeScript checking, linting, and formatting checks passed.
 
 ### Slice 3: Configuration composition and policy precedence
 
