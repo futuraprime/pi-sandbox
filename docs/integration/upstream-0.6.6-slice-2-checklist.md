@@ -38,13 +38,17 @@ A downstream test is not copied into the normal suite when its import would requ
 | `lifecycle.test.ts` | Downstream extension lifecycle state/context and derived filesystem integration | Stale session-start success/failure suppression, active `ctx.cwd`, reset/reinitialisation ordering, session allowance clearing, and status cleanup. | RD/EP, `src/extension.ts`; slices 5 and 9 |
 | `browser-process.test.ts` | The installed 0.0.70 runtime does not export the downstream test's `generateSandboxProfile` helper; 0.0.72/profile parity is a later runtime gate | Scoped Chromium process/sysctl, loopback, Darwin temp, and path-scoped Unix-socket permissions without broad `allowAllUnixSockets`. | EP, runtime comparison; slices 6–7 |
 
+## Slice 3 completion
+
+Slice 3 replaced the configuration and policy TODO gates with executable contract coverage. `src/config.ts` now composes validated defaults, global, and project arrays cumulatively (including per-key `ignoreViolations`) while retaining local scalar precedence. `src/policy.ts` now shares canonical path and domain specificity decisions, including deny precedence, more-specific allow exceptions, hard denies, and HTTP(S)/SSH/SCP command extraction. Direct read/write and network preflight callers consume those decisions.
+
 ## Current TODO gates
 
 These node:test TODOs identify expected parity work without adding later-slice production behavior:
 
-- `test/config.test.ts`: C-02/C-03 cumulative arrays; C-04 empty-array semantics; C-03 per-key `ignoreViolations`; C-07/D-02 canonical duplicate and scope representation; D-01/D-04 all six command rule types.
-- `test/policy.test.ts`: C-08/C-09 specificity and hard-deny matrix; C-10/C-11 deny-aware domain precedence and HTTP/SSH/SCP extraction.
+- `test/config.test.ts`: C-07/D-02 canonical duplicate and scope representation; D-01/D-04 all six command rule types.
+- `test/policy.test.ts`: no slice-3 policy gates remain; persistence and command integration remain with C-07/D-02 and D-01/D-04.
 - `test/sandbox-runtime.test.ts`: C-13 direct-tool versus runtime `allowWrite` meaning; R-02 Bash preflight classification, retry, and attribution.
 - UI timeout already has runnable upstream coverage; its no-persistence writer/reinitialisation contract belongs to P-03/D-03 in slice 9.
 
-No TODO weakens an existing assertion, changes runtime/security behavior, or substitutes for the blocked-module checklist above.
+No TODO weakens an existing assertion, changes runtime/security behavior, or substitutes for the blocked-module checklist above. Slice 4 owns canonical persistence deduplication and `/sandbox` protected persistence; later slices own full Bash diagnostics/preflight and the deferred C-13 decision.

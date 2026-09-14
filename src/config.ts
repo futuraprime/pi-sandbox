@@ -54,33 +54,87 @@ export const DEFAULT_CONFIG: SandboxConfig = {
   },
 };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function warnInvalidArray(label: string, value: unknown): void {
+  if (value !== undefined) {
+    console.error(`Warning: Ignoring invalid ${label}; expected an array of strings`);
+  }
+}
+
+function stringArray(value: unknown, label = "configuration array"): string[] | undefined {
+  if (!Array.isArray(value)) {
+    warnInvalidArray(label, value);
+    return undefined;
+  }
+
+  const strings = value.filter((item): item is string => typeof item === "string");
+  if (strings.length !== value.length) {
+    console.error(`Warning: Ignoring non-string entries in ${label}`);
+  }
+  return strings;
+}
+
+function configuredSection(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? value : {};
+}
+
 function mergeObjects(base: SandboxConfig, overrides: SandboxConfigFile): SandboxConfig {
+  const network = configuredSection(overrides.network);
+  const filesystem = configuredSection(overrides.filesystem);
+
   return {
     ...base,
     ...overrides,
-    network: overrides.network
-      ? ({ ...base.network, ...overrides.network } as NetworkConfig)
-      : base.network,
-    filesystem: overrides.filesystem
-      ? ({ ...base.filesystem, ...overrides.filesystem } as FilesystemConfig)
-      : base.filesystem,
+    network: { ...base.network, ...network } as NetworkConfig,
+    filesystem: { ...base.filesystem, ...filesystem } as FilesystemConfig,
   };
 }
 
-function stringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) return undefined;
-  return value;
-}
-
 function mergeConfiguredArray(
-  fallback: string[] | undefined,
+  defaultsValue: unknown,
   globalValue: unknown,
   projectValue: unknown,
+  label: string,
 ): string[] | undefined {
-  const globalEntries = stringArray(globalValue);
-  const projectEntries = stringArray(projectValue);
-  if (globalEntries === undefined && projectEntries === undefined) return fallback;
-  return [...new Set([...(globalEntries ?? []), ...(projectEntries ?? [])])];
+  const values = [
+    stringArray(defaultsValue, `${label} defaults`),
+    stringArray(globalValue, `${label} global configuration`),
+    stringArray(projectValue, `${label} project configuration`),
+  ];
+  if (values.every((entries) => entries === undefined)) return undefined;
+  return [...new Set(values.flatMap((entries) => entries ?? []))];
+}
+
+function mergeIgnoreViolations(
+  defaultsValue: unknown,
+  globalValue: unknown,
+  projectValue: unknown,
+): Record<string, string[]> | undefined {
+  const result: Record<string, string[]> = {};
+  let foundObject = false;
+
+  for (const [scope, value] of [
+    ["defaults", defaultsValue],
+    ["global configuration", globalValue],
+    ["project configuration", projectValue],
+  ] as const) {
+    if (value === undefined) continue;
+    if (!isRecord(value)) {
+      console.error(`Warning: Ignoring invalid ignoreViolations in ${scope}; expected an object`);
+      continue;
+    }
+    foundObject = true;
+    for (const [key, entries] of Object.entries(value)) {
+      const strings = stringArray(entries, `ignoreViolations[${key}] in ${scope}`);
+      if (strings === undefined) continue;
+      result[key] = [...new Set([...(result[key] ?? []), ...strings])];
+    }
+  }
+
+  return foundObject ? result : undefined;
 }
 
 export function mergeConfigLayers(
@@ -89,58 +143,77 @@ export function mergeConfigLayers(
   projectConfig: SandboxConfigFile,
 ): SandboxConfig {
   const merged = mergeObjects(mergeObjects(defaults, globalConfig), projectConfig);
+  const defaultsNetwork = configuredSection(defaults.network);
+  const globalNetwork = configuredSection(globalConfig.network);
+  const projectNetwork = configuredSection(projectConfig.network);
+  const defaultsFilesystem = configuredSection(defaults.filesystem);
+  const globalFilesystem = configuredSection(globalConfig.filesystem);
+  const projectFilesystem = configuredSection(projectConfig.filesystem);
 
   return {
     ...merged,
+    ignoreViolations: mergeIgnoreViolations(
+      defaults.ignoreViolations,
+      globalConfig.ignoreViolations,
+      projectConfig.ignoreViolations,
+    ),
     network: {
       ...merged.network,
       allowedDomains:
         mergeConfiguredArray(
-          defaults.network?.allowedDomains,
-          globalConfig.network?.allowedDomains,
-          projectConfig.network?.allowedDomains,
+          defaultsNetwork.allowedDomains,
+          globalNetwork.allowedDomains,
+          projectNetwork.allowedDomains,
+          "network.allowedDomains",
         ) ?? [],
       deniedDomains:
         mergeConfiguredArray(
-          defaults.network?.deniedDomains,
-          globalConfig.network?.deniedDomains,
-          projectConfig.network?.deniedDomains,
+          defaultsNetwork.deniedDomains,
+          globalNetwork.deniedDomains,
+          projectNetwork.deniedDomains,
+          "network.deniedDomains",
         ) ?? [],
       allowUnixSockets: mergeConfiguredArray(
-        defaults.network?.allowUnixSockets,
-        globalConfig.network?.allowUnixSockets,
-        projectConfig.network?.allowUnixSockets,
+        defaultsNetwork.allowUnixSockets,
+        globalNetwork.allowUnixSockets,
+        projectNetwork.allowUnixSockets,
+        "network.allowUnixSockets",
       ),
       allowMachLookup: mergeConfiguredArray(
-        defaults.network?.allowMachLookup,
-        globalConfig.network?.allowMachLookup,
-        projectConfig.network?.allowMachLookup,
+        defaultsNetwork.allowMachLookup,
+        globalNetwork.allowMachLookup,
+        projectNetwork.allowMachLookup,
+        "network.allowMachLookup",
       ),
     },
     filesystem: {
       ...merged.filesystem,
       denyRead:
         mergeConfiguredArray(
-          defaults.filesystem?.denyRead,
-          globalConfig.filesystem?.denyRead,
-          projectConfig.filesystem?.denyRead,
+          defaultsFilesystem.denyRead,
+          globalFilesystem.denyRead,
+          projectFilesystem.denyRead,
+          "filesystem.denyRead",
         ) ?? [],
       allowRead: mergeConfiguredArray(
-        defaults.filesystem?.allowRead,
-        globalConfig.filesystem?.allowRead,
-        projectConfig.filesystem?.allowRead,
+        defaultsFilesystem.allowRead,
+        globalFilesystem.allowRead,
+        projectFilesystem.allowRead,
+        "filesystem.allowRead",
       ),
       allowWrite:
         mergeConfiguredArray(
-          defaults.filesystem?.allowWrite,
-          globalConfig.filesystem?.allowWrite,
-          projectConfig.filesystem?.allowWrite,
+          defaultsFilesystem.allowWrite,
+          globalFilesystem.allowWrite,
+          projectFilesystem.allowWrite,
+          "filesystem.allowWrite",
         ) ?? [],
       denyWrite:
         mergeConfiguredArray(
-          defaults.filesystem?.denyWrite,
-          globalConfig.filesystem?.denyWrite,
-          projectConfig.filesystem?.denyWrite,
+          defaultsFilesystem.denyWrite,
+          globalFilesystem.denyWrite,
+          projectFilesystem.denyWrite,
+          "filesystem.denyWrite",
         ) ?? [],
     },
   };

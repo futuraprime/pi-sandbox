@@ -16,7 +16,9 @@ import {
 } from "./config.ts";
 import {
   canonicalizePath,
+  decideDomainPolicy,
   domainIsAllowed,
+  decidePathPolicy,
   extractDomainsFromCommand,
   matchesPattern,
   resolveWritePermission,
@@ -64,7 +66,7 @@ export default function (pi: ExtensionAPI) {
   async function refreshSandbox(cwd: string): Promise<void> {
     if (!sandboxInitialized) return;
     try {
-      await reinitializeSandbox(loadConfig(cwd), allowances);
+      await reinitializeSandbox(loadConfig(cwd), allowances, cwd);
     } catch (error) {
       console.error(`Warning: Failed to reinitialize sandbox: ${error}`);
     }
@@ -116,7 +118,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     try {
-      await initializeSandbox(config, allowances);
+      await initializeSandbox(config, allowances, ctx.cwd);
       if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
         process.env.NODE_USE_ENV_PROXY ??= "1";
       }
@@ -213,6 +215,7 @@ export default function (pi: ExtensionAPI) {
             path,
             allowWrite: effectiveWritePaths(ctx.cwd),
             denyWrite: config.filesystem?.denyWrite ?? [],
+            cwd: ctx.cwd,
             prompt: (path) =>
               promptWriteBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds),
             saveWritePermission: (choice, value) => applyChoice(choice, "write", value, ctx.cwd),
@@ -248,7 +251,22 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig(ctx.cwd);
     if (config.sandboxUserShell === false) return;
     for (const domain of extractDomainsFromCommand(event.command)) {
-      if (!domainIsAllowed(domain, effectiveDomains(ctx.cwd))) {
+      const domainPolicy = decideDomainPolicy(
+        domain,
+        effectiveDomains(ctx.cwd),
+        config.network?.deniedDomains ?? [],
+      );
+      if (domainPolicy === "deny") {
+        return {
+          result: {
+            output: `Blocked: "${domain}" is denied by deniedDomains.`,
+            exitCode: 1,
+            cancelled: false,
+            truncated: false,
+          },
+        };
+      }
+      if (domainPolicy === "prompt") {
         const choice = await promptDomainBlock(
           pi,
           ctx,
@@ -284,7 +302,18 @@ export default function (pi: ExtensionAPI) {
 
     if (sandboxInitialized && isToolCallEventType("bash", event)) {
       for (const domain of extractDomainsFromCommand(event.input.command)) {
-        if (!domainIsAllowed(domain, effectiveDomains(ctx.cwd))) {
+        const domainPolicy = decideDomainPolicy(
+          domain,
+          effectiveDomains(ctx.cwd),
+          config.network?.deniedDomains ?? [],
+        );
+        if (domainPolicy === "deny") {
+          return {
+            block: true,
+            reason: `Network access to "${domain}" is denied by deniedDomains.`,
+          };
+        }
+        if (domainPolicy === "prompt") {
           const choice = await promptDomainBlock(
             pi,
             ctx,
@@ -303,8 +332,20 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (isToolCallEventType("read", event)) {
-      const path = canonicalizePath(event.input.path);
-      if (!matchesPattern(path, effectiveReadPaths(ctx.cwd))) {
+      const path = canonicalizePath(event.input.path, ctx.cwd);
+      const readPolicy = decidePathPolicy(
+        event.input.path,
+        effectiveReadPaths(ctx.cwd),
+        config.filesystem?.denyRead ?? [],
+        ctx.cwd,
+      );
+      if (readPolicy === "deny") {
+        return {
+          block: true,
+          reason: `Sandbox: read access denied for "${path}" (in denyRead)`,
+        };
+      }
+      if (readPolicy === "prompt") {
         const choice = await promptReadBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds);
         if (choice.action === "abort") {
           return { block: true, reason: `Sandbox: read access denied for "${path}"` };
@@ -315,11 +356,12 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
-      const path = canonicalizePath((event.input as { path: string }).path);
+      const path = canonicalizePath((event.input as { path: string }).path, ctx.cwd);
       const writePermission = await resolveWritePermission({
         path,
         allowWrite: effectiveWritePaths(ctx.cwd),
         denyWrite: config.filesystem?.denyWrite ?? [],
+        cwd: ctx.cwd,
         prompt: (path) => promptWriteBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds),
         saveWritePermission: (choice, value) => applyChoice(choice, "write", value, ctx.cwd),
       });

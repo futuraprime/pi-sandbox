@@ -53,17 +53,28 @@ test("mergeConfigLayers combines configured arrays and deduplicates entries", ()
   );
 
   assert.deepEqual(merged.network?.allowedDomains, [
+    ...DEFAULT_CONFIG.network!.allowedDomains!,
     "global.example.com",
     "shared.example.com",
     "project.example.com",
   ]);
   assert.deepEqual(merged.network?.deniedDomains, [
+    ...DEFAULT_CONFIG.network!.deniedDomains!,
     "blocked.example.com",
     "project-blocked.example.com",
   ]);
   assert.deepEqual(merged.network?.allowUnixSockets, ["/global.sock", "/project.sock"]);
-  assert.deepEqual(merged.filesystem?.allowRead, ["/global", "/shared", "/project"]);
-  assert.deepEqual(merged.filesystem?.denyWrite, ["global.key", "project.key"]);
+  assert.deepEqual(merged.filesystem?.allowRead, [
+    ...DEFAULT_CONFIG.filesystem!.allowRead!,
+    "/global",
+    "/shared",
+    "/project",
+  ]);
+  assert.deepEqual(merged.filesystem?.denyWrite, [
+    ...DEFAULT_CONFIG.filesystem!.denyWrite!,
+    "global.key",
+    "project.key",
+  ]);
 });
 
 test("mergeConfigLayers ignores malformed permission arrays", () => {
@@ -76,7 +87,7 @@ test("mergeConfigLayers ignores malformed permission arrays", () => {
   assert.deepEqual(merged.filesystem?.denyWrite, DEFAULT_CONFIG.filesystem?.denyWrite);
 });
 
-test("characterizes upstream replacement semantics for configured arrays", () => {
+test("characterizes cumulative defaults, global, and project array semantics", () => {
   const defaults: SandboxConfig = {
     ...DEFAULT_CONFIG,
     network: { ...DEFAULT_CONFIG.network!, allowedDomains: ["default.example.com"] },
@@ -94,13 +105,19 @@ test("characterizes upstream replacement semantics for configured arrays", () =>
     },
   );
 
-  // This records the upstream baseline. C-02/C-03 require downstream's
-  // cumulative defaults → global → project result in a later slice.
-  assert.deepEqual(merged.network?.allowedDomains, ["global.example.com", "project.example.com"]);
-  assert.deepEqual(merged.filesystem?.allowWrite, ["global-write", "project-write"]);
+  assert.deepEqual(merged.network?.allowedDomains, [
+    "default.example.com",
+    "global.example.com",
+    "project.example.com",
+  ]);
+  assert.deepEqual(merged.filesystem?.allowWrite, [
+    "default-write",
+    "global-write",
+    "project-write",
+  ]);
 });
 
-test("mergeConfigLayers uses defaults only for arrays not configured by either file", () => {
+test("mergeConfigLayers applies local scalar precedence and cumulative empty arrays", () => {
   const merged = mergeConfigLayers(
     DEFAULT_CONFIG,
     {
@@ -121,14 +138,106 @@ test("mergeConfigLayers uses defaults only for arrays not configured by either f
   assert.equal(merged.sandboxUserShell, true);
   assert.equal(merged.permissionPromptTimeoutSeconds, 0);
   assert.equal(merged.allowBrowserProcess, true);
-  assert.deepEqual(merged.filesystem?.allowWrite, []);
+  assert.deepEqual(merged.filesystem?.allowWrite, DEFAULT_CONFIG.filesystem?.allowWrite);
   assert.deepEqual(merged.filesystem?.allowRead, DEFAULT_CONFIG.filesystem?.allowRead);
   assert.deepEqual(merged.network?.allowedDomains, DEFAULT_CONFIG.network?.allowedDomains);
 });
 
-test.todo("C-02/C-03: configured arrays accumulate defaults, global, and project values");
-test.todo("C-04: explicit empty arrays do not clear defaults or inherited restrictions");
-test.todo("C-03: ignoreViolations arrays compose and deduplicate per key");
+test("mergeConfigLayers composes every supported array and ignoreViolations key", () => {
+  const defaults: SandboxConfig = {
+    ...DEFAULT_CONFIG,
+    network: {
+      ...DEFAULT_CONFIG.network!,
+      allowedDomains: ["default-domain"],
+      deniedDomains: ["default-deny"],
+      allowUnixSockets: ["default.sock"],
+      allowMachLookup: ["default.service"],
+    },
+    filesystem: {
+      ...DEFAULT_CONFIG.filesystem!,
+      allowRead: ["default-read"],
+      denyRead: ["default-deny-read"],
+      allowWrite: ["default-write"],
+      denyWrite: ["default-deny-write"],
+    },
+    ignoreViolations: { "read /default": ["default-path"], shared: ["default-shared"] },
+  };
+  const merged = mergeConfigLayers(
+    defaults,
+    {
+      network: {
+        allowedDomains: ["global-domain", "shared"],
+        deniedDomains: ["global-deny"],
+        allowUnixSockets: ["global.sock"],
+        allowMachLookup: ["global.service"],
+      },
+      filesystem: {
+        allowRead: ["global-read"],
+        denyRead: ["global-deny-read"],
+        allowWrite: ["global-write"],
+        denyWrite: ["global-deny-write"],
+      },
+      ignoreViolations: { "read /default": ["global-path"], shared: ["global-shared"] },
+    },
+    {
+      network: {
+        allowedDomains: ["shared", "project-domain"],
+        deniedDomains: ["project-deny"],
+        allowUnixSockets: ["global.sock", "project.sock"],
+        allowMachLookup: ["project.service"],
+      },
+      filesystem: {
+        allowRead: ["project-read"],
+        denyRead: ["project-deny-read"],
+        allowWrite: ["project-write"],
+        denyWrite: ["project-deny-write"],
+      },
+      ignoreViolations: {
+        "read /default": ["global-path", "project-path"],
+        project: ["project"],
+      },
+    },
+  );
+
+  assert.deepEqual(merged.network?.allowedDomains, [
+    "default-domain",
+    "global-domain",
+    "shared",
+    "project-domain",
+  ]);
+  assert.deepEqual(merged.network?.deniedDomains, ["default-deny", "global-deny", "project-deny"]);
+  assert.deepEqual(merged.network?.allowUnixSockets, [
+    "default.sock",
+    "global.sock",
+    "project.sock",
+  ]);
+  assert.deepEqual(merged.network?.allowMachLookup, [
+    "default.service",
+    "global.service",
+    "project.service",
+  ]);
+  assert.deepEqual(merged.filesystem?.allowRead, ["default-read", "global-read", "project-read"]);
+  assert.deepEqual(merged.filesystem?.denyRead, [
+    "default-deny-read",
+    "global-deny-read",
+    "project-deny-read",
+  ]);
+  assert.deepEqual(merged.filesystem?.allowWrite, [
+    "default-write",
+    "global-write",
+    "project-write",
+  ]);
+  assert.deepEqual(merged.filesystem?.denyWrite, [
+    "default-deny-write",
+    "global-deny-write",
+    "project-deny-write",
+  ]);
+  assert.deepEqual(merged.ignoreViolations, {
+    "read /default": ["default-path", "global-path", "project-path"],
+    shared: ["default-shared", "global-shared"],
+    project: ["project"],
+  });
+});
 
 test("characterizes malformed config values without throwing or iterating strings", () => {
   const merged = mergeConfigLayers(
@@ -143,7 +252,10 @@ test("characterizes malformed config values without throwing or iterating string
   );
 
   assert.deepEqual(merged.network?.allowedDomains, DEFAULT_CONFIG.network?.allowedDomains);
-  assert.deepEqual(merged.filesystem?.denyWrite, DEFAULT_CONFIG.filesystem?.denyWrite);
+  assert.deepEqual(merged.filesystem?.denyWrite, [
+    ...DEFAULT_CONFIG.filesystem!.denyWrite!,
+    "valid.key",
+  ]);
   assert.deepEqual(merged.filesystem?.allowRead, DEFAULT_CONFIG.filesystem?.allowRead);
 });
 

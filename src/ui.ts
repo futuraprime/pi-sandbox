@@ -392,7 +392,7 @@ export function formatSandboxConfiguration(
     "",
     "Note: ALL reads are prompted unless the path is in allowRead or allowWrite.",
     "Note: allowWrite also grants read access to the same path.",
-    "Note: denyRead is not a hard-block — granting a prompt adds to allowRead, overriding denyRead.",
-    "Note: denyWrite takes PRECEDENCE over allowWrite and is never prompted.",
+    "Note: denyRead is a hard-block unless a more-specific allowRead rule matches.",
+    "Note: denyWrite is a hard-block unless a more-specific allowWrite rule matches.",
   ].join("\n");
 }

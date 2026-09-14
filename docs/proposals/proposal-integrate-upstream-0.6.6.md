@@ -1,6 +1,6 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1 and 2 complete
+- **Status:** In progress — slices 1, 2, and 3 complete
 - **Date:** 2026-09-03
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
@@ -252,14 +252,14 @@ Plan the migration as nine expected `/execute`-sized slices, plus one conditiona
 
 **Completed:** commit `51d1bab` retains the upstream five-module baseline, adds runnable characterisation coverage and 12 explicit TODO gates, and records tests blocked on later seams. Verification passed with 37 passing tests, 12 TODOs, and no failures using `node --import tsx --test test/**/*.test.ts`; `pnpm verify` is not defined, and the equivalent `pnpm test` command could not run inside the review sandbox because the `tsx` CLI could not create its IPC socket. TypeScript checking, linting, and formatting checks passed.
 
-### Slice 3: Configuration composition and policy precedence
+### Slice 3: Configuration composition and policy precedence (complete)
 
-- Implement cumulative defaults, global, and project configuration composition with validation and deduplication.
-- Restore specificity-aware path and domain precedence across direct preflight, Bash diagnostics, network checks, and runtime configuration.
-- Preserve project-relative rules while using canonical comparison for matching and duplicate detection.
-- Add contract tests for the effective-policy and configuration seams.
+- Implemented cumulative defaults, global, and project configuration composition with validation and first-occurrence deduplication.
+- Restored shared specificity-aware path and domain precedence for direct preflight, network checks, and runtime policy callbacks.
+- Preserved project-relative values for persistence while resolving paths transiently for matching and specificity.
+- Added executable configuration and policy contract tests for composition, malformed input, specificity, relative paths, domain precedence, and command extraction.
 
-**Exit condition:** focused configuration and policy suites pass for composition, malformed input, specificity, relative paths, and persistence representation.
+**Exit condition:** focused configuration and policy suites pass for composition, malformed input, specificity, relative paths, and domain extraction. Canonical persistence deduplication (C-07), `/sandbox` persistence/protection (D-01/D-04), full Bash preflight (R-02), and the deferred C-13 runtime-meaning decision remain later-slice work.
 
 ### Slice 4: `/sandbox`, protected persistence, and configuration protection
 

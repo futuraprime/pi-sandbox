@@ -8,6 +8,8 @@ import assert from "node:assert/strict";
 import {
   allowsAllDomains,
   canonicalizePath,
+  decideDomainPolicy,
+  decidePathPolicy,
   decideWritePolicy,
   domainIsAllowed,
   extractDomainsFromCommand,
@@ -29,16 +31,32 @@ test("matches exact, wildcard, and all-domain policies", () => {
   assert.equal(allowsAllDomains(["*"]), true);
 });
 
-test("characterizes current URL-only command domain extraction", () => {
+test("extracts HTTP(S), SSH URL, and SCP-like Git domains without output false positives", () => {
   assert.deepEqual(
     extractDomainsFromCommand(
-      "ssh://git.example.com/repo git@git.example.com:team/repo.git; echo https://api.example.com",
+      [
+        "curl https://api.example.com/a http://api.example.com/b",
+        "git clone ssh://git@git.example.com/team/repo.git",
+        "git fetch git@git.example.com:team/repo.git",
+        "scp local.txt user@git.example.com:uploads/file.txt",
+        'echo "https://ignored.example.com"',
+        "printf unrelated.example.com",
+      ].join("; "),
     ),
-    ["api.example.com"],
+    ["api.example.com", "git.example.com"],
   );
 });
 
-test.todo("C-10/C-11: domain deny precedence and SSH/SCP command extraction share the policy seam");
+test("uses specificity-aware precedence for domains, including wildcard allows", () => {
+  assert.equal(decideDomainPolicy("api.example.com", ["*"], ["api.example.com"]), "deny");
+  assert.equal(
+    decideDomainPolicy("api.example.com", ["api.example.com"], ["*.example.com"]),
+    "allow",
+  );
+  assert.equal(decideDomainPolicy("api.example.com", ["*.example.com"], ["*.example.com"]), "deny");
+  assert.equal(decideDomainPolicy("other.example.com", ["*.example.com"], []), "allow");
+  assert.equal(decideDomainPolicy("unmatched.test", [], []), "prompt");
+});
 
 test("decides write policy from deny and allow lists", () => {
   assert.equal(decideWritePolicy("/tmp/file", ["/tmp"], ["/tmp/file"]), "deny");
@@ -47,20 +65,52 @@ test("decides write policy from deny and allow lists", () => {
   assert.equal(decideWritePolicy("/tmp/file", [], []), "prompt");
 });
 
-test("characterizes upstream deny-first precedence for a more-specific allow", () => {
-  const target = "/tmp/project/packages/widget/src/index.ts";
+test("uses canonical relative paths and specificity-aware filesystem precedence", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-specificity-"));
+  const target = join(root, "packages", "widget", "src", "index.ts");
+  const equalDepthTarget = join(root, "longsegment", "file.txt");
 
-  // The shared downstream policy (C-08/C-09) is expected to allow a
-  // strictly more-specific allow. This records the upstream result until
-  // that policy is integrated; it is not a parity assertion.
   assert.equal(
-    decideWritePolicy(target, ["/tmp/project/packages/widget"], ["/tmp/project"]),
+    decidePathPolicy("packages/widget/src/index.ts", ["packages/widget"], [root], root),
+    "allow",
+  );
+  assert.equal(decideWritePolicy(target, [join(root, "packages", "widget")], [root]), "allow");
+  assert.equal(
+    decideWritePolicy(
+      equalDepthTarget,
+      [join(root, "longsegment", "*")],
+      [join(root, "*", "file.txt")],
+    ),
     "deny",
   );
+  assert.equal(decideWritePolicy(target, [root], [root]), "deny");
+  assert.equal(decidePathPolicy(target, [], [root]), "deny");
+  assert.equal(decidePathPolicy(join(root, "outside"), [], []), "prompt");
 });
 
-test.todo("C-08/C-09: a strictly more-specific allow overrides a broader deny");
-test.todo("C-08/C-09/P-06: equal-specificity deny wins and hard denies never prompt");
+test("hard filesystem denies do not prompt while more-specific allows can override", async () => {
+  const calls: string[] = [];
+  const prompt = async () => {
+    calls.push("prompt");
+    return { action: "session" as const, value: "/tmp" };
+  };
+
+  assert.equal(decideWritePolicy("/tmp/project/file", ["/tmp/project"], ["/tmp"]), "allow");
+  assert.equal(decideWritePolicy("/tmp/project/file", ["/tmp"], ["/tmp"]), "deny");
+  assert.deepEqual(
+    await resolveWritePermission({
+      path: "/tmp/secret",
+      allowWrite: [],
+      denyWrite: ["/tmp"],
+      prompt,
+      saveWritePermission: async () => {
+        calls.push("apply");
+      },
+    }),
+    { action: "deny" },
+  );
+  assert.deepEqual(calls, []);
+});
 
 test("resolves write permission without prompting for denied or allowed paths", async () => {
   const calls: string[] = [];

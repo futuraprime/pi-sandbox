@@ -10,7 +10,7 @@ import {
 import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-agent";
 
 import { type SandboxConfig } from "./config.ts";
-import { canonicalizePath, domainIsAllowed } from "./policy.ts";
+import { canonicalizePathPattern, decideDomainPolicy } from "./policy.ts";
 
 export interface SessionAllowances {
   domains: string[];
@@ -28,11 +28,11 @@ function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
 
-const canonicalizeFilesystemPattern = (path: string) =>
-  path.includes("*") ? path : canonicalizePath(path);
+const canonicalizeFilesystemPattern = (path: string, cwd: string) =>
+  canonicalizePathPattern(path, cwd);
 
-const canonicalizeFilesystemPatterns = (paths: string[]) =>
-  unique(paths.map(canonicalizeFilesystemPattern));
+const canonicalizeFilesystemPatterns = (paths: string[], cwd = process.cwd()) =>
+  unique(paths.map((path) => canonicalizeFilesystemPattern(path, cwd)));
 
 function sandboxRuntimeReadPaths(platform: NodeJS.Platform): string[] {
   if (platform !== "linux") return [];
@@ -63,32 +63,38 @@ export function resolveAllowances(
   };
 }
 
-export function createNetworkAskCallback(allowedDomains: string[]): SandboxAskCallback {
-  return async ({ host }) => domainIsAllowed(host, allowedDomains);
+export function createNetworkAskCallback(
+  allowedDomains: string[],
+  deniedDomains: string[] = [],
+): SandboxAskCallback {
+  return async ({ host }) => decideDomainPolicy(host, allowedDomains, deniedDomains) === "allow";
 }
 
 export function buildRuntimeConfig(
   config: SandboxConfig,
   allowances?: SessionAllowances,
   platform: NodeJS.Platform = process.platform,
+  cwd = process.cwd(),
 ): SandboxRuntimeConfig {
   const effective = resolveAllowances(config, allowances);
-
   return {
     network: {
       ...config.network,
-      allowedDomains: effective.domains,
-      deniedDomains: config.network?.deniedDomains ?? [],
+      // Runtime 0.0.70 evaluates deny rules before allow rules. Route every
+      // request through the shared callback so specificity is applied once.
+      allowedDomains: [],
+      deniedDomains: [],
+      strictAllowlist: false,
     },
     filesystem: {
       disabled: config.filesystem?.disabled,
-      denyRead: canonicalizeFilesystemPatterns(config.filesystem?.denyRead ?? []),
-      allowRead: canonicalizeFilesystemPatterns([
-        ...effective.readPaths,
-        ...sandboxRuntimeReadPaths(platform),
-      ]),
-      allowWrite: canonicalizeFilesystemPatterns(effective.writePaths),
-      denyWrite: canonicalizeFilesystemPatterns(config.filesystem?.denyWrite ?? []),
+      denyRead: canonicalizeFilesystemPatterns(config.filesystem?.denyRead ?? [], cwd),
+      allowRead: canonicalizeFilesystemPatterns(
+        [...effective.readPaths, ...sandboxRuntimeReadPaths(platform)],
+        cwd,
+      ),
+      allowWrite: canonicalizeFilesystemPatterns(effective.writePaths, cwd),
+      denyWrite: canonicalizeFilesystemPatterns(config.filesystem?.denyWrite ?? [], cwd),
     },
     ignoreViolations: config.ignoreViolations,
     enableWeakerNestedSandbox: config.enableWeakerNestedSandbox,
@@ -101,20 +107,23 @@ export function buildRuntimeConfig(
 export async function initializeSandbox(
   config: SandboxConfig,
   allowances?: SessionAllowances,
+  cwd = process.cwd(),
 ): Promise<void> {
-  const runtimeConfig = buildRuntimeConfig(config, allowances);
+  const runtimeConfig = buildRuntimeConfig(config, allowances, process.platform, cwd);
+  const effective = resolveAllowances(config, allowances);
   await SandboxManager.initialize(
     runtimeConfig,
-    createNetworkAskCallback(runtimeConfig.network?.allowedDomains ?? []),
+    createNetworkAskCallback(effective.domains, config.network?.deniedDomains ?? []),
   );
 }
 
 export async function reinitializeSandbox(
   config: SandboxConfig,
   allowances: SessionAllowances,
+  cwd = process.cwd(),
 ): Promise<void> {
   await SandboxManager.reset();
-  await initializeSandbox(config, allowances);
+  await initializeSandbox(config, allowances, cwd);
 }
 
 export function supportsNodeEnvProxy(version: string): boolean {

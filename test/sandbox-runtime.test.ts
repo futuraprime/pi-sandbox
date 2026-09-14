@@ -11,6 +11,7 @@ import { DEFAULT_CONFIG } from "../src/config.ts";
 import { canonicalizePath } from "../src/policy.ts";
 import {
   buildRuntimeConfig,
+  createNetworkAskCallback,
   createSandboxedBashOps,
   extractBlockedWritePath,
   resolveAllowances,
@@ -77,7 +78,9 @@ test("buildRuntimeConfig adds session allowances without mutating config", () =>
     readPaths: ["/read"],
     writePaths: ["/write"],
   });
-  assert.equal(runtime.network?.allowedDomains?.includes("example.com"), true);
+  assert.deepEqual(runtime.network?.allowedDomains, []);
+  assert.deepEqual(runtime.network?.deniedDomains, []);
+  assert.equal(runtime.network?.strictAllowlist, false);
   assert.equal(runtime.filesystem?.allowRead?.includes("/read"), true);
   assert.equal(runtime.filesystem?.allowRead?.includes("/write"), true);
   assert.equal(runtime.filesystem?.allowWrite?.includes("/write"), true);
@@ -99,7 +102,44 @@ test("buildRuntimeConfig canonicalizes non-glob filesystem paths", () => {
   assert.deepEqual(runtime.filesystem?.denyRead, [canonicalizePath("/tmp")]);
   assert.equal(runtime.filesystem?.allowRead?.includes(canonicalizePath("/tmp")), true);
   assert.deepEqual(runtime.filesystem?.allowWrite, [canonicalizePath("/tmp")]);
-  assert.deepEqual(runtime.filesystem?.denyWrite, ["*.key"]);
+  assert.deepEqual(runtime.filesystem?.denyWrite, [join(process.cwd(), "*.key")]);
+});
+
+test("buildRuntimeConfig resolves relative glob rules against the project cwd", (t) => {
+  const cwd = mkdtempSync(join(process.cwd(), ".pi-sandbox-runtime-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+
+  const runtime = buildRuntimeConfig(
+    {
+      ...DEFAULT_CONFIG,
+      filesystem: {
+        ...DEFAULT_CONFIG.filesystem!,
+        allowRead: ["packages/*"],
+        denyRead: ["private/*"],
+        allowWrite: ["output/*"],
+        denyWrite: ["output/*.key"],
+      },
+    },
+    undefined,
+    process.platform,
+    cwd,
+  );
+
+  assert.deepEqual(runtime.filesystem?.allowRead, [
+    join(cwd, "packages", "*"),
+    join(cwd, "output", "*"),
+  ]);
+  assert.deepEqual(runtime.filesystem?.denyRead, [join(cwd, "private", "*")]);
+  assert.deepEqual(runtime.filesystem?.allowWrite, [join(cwd, "output", "*")]);
+  assert.deepEqual(runtime.filesystem?.denyWrite, [join(cwd, "output", "*.key")]);
+});
+
+test("runtime network callback applies shared specificity without deny-first short-circuiting", async () => {
+  const callback = createNetworkAskCallback(["*", "api.example.com"], ["*.example.com"]);
+
+  assert.equal(await callback({ host: "api.example.com", port: 443 }), true);
+  assert.equal(await callback({ host: "other.example.com", port: 443 }), false);
+  assert.equal(await callback({ host: "unrelated.test", port: 443 }), true);
 });
 
 test("buildRuntimeConfig exposes the bundled seccomp helper on Linux", () => {
