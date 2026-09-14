@@ -29,12 +29,38 @@ test("matches exact, wildcard, and all-domain policies", () => {
   assert.equal(allowsAllDomains(["*"]), true);
 });
 
+test("characterizes current URL-only command domain extraction", () => {
+  assert.deepEqual(
+    extractDomainsFromCommand(
+      "ssh://git.example.com/repo git@git.example.com:team/repo.git; echo https://api.example.com",
+    ),
+    ["api.example.com"],
+  );
+});
+
+test.todo("C-10/C-11: domain deny precedence and SSH/SCP command extraction share the policy seam");
+
 test("decides write policy from deny and allow lists", () => {
   assert.equal(decideWritePolicy("/tmp/file", ["/tmp"], ["/tmp/file"]), "deny");
   assert.equal(decideWritePolicy("/tmp/file", ["/tmp"], []), "allow");
   assert.equal(decideWritePolicy("/tmp/file", ["/var"], []), "prompt");
   assert.equal(decideWritePolicy("/tmp/file", [], []), "prompt");
 });
+
+test("characterizes upstream deny-first precedence for a more-specific allow", () => {
+  const target = "/tmp/project/packages/widget/src/index.ts";
+
+  // The shared downstream policy (C-08/C-09) is expected to allow a
+  // strictly more-specific allow. This records the upstream result until
+  // that policy is integrated; it is not a parity assertion.
+  assert.equal(
+    decideWritePolicy(target, ["/tmp/project/packages/widget"], ["/tmp/project"]),
+    "deny",
+  );
+});
+
+test.todo("C-08/C-09: a strictly more-specific allow overrides a broader deny");
+test.todo("C-08/C-09/P-06: equal-specificity deny wins and hard denies never prompt");
 
 test("resolves write permission without prompting for denied or allowed paths", async () => {
   const calls: string[] = [];

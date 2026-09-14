@@ -112,7 +112,7 @@ test("buildRuntimeConfig exposes the bundled seccomp helper on Linux", () => {
   assert.equal(runtime.filesystem?.allowRead?.includes(seccompPath), true);
 });
 
-test("resolveAllowances makes configured and session write paths readable", () => {
+test("characterizes upstream runtime read expansion for write allowances", () => {
   const config = {
     ...DEFAULT_CONFIG,
     filesystem: {
@@ -127,8 +127,19 @@ test("resolveAllowances makes configured and session write paths readable", () =
     writePaths: ["/session-write"],
   });
 
+  // C-13 keeps the direct-tool and runtime meanings of allowWrite as an
+  // explicit decision. Preserve the upstream result until that comparison.
   assert.deepEqual(effective.readPaths, ["/configured-write", "/session-write"]);
   assert.deepEqual(effective.writePaths, ["/configured-write", "/session-write"]);
+});
+
+test.todo("C-13: decide whether runtime allowWrite also grants direct-tool read access");
+
+test("buildRuntimeConfig preserves allowPty at the runtime seam", () => {
+  for (const allowPty of [true, false, undefined]) {
+    const config = { ...DEFAULT_CONFIG, allowPty };
+    assert.equal(buildRuntimeConfig(config).allowPty, allowPty);
+  }
 });
 
 test("extractBlockedWritePath recognizes shell sandbox errors", () => {
@@ -138,6 +149,22 @@ test("extractBlockedWritePath recognizes shell sandbox errors", () => {
   );
   assert.equal(extractBlockedWritePath("permission denied"), null);
 });
+
+test("extractBlockedWritePath handles Bash preflight output variants", () => {
+  assert.equal(
+    extractBlockedWritePath("/bin/bash: line 2: /tmp/project/file.txt: Operation not permitted"),
+    "/tmp/project/file.txt",
+  );
+  assert.equal(
+    extractBlockedWritePath("sh: /private/secret: Operation not permitted"),
+    "/private/secret",
+  );
+  assert.equal(extractBlockedWritePath("bash: line 1: /tmp/file.txt: Permission denied"), null);
+});
+
+test.todo(
+  "R-02: Bash preflight classifies allow, prompt, hard-deny, retry, and output attribution",
+);
 
 test("supportsNodeEnvProxy observes Node release boundaries", () => {
   assert.equal(supportsNodeEnvProxy("22.20.0"), false);

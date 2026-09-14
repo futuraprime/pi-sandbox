@@ -93,3 +93,10 @@ test(
     assert.deepEqual(result, { action: "abort", value: "example.test" });
   },
 );
+
+test.todo(
+  "P-01/P-02/P-03/D-03: edited prompt rules preserve target matching and scoped persistence",
+);
+test.todo(
+  "P-04/P-05: attention, confirmation, abort, and session-only grant flows remain explicit",
+);
