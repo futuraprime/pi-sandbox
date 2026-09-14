@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { canonicalizePath } from "../src/policy.ts";
+import { getProtectedSandboxConfigPaths } from "../src/sandbox-command.ts";
 import {
   buildRuntimeConfig,
   createNetworkAskCallback,
@@ -102,7 +103,10 @@ test("buildRuntimeConfig canonicalizes non-glob filesystem paths", () => {
   assert.deepEqual(runtime.filesystem?.denyRead, [canonicalizePath("/tmp")]);
   assert.equal(runtime.filesystem?.allowRead?.includes(canonicalizePath("/tmp")), true);
   assert.deepEqual(runtime.filesystem?.allowWrite, [canonicalizePath("/tmp")]);
-  assert.deepEqual(runtime.filesystem?.denyWrite, [join(process.cwd(), "*.key")]);
+  assert.deepEqual(runtime.filesystem?.denyWrite?.slice(0, 1), [join(process.cwd(), "*.key")]);
+  const protectedPaths = getProtectedSandboxConfigPaths(process.cwd());
+  assert.equal(runtime.filesystem?.denyWrite?.includes(protectedPaths.projectPath), true);
+  assert.equal(runtime.filesystem?.denyWrite?.includes(protectedPaths.globalPath), true);
 });
 
 test("buildRuntimeConfig resolves relative glob rules against the project cwd", (t) => {
@@ -131,7 +135,10 @@ test("buildRuntimeConfig resolves relative glob rules against the project cwd", 
   ]);
   assert.deepEqual(runtime.filesystem?.denyRead, [join(cwd, "private", "*")]);
   assert.deepEqual(runtime.filesystem?.allowWrite, [join(cwd, "output", "*")]);
-  assert.deepEqual(runtime.filesystem?.denyWrite, [join(cwd, "output", "*.key")]);
+  assert.deepEqual(runtime.filesystem?.denyWrite?.slice(0, 1), [join(cwd, "output", "*.key")]);
+  const protectedPaths = getProtectedSandboxConfigPaths(cwd);
+  assert.equal(runtime.filesystem?.denyWrite?.includes(protectedPaths.projectPath), true);
+  assert.equal(runtime.filesystem?.denyWrite?.includes(protectedPaths.globalPath), true);
 });
 
 test("runtime network callback applies shared specificity without deny-first short-circuiting", async () => {

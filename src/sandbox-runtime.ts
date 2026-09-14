@@ -11,6 +11,7 @@ import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-a
 
 import { type SandboxConfig } from "./config.ts";
 import { canonicalizePathPattern, decideDomainPolicy } from "./policy.ts";
+import { getProtectedSandboxConfigPaths } from "./sandbox-command.ts";
 
 export interface SessionAllowances {
   domains: string[];
@@ -77,6 +78,7 @@ export function buildRuntimeConfig(
   cwd = process.cwd(),
 ): SandboxRuntimeConfig {
   const effective = resolveAllowances(config, allowances);
+  const protectedConfigPaths = getProtectedSandboxConfigPaths(cwd);
   return {
     network: {
       ...config.network,
@@ -94,7 +96,14 @@ export function buildRuntimeConfig(
         cwd,
       ),
       allowWrite: canonicalizeFilesystemPatterns(effective.writePaths, cwd),
-      denyWrite: canonicalizeFilesystemPatterns(config.filesystem?.denyWrite ?? [], cwd),
+      denyWrite: canonicalizeFilesystemPatterns(
+        [
+          ...(config.filesystem?.denyWrite ?? []),
+          protectedConfigPaths.projectPath,
+          protectedConfigPaths.globalPath,
+        ],
+        cwd,
+      ),
     },
     ignoreViolations: config.ignoreViolations,
     enableWeakerNestedSandbox: config.enableWeakerNestedSandbox,

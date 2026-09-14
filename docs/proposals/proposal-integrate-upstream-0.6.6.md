@@ -1,6 +1,6 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1, 2, and 3 complete
+- **Status:** In progress — slices 1–4 complete
 - **Date:** 2026-09-03
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
@@ -269,6 +269,8 @@ Plan the migration as nine expected `/execute`-sized slices, plus one conditiona
 - Avoid retaining upstream and downstream configuration writers as parallel mutation paths.
 
 **Exit condition:** command, persistence, and protection tests pass through the upstream-shaped extension integration points.
+
+**Slice 4 verified:** the six-rule `/sandbox` command and its single persistence adapter are implemented in `src/sandbox-command.ts`. Project mutations preserve unrelated JSON and relative spellings, deduplicate canonical filesystem paths, and refresh an active runtime only after a real change. Canonical project/global config paths are protected at direct write/edit and Bash preflight seams before sandbox-disabled checks and are included in runtime `denyWrite`; `/sandbox-allow` is removed. Focused node:test command, protection, and extension reinitialisation contracts pass. Remaining Bash diagnostic/preflight and runtime-meaning TODOs stay assigned to later slices.
 
 ### Slice 5: Diagnostics, Git/worktree, and status modules
 

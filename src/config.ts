@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
@@ -219,7 +219,7 @@ export function mergeConfigLayers(
   };
 }
 
-function readJsonConfig(configPath: string, warn: boolean): SandboxConfigFile {
+export function readConfigFile(configPath: string, warn = true): SandboxConfigFile {
   if (!existsSync(configPath)) return {};
   try {
     const parsed: unknown = JSON.parse(readFileSync(configPath, "utf-8"));
@@ -242,48 +242,7 @@ export function getConfigPaths(cwd: string): { globalPath: string; projectPath: 
 
 export function loadConfig(cwd: string): SandboxConfig {
   const { globalPath, projectPath } = getConfigPaths(cwd);
-  const globalConfig = readJsonConfig(globalPath, true);
-  const projectConfig = readJsonConfig(projectPath, true);
+  const globalConfig = readConfigFile(globalPath, true);
+  const projectConfig = readConfigFile(projectPath, true);
   return mergeConfigLayers(DEFAULT_CONFIG, globalConfig, projectConfig);
-}
-
-function writeConfigFile(configPath: string, config: SandboxConfigFile): void {
-  mkdirSync(dirname(configPath), { recursive: true });
-  writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
-}
-
-export function addDomainToConfig(configPath: string, domain: string): void {
-  const config = readJsonConfig(configPath, false);
-  const existing = stringArray(config.network?.allowedDomains) ?? [];
-  if (existing.includes(domain)) return;
-
-  config.network = {
-    ...config.network,
-    allowedDomains: [...existing, domain],
-  };
-  writeConfigFile(configPath, config);
-}
-
-export function addReadPathToConfig(configPath: string, pathToAdd: string): void {
-  const config = readJsonConfig(configPath, false);
-  const existing = stringArray(config.filesystem?.allowRead) ?? [];
-  if (existing.includes(pathToAdd)) return;
-
-  config.filesystem = {
-    ...config.filesystem,
-    allowRead: [...existing, pathToAdd],
-  };
-  writeConfigFile(configPath, config);
-}
-
-export function addWritePathToConfig(configPath: string, pathToAdd: string): void {
-  const config = readJsonConfig(configPath, false);
-  const existing = stringArray(config.filesystem?.allowWrite) ?? [];
-  if (existing.includes(pathToAdd)) return;
-
-  config.filesystem = {
-    ...config.filesystem,
-    allowWrite: [...existing, pathToAdd],
-  };
-  writeConfigFile(configPath, config);
 }

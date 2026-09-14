@@ -6,9 +6,6 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  addDomainToConfig,
-  addReadPathToConfig,
-  addWritePathToConfig,
   DEFAULT_CONFIG,
   DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS,
   getConfigPaths,
@@ -16,6 +13,7 @@ import {
   mergeConfigLayers,
   type SandboxConfig,
 } from "../src/config.ts";
+import { updateSandboxConfigFile } from "../src/sandbox-command.ts";
 
 test("omitted settings use their defaults", () => {
   const merged = mergeConfigLayers(DEFAULT_CONFIG, {}, {});
@@ -305,9 +303,9 @@ test("permission writers only persist the property being changed", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-sandbox-config-"));
   const configPath = join(root, "sandbox.json");
 
-  addReadPathToConfig(configPath, "/read");
-  addWritePathToConfig(configPath, "/write");
-  addDomainToConfig(configPath, "example.com");
+  updateSandboxConfigFile(configPath, { key: "allowRead", value: "/read" });
+  updateSandboxConfigFile(configPath, { key: "allowWrite", value: "/write" });
+  updateSandboxConfigFile(configPath, { key: "allowedDomains", value: "example.com" });
 
   const written = JSON.parse(readFileSync(configPath, "utf8"));
   assert.deepEqual(written, {
@@ -330,7 +328,11 @@ test("ported persistence seam preserves unrelated config and project-relative va
       "utf8",
     );
 
-    addReadPathToConfig(configPath, "./docs");
+    updateSandboxConfigFile(
+      configPath,
+      { key: "allowRead", value: "./docs" },
+      join(root, "project"),
+    );
 
     assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
       enabled: false,
@@ -349,7 +351,11 @@ test("ported persistence seam updates only the selected config path", () => {
     mkdirSync(join(root, "global"), { recursive: true });
     writeFileSync(globalPath, '{"filesystem":{"allowWrite":["/existing"]}}\n', "utf8");
 
-    addWritePathToConfig(projectPath, "./tmp");
+    updateSandboxConfigFile(
+      projectPath,
+      { key: "allowWrite", value: "./tmp" },
+      join(root, "project"),
+    );
 
     assert.deepEqual(JSON.parse(readFileSync(projectPath, "utf8")), {
       filesystem: { allowWrite: ["./tmp"] },
@@ -359,8 +365,3 @@ test("ported persistence seam updates only the selected config path", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
-
-test.todo(
-  "C-07/D-02: equivalent canonical path spellings deduplicate without rewriting project values",
-);
-test.todo("D-01/D-04: the sanctioned persistence seam supports all six /sandbox rule types");

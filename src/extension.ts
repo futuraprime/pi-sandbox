@@ -1,3 +1,5 @@
+import { isAbsolute, relative } from "node:path";
+
 import { SandboxManager } from "@carderne/sandbox-runtime";
 import { type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -7,22 +9,24 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
 
-import {
-  addDomainToConfig,
-  addReadPathToConfig,
-  addWritePathToConfig,
-  getConfigPaths,
-  loadConfig,
-} from "./config.ts";
+import { getConfigPaths, loadConfig } from "./config.ts";
 import {
   canonicalizePath,
+  canonicalizePathPattern,
   decideDomainPolicy,
-  domainIsAllowed,
   decidePathPolicy,
   extractDomainsFromCommand,
-  matchesPattern,
   resolveWritePermission,
 } from "./policy.ts";
+import {
+  bashCommandMentionsSandboxConfig,
+  describeSandboxCommandResult,
+  formatSandboxCommandUsage,
+  getProtectedSandboxConfigPaths,
+  isSandboxConfigPath,
+  parseSandboxCommand,
+  updateSandboxConfigFile,
+} from "./sandbox-command.ts";
 import {
   createSandboxedBashOps,
   extractBlockedWritePath,
@@ -38,10 +42,17 @@ import {
   type PermissionPromptResult,
   promptDomainBlock,
   promptReadBlock,
-  showPermissionPrompt,
   promptWriteBlock,
   warnIfAllDomainsAllowed,
 } from "./ui.ts";
+
+function sandboxConfigMutationMessage(cwd: string): string {
+  const { projectPath, globalPath } = getProtectedSandboxConfigPaths(cwd);
+  return (
+    "Sandbox configuration files are protected. Use /sandbox to add rules; " +
+    `protected paths are:\n  ${projectPath}\n  ${globalPath}`
+  );
+}
 
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("no-sandbox", {
@@ -78,20 +89,48 @@ export default function (pi: ExtensionAPI) {
     value: string,
     cwd: string,
   ): Promise<void> {
-    const { globalPath, projectPath } = getConfigPaths(cwd);
-    const target = choice === "project" ? projectPath : globalPath;
+    const commandKey =
+      kind === "domain" ? "allowedDomains" : kind === "read" ? "allowRead" : "allowWrite";
+    const storedValue =
+      kind === "domain"
+        ? value
+        : choice === "project"
+          ? projectRuleValue(value, cwd)
+          : canonicalizePathPattern(value, cwd);
+    let changed = false;
 
     if (kind === "domain") {
-      if (!allowances.domains.includes(value)) allowances.domains.push(value);
-      if (choice !== "session") addDomainToConfig(target, value);
-    } else if (kind === "read") {
-      if (!allowances.readPaths.includes(value)) allowances.readPaths.push(value);
-      if (choice !== "session") addReadPathToConfig(target, value);
+      changed = addSessionAllowance(allowances.domains, value);
     } else {
-      if (!allowances.writePaths.includes(value)) allowances.writePaths.push(value);
-      if (choice !== "session") addWritePathToConfig(target, value);
+      changed = addSessionAllowance(
+        kind === "read" ? allowances.readPaths : allowances.writePaths,
+        canonicalizePathPattern(value, cwd),
+      );
     }
-    await refreshSandbox(cwd);
+
+    if (choice !== "session") {
+      const { globalPath, projectPath } = getConfigPaths(cwd);
+      const target = choice === "project" ? projectPath : globalPath;
+      const result = updateSandboxConfigFile(target, { key: commandKey, value: storedValue }, cwd);
+      changed ||= result.changed;
+    }
+
+    if (changed) await refreshSandbox(cwd);
+  }
+
+  function addSessionAllowance(values: string[], value: string): boolean {
+    if (values.includes(value)) return false;
+    values.push(value);
+    return true;
+  }
+
+  function projectRuleValue(value: string, cwd: string): string {
+    if (!isAbsolute(value) && !value.startsWith("~")) return value;
+    const canonical = canonicalizePathPattern(value, cwd);
+    const relativePath = relative(cwd, canonical);
+    if (relativePath === "") return ".";
+    if (relativePath.startsWith("..")) return canonical;
+    return relativePath.startsWith(".") ? relativePath : `./${relativePath}`;
   }
 
   function updateStatus(
@@ -246,6 +285,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("user_bash", async (event, ctx) => {
+    if (bashCommandMentionsSandboxConfig(event.command, ctx.cwd)) {
+      return {
+        result: {
+          output: sandboxConfigMutationMessage(ctx.cwd),
+          exitCode: 1,
+          cancelled: false,
+          truncated: false,
+        },
+      };
+    }
     if (!sandboxEnabled || !sandboxInitialized) return;
 
     const config = loadConfig(ctx.cwd);
@@ -295,6 +344,18 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    if (
+      (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) &&
+      isSandboxConfigPath((event.input as { path: string }).path, ctx.cwd)
+    ) {
+      return { block: true, reason: sandboxConfigMutationMessage(ctx.cwd) };
+    }
+    if (
+      isToolCallEventType("bash", event) &&
+      bashCommandMentionsSandboxConfig(event.input.command, ctx.cwd)
+    ) {
+      return { block: true, reason: sandboxConfigMutationMessage(ctx.cwd) };
+    }
     if (!sandboxEnabled) return;
     const config = loadConfig(ctx.cwd);
     if (!config.enabled) return;
@@ -427,51 +488,30 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("sandbox-allow", {
-    description: "Prompt to allow a domain or read/write access to a file path",
-    handler: async (args, ctx) => {
-      const [kind, ...targetParts] = args.trim().split(/\s+/);
-      const targetArg = targetParts.join(" ");
-
-      if ((kind !== "domain" && kind !== "read" && kind !== "write") || !targetArg) {
-        ctx.ui.notify("Usage: /sandbox-allow <domain|read|write> <domain-or-path>", "error");
-        return;
-      }
-
-      const target = kind === "domain" ? targetArg : canonicalizePath(targetArg);
-      const config = loadConfig(ctx.cwd);
-      const configKey =
-        kind === "domain" ? "allowedDomains" : kind === "read" ? "allowRead" : "allowWrite";
-      const choice = await showPermissionPrompt(
-        pi,
-        ctx,
-        `Add ${target} to ${configKey}?`,
-        target,
-        (value) => {
-          if (!value) return "Rule cannot be empty.";
-          const matches =
-            kind === "domain" ? domainIsAllowed(target, [value]) : matchesPattern(target, [value]);
-          return matches ? null : `Rule must match "${target}".`;
-        },
-        config.permissionPromptTimeoutSeconds,
-      );
-      if (choice.action === "abort") {
-        ctx.ui.notify("Allow cancelled", "info");
-        return;
-      }
-
-      await applyChoice(choice.action, kind, choice.value, ctx.cwd);
-      ctx.ui.notify(`Added ${choice.value} to ${configKey}`, "info");
-    },
-  });
-
   pi.registerCommand("sandbox", {
-    description: "Show sandbox configuration",
-    handler: async (_args, ctx) => {
-      if (!sandboxEnabled) {
-        ctx.ui.notify("Sandbox is disabled", "info");
+    description: "Show or update sandbox configuration",
+    handler: async (args, ctx) => {
+      let command;
+      try {
+        command = parseSandboxCommand(args, ctx.cwd);
+      } catch (error) {
+        ctx.ui.notify(
+          error instanceof Error ? error.message : formatSandboxCommandUsage(),
+          "error",
+        );
         return;
       }
+
+      if (command) {
+        const { projectPath } = getConfigPaths(ctx.cwd);
+        const result = updateSandboxConfigFile(projectPath, command, ctx.cwd);
+        if (result.changed && sandboxEnabled && sandboxInitialized) {
+          await refreshSandbox(ctx.cwd);
+        }
+        ctx.ui.notify(`${describeSandboxCommandResult(result)}\nUpdated: ${projectPath}`, "info");
+        return;
+      }
+
       ctx.ui.notify(
         formatSandboxConfiguration(loadConfig(ctx.cwd), getConfigPaths(ctx.cwd), allowances),
         "info",

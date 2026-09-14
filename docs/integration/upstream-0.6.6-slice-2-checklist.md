@@ -42,13 +42,10 @@ A downstream test is not copied into the normal suite when its import would requ
 
 Slice 3 replaced the configuration and policy TODO gates with executable contract coverage. `src/config.ts` now composes validated defaults, global, and project arrays cumulatively (including per-key `ignoreViolations`) while retaining local scalar precedence. `src/policy.ts` now shares canonical path and domain specificity decisions, including deny precedence, more-specific allow exceptions, hard denies, and HTTP(S)/SSH/SCP command extraction. Direct read/write and network preflight callers consume those decisions.
 
-## Current TODO gates
+## Slice 4 completion
 
-These node:test TODOs identify expected parity work without adding later-slice production behavior:
+Slice 4 replaced the C-07/D-02 and D-01/D-04 TODO gates with executable node:test contracts. The new `src/sandbox-command.ts` owns parsing, validation, canonical filesystem duplicate detection, project-relative persistence, and all six rule arrays. `src/extension.ts` now exposes only `/sandbox` (no `/sandbox-allow`), writes project scope, and refreshes an active runtime only after a changed command. Direct write/edit calls and Bash mentions of the project or `getAgentDir()` global config are blocked before sandbox state checks; both canonical paths are also in runtime `denyWrite`.
 
-- `test/config.test.ts`: C-07/D-02 canonical duplicate and scope representation; D-01/D-04 all six command rule types.
-- `test/policy.test.ts`: no slice-3 policy gates remain; persistence and command integration remain with C-07/D-02 and D-01/D-04.
-- `test/sandbox-runtime.test.ts`: C-13 direct-tool versus runtime `allowWrite` meaning; R-02 Bash preflight classification, retry, and attribution.
-- UI timeout already has runnable upstream coverage; its no-persistence writer/reinitialisation contract belongs to P-03/D-03 in slice 9.
+Focused Slice 4 coverage passes in `test/sandbox-command.test.ts`, `test/sandbox-protection.test.ts`, and `test/extension.test.ts`. Remaining TODOs are unrelated later-slice gates: C-13 direct-tool versus runtime `allowWrite` meaning and R-02 Bash preflight classification, retry, and attribution. UI timeout persistence remains P-03/D-03 work for slice 9.
 
-No TODO weakens an existing assertion, changes runtime/security behavior, or substitutes for the blocked-module checklist above. Slice 4 owns canonical persistence deduplication and `/sandbox` protected persistence; later slices own full Bash diagnostics/preflight and the deferred C-13 decision.
+No TODO weakens an existing assertion, changes runtime/security behavior, or substitutes for the blocked-module checklist above.
