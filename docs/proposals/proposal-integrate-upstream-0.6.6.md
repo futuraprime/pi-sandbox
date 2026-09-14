@@ -285,6 +285,7 @@ Plan the migration as nine expected `/execute`-sized slices, plus one conditiona
 
 - Retain upstream subprocess cleanup, Bash write prompting, and `allowPty` fixes.
 - Compare the pinned downstream runtime with sandbox-runtime 0.0.72 and record any changed defaults or missing patches.
+- Assess reset-then-initialise failure semantics: determine whether the previous runtime can be restored or the unavailable manager can be detected and kept fail-closed.
 - Test scoped Chromium behaviour without broad Unix-socket access.
 - Test macOS Git-over-SSH behaviour with unauthenticated SOCKS compatibility, domain filtering, and separate SSH-agent approval.
 
@@ -314,6 +315,7 @@ Run this slice only if sandbox-runtime 0.0.72 fails the parity checks in slice 6
 - Adapt editable and validated prompt rules to downstream scope and persistence semantics.
 - Add timeout behaviour that aborts without persistence and emit attention events for prompts.
 - Complete extension lifecycle wiring, stale-context handling, cleanup, status, and sandbox reinitialisation.
+- Handle reset-success/initialisation-failure explicitly: restore the previous runtime when possible, otherwise block Bash until recovery, report the unavailable runtime, and roll back new session-only allowances.
 - Keep optional `/sandbox-allow`, SSH proxy, `sandboxUserShell`, and toggle decisions outside this slice unless separately approved.
 
 **Exit condition:** prompt, UI, lifecycle, and extension-seam tests pass without weakening configuration protection or policy precedence.
@@ -366,7 +368,7 @@ Add or retain focused tests for:
 - edited prompt rules matching the blocked target;
 - prompt timeout aborting without persistence;
 - protected config files remaining inaccessible to direct tools and Bash mutation;
-- successful sandbox reinitialisation after an approved change;
+- successful sandbox reinitialisation after an approved change, plus fail-closed recovery when reset succeeds but replacement initialisation fails;
 - scoped macOS Chromium policy without broad Unix-socket access;
 - macOS Git-over-SSH through the unauthenticated SOCKS compatibility mode while retaining domain and SSH-agent controls;
 - environment-variable deny and mask modes on macOS;

@@ -74,12 +74,15 @@ export default function (pi: ExtensionAPI) {
   const effectiveReadPaths = (cwd: string) => effectiveAllowances(cwd).readPaths;
   const effectiveWritePaths = (cwd: string) => effectiveAllowances(cwd).writePaths;
 
-  async function refreshSandbox(cwd: string): Promise<void> {
-    if (!sandboxInitialized) return;
+  async function refreshSandbox(cwd: string): Promise<boolean> {
+    if (!sandboxInitialized) return true;
     try {
       await reinitializeSandbox(loadConfig(cwd), allowances, cwd);
+      return true;
     } catch (error) {
+      // Keep the sandbox state enabled so execution cannot fall back to local Bash.
       console.error(`Warning: Failed to reinitialize sandbox: ${error}`);
+      return false;
     }
   }
 
@@ -505,10 +508,17 @@ export default function (pi: ExtensionAPI) {
       if (command) {
         const { projectPath } = getConfigPaths(ctx.cwd);
         const result = updateSandboxConfigFile(projectPath, command, ctx.cwd);
-        if (result.changed && sandboxEnabled && sandboxInitialized) {
-          await refreshSandbox(ctx.cwd);
-        }
+        const runtimeRefreshed =
+          !result.changed || !sandboxEnabled || !sandboxInitialized
+            ? true
+            : await refreshSandbox(ctx.cwd);
         ctx.ui.notify(`${describeSandboxCommandResult(result)}\nUpdated: ${projectPath}`, "info");
+        if (!runtimeRefreshed) {
+          ctx.ui.notify(
+            "Warning: The project configuration was persisted, but the active sandbox runtime was not refreshed.",
+            "warning",
+          );
+        }
         return;
       }
 

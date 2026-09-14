@@ -1,7 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import test, { mock } from "node:test";
 
@@ -13,10 +12,13 @@ import extension from "../src/extension.ts";
 function makePi() {
   const commands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
   const handlers = new Map<string, (event: any, ctx: ExtensionContext) => Promise<any>>();
+  const tools = new Map<string, any>();
   const pi = {
     registerFlag: () => undefined,
     getFlag: () => false,
-    registerTool: () => undefined,
+    registerTool: (definition: { name: string }) => {
+      tools.set(definition.name, definition);
+    },
     registerShortcut: () => undefined,
     registerCommand: (
       name: string,
@@ -28,7 +30,11 @@ function makePi() {
       handlers.set(name, handler);
     },
   } as unknown as ExtensionAPI;
-  return { pi, commands, handlers };
+  return { pi, commands, handlers, tools };
+}
+
+function makeProjectTempDirectory(prefix: string): string {
+  return mkdtempSync(join(process.cwd(), `.pi-sandbox-${prefix}-`));
 }
 
 function makeContext(cwd: string, notices: string[]): ExtensionContext {
@@ -43,8 +49,8 @@ function makeContext(cwd: string, notices: string[]): ExtensionContext {
   } as unknown as ExtensionContext;
 }
 
-test("/sandbox supports project-only mutations and refreshes an active sandbox only after changes", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-extension-"));
+test("/sandbox exercises all six project-only rules and refreshes only after changes", async () => {
+  const root = makeProjectTempDirectory("extension");
   const agentDir = join(root, "global-agent");
   const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -67,24 +73,40 @@ test("/sandbox supports project-only mutations and refreshes an active sandbox o
     await handlers.get("session_start")?.({}, ctx);
     assert.equal(initialised.length, 1);
 
-    await commands.get("sandbox")?.("allowWrite ./generated", ctx);
-    assert.equal(resets.length, 1);
-    assert.equal(initialised.length, 2);
-    assert.match(notices.at(-1) ?? "", /Added: \.,?\/generated|Added: \.\/generated/);
+    const rules = [
+      "allowRead ./allowed-read",
+      "denyRead ./denied-read",
+      "allowWrite ./allowed-write",
+      "denyWrite *.secret",
+      "allowedDomains allowed.example",
+      "deniedDomains denied.example",
+    ];
+    for (const rule of rules) await commands.get("sandbox")?.(rule, ctx);
 
+    assert.equal(resets.length, rules.length);
+    assert.equal(initialised.length, rules.length + 1);
     const projectConfig = JSON.parse(readFileSync(join(root, ".pi", "sandbox.json"), "utf8"));
-    assert.deepEqual(projectConfig, { filesystem: { allowWrite: ["./generated"] } });
+    assert.deepEqual(projectConfig, {
+      filesystem: {
+        allowRead: ["./allowed-read"],
+        denyRead: ["./denied-read"],
+        allowWrite: ["./allowed-write"],
+        denyWrite: ["*.secret"],
+      },
+      network: { allowedDomains: ["allowed.example"], deniedDomains: ["denied.example"] },
+    });
+    assert.equal(existsSync(join(agentDir, "sandbox.json")), false);
     assert.equal(requireNotice(notices, "Updated: " + join(root, ".pi", "sandbox.json")), true);
 
     const resetCount = resets.length;
-    await commands.get("sandbox")?.("allowWrite ./generated", ctx);
+    await commands.get("sandbox")?.(`allowRead ${join(root, "allowed-read")}`, ctx);
     assert.equal(resets.length, resetCount);
     assert.match(notices.at(-1) ?? "", /^Already present:/);
 
     await commands.get("sandbox")?.("", ctx);
     assert.match(notices.at(-1) ?? "", /Sandbox Configuration/);
-    assert.equal(initialised.length, 2);
-    assert.equal(resets.length, 1);
+    assert.equal(initialised.length, rules.length + 1);
+    assert.equal(resets.length, rules.length);
   } finally {
     managerMock.mock.restore();
     resetMock.mock.restore();
@@ -94,27 +116,100 @@ test("/sandbox supports project-only mutations and refreshes an active sandbox o
   }
 });
 
-test("protected direct writes and Bash mentions are blocked before sandbox state checks", async () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-extension-protection-"));
+test("/sandbox warns when persistence succeeds but active runtime refresh fails", async () => {
+  const root = makeProjectTempDirectory("extension-refresh-failure");
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(root, "global-agent");
+  const initialised: string[] = [];
+  const resets: string[] = [];
+  const notices: string[] = [];
+  const managerMock = mock.method(SandboxManager, "initialize", async () => {
+    initialised.push("initialize");
+    if (initialised.length > 1) throw new Error("test refresh failure");
+  });
+  const resetMock = mock.method(SandboxManager, "reset", async () => {
+    resets.push("reset");
+  });
+  let wrapMock: ReturnType<typeof mock.method> | undefined;
+
+  try {
+    const { pi, commands, handlers, tools } = makePi();
+    extension(pi);
+    const ctx = makeContext(root, notices);
+
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("sandbox")?.("allowRead ./refresh-read", ctx);
+
+    assert.equal(initialised.length, 2);
+    assert.equal(resets.length, 1);
+    assert.deepEqual(JSON.parse(readFileSync(join(root, ".pi", "sandbox.json"), "utf8")), {
+      filesystem: { allowRead: ["./refresh-read"] },
+    });
+    assert.match(notices.at(-1) ?? "", /active sandbox runtime was not refreshed/i);
+
+    const wrappedCommands: string[] = [];
+    wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async (command: string) => {
+      wrappedCommands.push(command);
+      return "printf sandboxed";
+    });
+    const bashTool = tools.get("bash");
+    assert.ok(bashTool);
+    const result = await bashTool.execute(
+      "test",
+      { command: "printf local" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(wrappedCommands.length, 1);
+    assert.ok(result);
+    assert.match((result.content[0] as { text: string }).text, /sandboxed/);
+  } finally {
+    wrapMock?.mock.restore();
+    managerMock.mock.restore();
+    resetMock.mock.restore();
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("protected write, edit, Bash, and user Bash mutations are blocked before sandbox state checks", async () => {
+  const root = makeProjectTempDirectory("extension-protection");
+  const agentDir = join(root, "custom-agent");
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
   const notices: string[] = [];
   try {
     const { pi, handlers } = makePi();
     extension(pi);
     const ctx = makeContext(root, notices);
-    const direct = await handlers.get("tool_call")?.(
-      { toolName: "write", input: { path: join(root, ".pi", "sandbox.json") } },
+    const globalPath = join(agentDir, "sandbox.json");
+    const directWrite = await handlers.get("tool_call")?.(
+      { toolName: "write", input: { path: globalPath } },
+      ctx,
+    );
+    const directEdit = await handlers.get("tool_call")?.(
+      { toolName: "edit", input: { path: globalPath } },
       ctx,
     );
     const bash = await handlers.get("tool_call")?.(
-      { toolName: "bash", input: { command: "echo x > .pi/sandbox.json" } },
+      { toolName: "bash", input: { command: `echo x > ${globalPath}` } },
       ctx,
     );
+    const userBash = await handlers.get("user_bash")?.({ command: `echo x > ${globalPath}` }, ctx);
 
-    assert.equal(direct?.block, true);
+    assert.equal(directWrite?.block, true);
+    assert.equal(directEdit?.block, true);
     assert.equal(bash?.block, true);
-    assert.match(direct?.reason ?? "", /protected/);
+    assert.equal(userBash?.result?.exitCode, 1);
+    assert.match(directWrite?.reason ?? "", /protected/);
+    assert.match(directEdit?.reason ?? "", /protected/);
     assert.match(bash?.reason ?? "", /use \/sandbox/i);
+    assert.match(userBash?.result?.output ?? "", /use \/sandbox/i);
   } finally {
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
     rmSync(root, { recursive: true, force: true });
   }
 });

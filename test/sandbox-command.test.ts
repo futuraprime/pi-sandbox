@@ -1,5 +1,4 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
@@ -14,6 +13,10 @@ import {
   type SandboxCommandKey,
   type SandboxConfigForCommand,
 } from "../src/sandbox-command.ts";
+
+function makeProjectTempDirectory(prefix: string): string {
+  return mkdtempSync(join(process.cwd(), `.pi-sandbox-${prefix}-`));
+}
 
 const commandCases: Array<{
   key: SandboxCommandKey;
@@ -76,7 +79,7 @@ test("applySandboxCommand adds each rule to only its selected array", () => {
 });
 
 test("canonical filesystem duplicates retain the existing project spelling", () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-command-canonical-"));
+  const root = makeProjectTempDirectory("command-canonical");
   try {
     const real = join(root, "real");
     const link = join(root, "link");
@@ -104,7 +107,7 @@ test("canonical filesystem duplicates retain the existing project spelling", () 
 });
 
 test("persistence preserves unrelated fields and updates only the selected array", () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-command-persistence-"));
+  const root = makeProjectTempDirectory("command-persistence");
   const configPath = join(root, ".pi", "sandbox.json");
   try {
     mkdirSync(dirname(configPath), { recursive: true });
@@ -147,7 +150,7 @@ test("persistence preserves unrelated fields and updates only the selected array
 });
 
 test("persistence supports all six arrays and does not touch a separate config path", () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-command-six-"));
+  const root = makeProjectTempDirectory("command-six");
   const projectPath = join(root, "project", ".pi", "sandbox.json");
   const globalPath = join(root, "global", "sandbox.json");
   try {
