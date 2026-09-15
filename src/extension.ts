@@ -10,6 +10,8 @@ import {
 import { Key } from "@earendil-works/pi-tui";
 
 import { getConfigPaths, loadConfig } from "./config.ts";
+import { isGitUpstreamMutationCommand } from "./diagnostics.ts";
+import { runGitCommand, setGitUpstream } from "./git-upstream.ts";
 import {
   canonicalizePath,
   canonicalizePathPattern,
@@ -46,6 +48,51 @@ import {
   promptWriteBlock,
   warnIfAllDomainsAllowed,
 } from "./ui.ts";
+
+interface SetGitUpstreamParameters {
+  localBranch: string;
+  remote: "origin";
+  remoteBranch: string;
+}
+
+const setGitUpstreamParameters = {
+  type: "object",
+  properties: {
+    localBranch: {
+      type: "string",
+      description: "The existing local branch name",
+    },
+    remote: {
+      type: "string",
+      const: "origin",
+      description: 'The only permitted remote; must be "origin"',
+    },
+    remoteBranch: {
+      type: "string",
+      description: "The existing remote branch name",
+    },
+  },
+  required: ["localBranch", "remote", "remoteBranch"],
+  additionalProperties: false,
+} as const;
+
+function gitUpstreamRedirectMessage(): string {
+  return (
+    "Use the set_git_upstream tool for Git branch tracking instead of Bash. " +
+    "If git push -u is needed to publish the branch, push without -u first, then call set_git_upstream."
+  );
+}
+
+function gitUpstreamBlockedResult() {
+  return {
+    result: {
+      output: gitUpstreamRedirectMessage(),
+      exitCode: 1,
+      cancelled: false,
+      truncated: false,
+    },
+  };
+}
 
 function sandboxConfigMutationMessage(cwd: string): string {
   const { projectPath, globalPath } = getProtectedSandboxConfigPaths(cwd);
@@ -221,9 +268,48 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.registerTool({
+    name: "set_git_upstream",
+    label: "Set Git upstream",
+    description:
+      "Set a local branch to track an existing branch on the origin remote. " +
+      "This tool accepts branch names only and cannot run arbitrary Git commands or modify other config.",
+    promptSnippet: "Set a local branch to track an existing origin branch",
+    parameters: setGitUpstreamParameters,
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      const input = params as unknown as SetGitUpstreamParameters;
+      await setGitUpstream(
+        {
+          cwd: ctx.cwd,
+          localBranch: input.localBranch,
+          remote: input.remote,
+          remoteBranch: input.remoteBranch,
+        },
+        runGitCommand,
+        signal,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Local branch "${input.localBranch}" now tracks "${input.remote}/${input.remoteBranch}".`,
+          },
+        ],
+        details: {},
+      };
+    },
+  });
+
+  pi.registerTool({
     ...localBash,
     label: "bash (sandboxed)",
     async execute(id, params, signal, onUpdate, ctx) {
+      if (isGitUpstreamMutationCommand(params.command)) {
+        return {
+          content: [{ type: "text", text: gitUpstreamRedirectMessage() }],
+          details: {},
+        };
+      }
+
       const runBash = async () => {
         if (!sandboxEnabled || !sandboxInitialized) {
           return localBash.execute(id, params, signal, onUpdate, ctx);
@@ -301,6 +387,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("user_bash", async (event, ctx) => {
+    if (isGitUpstreamMutationCommand(event.command)) return gitUpstreamBlockedResult();
     if (bashCommandMentionsSandboxConfig(event.command, ctx.cwd)) {
       return {
         result: {
@@ -361,6 +448,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    if (isToolCallEventType("bash", event) && isGitUpstreamMutationCommand(event.input.command)) {
+      return { block: true, reason: gitUpstreamRedirectMessage() };
+    }
     if (
       (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) &&
       isSandboxConfigPath((event.input as { path: string }).path, ctx.cwd)

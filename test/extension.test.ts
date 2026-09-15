@@ -17,6 +17,10 @@ import { SandboxManager } from "@carderne/sandbox-runtime";
 import assert from "node:assert/strict";
 
 import extension from "../src/extension.ts";
+import {
+  gitUpstreamMutationCommands,
+  nonGitUpstreamMutationCommands,
+} from "./git-upstream-command-fixtures.ts";
 
 function makePi() {
   const commands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
@@ -44,6 +48,17 @@ function makePi() {
 
 function makeProjectTempDirectory(prefix: string): string {
   return mkdtempSync(join(process.cwd(), `.pi-sandbox-${prefix}-`));
+}
+
+function makeGitUpstreamFixture(): string {
+  const repository = makeProjectTempDirectory("git-upstream-extension");
+  git(repository, ["init", "-q", "-b", "main"]);
+  git(repository, ["config", "user.name", "Test User"]);
+  git(repository, ["config", "user.email", "test@example.com"]);
+  git(repository, ["commit", "--allow-empty", "-m", "initial"]);
+  git(repository, ["remote", "add", "origin", join(repository, "remote")]);
+  git(repository, ["update-ref", "refs/remotes/origin/main", "HEAD"]);
+  return repository;
 }
 
 function git(cwd: string, args: string[]): string {
@@ -382,6 +397,121 @@ test("protected write, edit, Bash, and user Bash mutations are blocked before sa
   } finally {
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("registers set_git_upstream with the exact narrow schema and routes through ctx.cwd", async () => {
+  const repository = makeGitUpstreamFixture();
+  const notices: string[] = [];
+  try {
+    const { pi, tools } = makePi();
+    extension(pi);
+    const tool = tools.get("set_git_upstream");
+    assert.ok(tool);
+    assert.deepEqual(tool.parameters, {
+      type: "object",
+      properties: {
+        localBranch: {
+          type: "string",
+          description: "The existing local branch name",
+        },
+        remote: {
+          type: "string",
+          const: "origin",
+          description: 'The only permitted remote; must be "origin"',
+        },
+        remoteBranch: {
+          type: "string",
+          description: "The existing remote branch name",
+        },
+      },
+      required: ["localBranch", "remote", "remoteBranch"],
+      additionalProperties: false,
+    });
+
+    const ctx = makeContext(repository, notices);
+    const result = await tool.execute(
+      "set-upstream",
+      { localBranch: "main", remote: "origin", remoteBranch: "main" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match((result.content[0] as { text: string }).text, /now tracks/);
+    assert.equal(
+      git(repository, ["config", "--local", "--get", "branch.main.remote"]).trim(),
+      "origin",
+    );
+
+    await assert.rejects(
+      tool.execute(
+        "bad-remote",
+        { localBranch: "main", remote: "upstream", remoteBranch: "main" },
+        undefined,
+        undefined,
+        ctx,
+      ),
+      /origin/i,
+    );
+
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      tool.execute(
+        "cancelled",
+        { localBranch: "main", remote: "origin", remoteBranch: "main" },
+        controller.signal,
+        undefined,
+        ctx,
+      ),
+      /aborted/i,
+    );
+  } finally {
+    rmSync(repository, { recursive: true, force: true });
+  }
+});
+
+test("blocks every positive Git tracking mutation before Bash execution and passes negatives", async () => {
+  const root = makeProjectTempDirectory("git-upstream-preflight");
+  const marker = join(root, "must-not-run");
+  try {
+    const { pi, handlers, tools } = makePi();
+    extension(pi);
+    const ctx = makeContext(root, []);
+    const handler = handlers.get("tool_call");
+    assert.ok(handler);
+
+    for (const command of gitUpstreamMutationCommands) {
+      const blocked = await handler({ toolName: "bash", input: { command } }, ctx);
+      assert.equal(blocked?.block, true, command);
+    }
+    for (const command of nonGitUpstreamMutationCommands) {
+      assert.equal(
+        await handler({ toolName: "bash", input: { command } }, ctx),
+        undefined,
+        command,
+      );
+    }
+
+    const bash = tools.get("bash");
+    assert.ok(bash);
+    const result = await bash.execute(
+      "blocked-direct",
+      { command: `git branch -u origin/main main; touch ${marker}` },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.match((result.content[0] as { text: string }).text, /set_git_upstream/);
+    assert.equal(existsSync(marker), false);
+
+    const userBash = await handlers.get("user_bash")?.(
+      { command: gitUpstreamMutationCommands[0] },
+      ctx,
+    );
+    assert.equal(userBash?.result?.exitCode, 1);
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
