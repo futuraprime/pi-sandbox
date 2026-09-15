@@ -4,7 +4,6 @@ import assert from "node:assert/strict";
 
 import {
   MAX_DEBUG_INCIDENTS,
-  SandboxIncidentHistory,
   formatCommandPreview,
   recordIncident,
   type SandboxDiagnostic,
@@ -49,16 +48,16 @@ function incident(index: number, retained = true): SandboxIncident {
 }
 
 test("retains only attributed or prompted incidents and keeps the newest five", () => {
-  const history = new SandboxIncidentHistory();
+  const incidents: SandboxIncident[] = [];
   assert.equal(MAX_DEBUG_INCIDENTS, 5);
-  assert.equal(history.record(incident(0, false)), false);
-  for (let index = 1; index <= 6; index += 1) assert.equal(history.record(incident(index)), true);
+  assert.equal(recordIncident(incidents, incident(0, false)), false);
+  for (let index = 1; index <= 6; index += 1) {
+    assert.equal(recordIncident(incidents, incident(index)), true);
+  }
   assert.deepEqual(
-    history.list().map((item) => item.id),
+    incidents.map((item) => item.id),
     ["incident-2", "incident-3", "incident-4", "incident-5", "incident-6"],
   );
-  history.clear();
-  assert.equal(history.size, 0);
 });
 
 test("records prompted incidents and renders debug entries newest first", () => {

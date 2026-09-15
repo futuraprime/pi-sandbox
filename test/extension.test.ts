@@ -23,14 +23,16 @@ import {
   nonGitUpstreamMutationCommands,
 } from "./git-upstream-command-fixtures.ts";
 
-function makePi() {
+type StatusUpdate = { key: string; value: string | undefined };
+
+function makePi(options: { noSandbox?: boolean } = {}) {
   const commands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
   const handlers = new Map<string, (event: any, ctx: ExtensionContext) => Promise<any>>();
   const tools = new Map<string, any>();
   const sentMessages: Array<{ customType: string; content: string; display: boolean }> = [];
   const pi = {
     registerFlag: () => undefined,
-    getFlag: () => false,
+    getFlag: (name: string) => name === "no-sandbox" && options.noSandbox === true,
     registerTool: (definition: { name: string }) => {
       tools.set(definition.name, definition);
     },
@@ -108,17 +110,122 @@ function makeLinkedWorktreeFixture(): {
   };
 }
 
-function makeContext(cwd: string, notices: string[]): ExtensionContext {
+function makeContext(
+  cwd: string,
+  notices: string[],
+  statusUpdates: StatusUpdate[] = [],
+): ExtensionContext {
   return {
     cwd,
     hasUI: true,
     ui: {
       notify: (message: string) => notices.push(message),
-      setStatus: () => undefined,
+      setStatus: (key: string, value: string | undefined) => statusUpdates.push({ key, value }),
       theme: { fg: (_colour: string, text: string) => text },
     },
   } as unknown as ExtensionContext;
 }
+
+test("extension wires pending, enabled, disabled, and shutdown statuses", async () => {
+  const root = makeProjectTempDirectory("extension-status");
+  const statusUpdates: StatusUpdate[] = [];
+  const initialized: string[] = [];
+  const managerMock = mock.method(SandboxManager, "initialize", async () => {
+    assert.deepEqual(statusUpdates.at(-1), { key: "sandbox", value: "ꗃ" });
+    initialized.push("initialize");
+  });
+  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+
+  try {
+    const { pi, commands, handlers } = makePi();
+    extension(pi);
+    const ctx = makeContext(root, [], statusUpdates);
+
+    await handlers.get("session_start")?.({}, ctx);
+    assert.equal(initialized.length, 1);
+    assert.deepEqual(statusUpdates, [
+      { key: "sandbox", value: "ꗃ" },
+      { key: "sandbox", value: "🔒" },
+    ]);
+
+    await handlers.get("session_start")?.({}, ctx);
+    assert.deepEqual(statusUpdates.slice(-2), [
+      { key: "sandbox", value: "ꗃ" },
+      { key: "sandbox", value: "🔒" },
+    ]);
+
+    await commands.get("sandbox-disable")?.("", ctx);
+    assert.deepEqual(statusUpdates.at(-1), { key: "sandbox", value: "ꗃ" });
+
+    await handlers.get("session_shutdown")?.({}, ctx);
+    assert.deepEqual(statusUpdates.at(-1), { key: "sandbox", value: undefined });
+  } finally {
+    managerMock.mock.restore();
+    resetMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("extension reports disabled status for --no-sandbox and config", async () => {
+  const flagRoot = makeProjectTempDirectory("extension-status-flag");
+  const configRoot = makeProjectTempDirectory("extension-status-config");
+  mkdirSync(join(configRoot, ".pi"));
+  writeFileSync(join(configRoot, ".pi", "sandbox.json"), JSON.stringify({ enabled: false }));
+
+  try {
+    const flagStatuses: StatusUpdate[] = [];
+    const flag = makePi({ noSandbox: true });
+    extension(flag.pi);
+    const flagContext = makeContext(flagRoot, [], flagStatuses);
+    await flag.handlers.get("session_start")?.({}, flagContext);
+    assert.deepEqual(flagStatuses, [
+      { key: "sandbox", value: "ꗃ" },
+      { key: "sandbox", value: "ꗃ" },
+    ]);
+
+    const configStatuses: StatusUpdate[] = [];
+    const config = makePi();
+    extension(config.pi);
+    const configContext = makeContext(configRoot, [], configStatuses);
+    await config.handlers.get("session_start")?.({}, configContext);
+    assert.deepEqual(configStatuses, [
+      { key: "sandbox", value: "ꗃ" },
+      { key: "sandbox", value: "ꗃ" },
+    ]);
+  } finally {
+    rmSync(flagRoot, { recursive: true, force: true });
+    rmSync(configRoot, { recursive: true, force: true });
+  }
+});
+
+test("extension reports an initialization error after pending status", async () => {
+  const root = makeProjectTempDirectory("extension-status-error");
+  const statusUpdates: StatusUpdate[] = [];
+  const managerMock = mock.method(SandboxManager, "initialize", async () => {
+    assert.deepEqual(statusUpdates.at(-1), { key: "sandbox", value: "ꗃ" });
+    throw new Error("test initialization failure");
+  });
+
+  try {
+    const { pi, handlers } = makePi();
+    extension(pi);
+    const notices: string[] = [];
+    const ctx = makeContext(root, notices, statusUpdates);
+
+    await handlers.get("session_start")?.({}, ctx);
+    assert.deepEqual(statusUpdates, [
+      { key: "sandbox", value: "ꗃ" },
+      { key: "sandbox", value: "ꗃ" },
+    ]);
+    assert.match(notices.at(-1) ?? "", /initialization failed/);
+
+    await handlers.get("session_shutdown")?.({}, ctx);
+    assert.deepEqual(statusUpdates.at(-1), { key: "sandbox", value: undefined });
+  } finally {
+    managerMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("/sandbox exercises all six project-only rules and refreshes only after changes", async () => {
   const root = makeProjectTempDirectory("extension");
@@ -684,8 +791,8 @@ test("sandbox-debug retains five incidents in memory and resets on a new session
     assert.equal(existsSync(join(root, ".pi", "sandbox.json")), false);
     assert.equal(existsSync(join(agentDir, "sandbox.json")), false);
 
-    // A replacement session clears both history and session approvals without
-    // reading or writing a history file.
+    // A replacement session clears incident history without reading or writing
+    // a history file; session allowances remain until shutdown.
     await handlers.get("session_start")?.({}, ctx);
     await commands.get("sandbox-debug")?.("", ctx);
     assert.match(notices.at(-1) ?? "", /no attributed incidents/i);
@@ -694,6 +801,70 @@ test("sandbox-debug retains five incidents in memory and resets on a new session
     managerMock.mock.restore();
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("session starts retain allowances until shutdown clears them", async () => {
+  const root = makeProjectTempDirectory("session-allowances-lifecycle");
+  const initialized: string[] = [];
+  const resets: string[] = [];
+  const managerMock = mock.method(SandboxManager, "initialize", async () => {
+    initialized.push("initialize");
+  });
+  const resetMock = mock.method(SandboxManager, "reset", async () => {
+    resets.push("reset");
+  });
+
+  try {
+    const { pi, handlers } = makePi();
+    extension(pi);
+    const ctx = makeContext(root, []);
+    let promptCount = 0;
+    (ctx.ui as any).custom = (factory: any) =>
+      new Promise((resolve) => {
+        const component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          (result: unknown) => resolve(result),
+        );
+        promptCount += 1;
+        component.handleInput("s");
+      });
+
+    await handlers.get("session_start")?.({}, ctx);
+    const first = await handlers.get("user_bash")?.(
+      { command: "curl https://session-only.example", excludeFromContext: true },
+      ctx,
+    );
+    assert.ok(first?.operations);
+    assert.equal(promptCount, 1);
+    assert.equal(initialized.length, 2);
+    assert.equal(resets.length, 1);
+
+    await handlers.get("session_start")?.({}, ctx);
+    const sameSession = await handlers.get("user_bash")?.(
+      { command: "curl https://session-only.example", excludeFromContext: true },
+      ctx,
+    );
+    assert.ok(sameSession?.operations);
+    assert.equal(promptCount, 1);
+    assert.equal(initialized.length, 2);
+
+    await handlers.get("session_shutdown")?.({}, ctx);
+    await handlers.get("session_start")?.({}, ctx);
+    const freshSession = await handlers.get("user_bash")?.(
+      { command: "curl https://session-only.example", excludeFromContext: true },
+      ctx,
+    );
+    assert.ok(freshSession?.operations);
+    assert.equal(promptCount, 2);
+    assert.equal(initialized.length, 4);
+    assert.equal(resets.length, 3);
+  } finally {
+    managerMock.mock.restore();
+    resetMock.mock.restore();
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -583,36 +583,6 @@ export function recordIncident(
   return true;
 }
 
-/** A bounded, memory-only incident history for one extension/session closure. */
-export class SandboxIncidentHistory {
-  private readonly incidents: SandboxIncident[] = [];
-  private readonly max: number;
-
-  constructor(max = MAX_DEBUG_INCIDENTS) {
-    this.max = Math.max(0, Math.floor(max));
-  }
-
-  record(incident: SandboxIncident): boolean {
-    return recordIncident(this.incidents, incident, this.max);
-  }
-
-  list(): SandboxIncident[] {
-    return [...this.incidents];
-  }
-
-  clear(): void {
-    this.incidents.length = 0;
-  }
-
-  get size(): number {
-    return this.incidents.length;
-  }
-}
-
-export function createIncidentHistory(max = MAX_DEBUG_INCIDENTS): SandboxIncidentHistory {
-  return new SandboxIncidentHistory(max);
-}
-
 export interface DiagnosticPolicyContext {
   cwd: string;
   allowRead: string[];

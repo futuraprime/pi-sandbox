@@ -256,11 +256,15 @@ export default function (pi: ExtensionAPI) {
     recordIncident(sandboxIncidents, incident);
   }
 
+  function resetIncidentHistory(): void {
+    sandboxIncidents.length = 0;
+  }
+
   function resetSessionMemory(): void {
     allowances.domains.length = 0;
     allowances.readPaths.length = 0;
     allowances.writePaths.length = 0;
-    sandboxIncidents.length = 0;
+    resetIncidentHistory();
   }
 
   async function promptForDiagnostic(
@@ -424,6 +428,7 @@ export default function (pi: ExtensionAPI) {
         return refreshed;
       }
       ctx.ui.notify("Sandbox is already enabled", "info");
+      updateStatus(ctx, "enabled");
       return false;
     }
 
@@ -785,9 +790,9 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    // Approvals and incident history belong to this session only. Reset them
-    // before inspecting the new session's config; no file is involved.
-    resetSessionMemory();
+    // Incident history is scoped to the replacement session. Session allowances
+    // remain with the active runtime until session_shutdown tears it down.
+    resetIncidentHistory();
     updateStatus(ctx, "pending");
 
     if (pi.getFlag("no-sandbox") as boolean) {

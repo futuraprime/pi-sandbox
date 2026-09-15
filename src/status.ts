@@ -18,12 +18,7 @@ export type SandboxStatusState =
   | "error"
   | "shutdown";
 
-export type SandboxInterventionState = "collapsed" | "expanded";
-export type SandboxPresentationState =
-  | SandboxStatusState
-  | "intervention"
-  | "collapsed"
-  | "expanded";
+type SandboxInterventionState = "collapsed" | "expanded";
 
 type ThemeColor = Parameters<ExtensionContext["ui"]["theme"]["fg"]>[0];
 type DiagnosticTheme = {
@@ -33,7 +28,7 @@ type DiagnosticTheme = {
 type StatusTheme = Pick<DiagnosticTheme, "fg">;
 type StatusTone = "accent" | "error";
 
-export interface SandboxStatusPresentation {
+interface SandboxStatusPresentation {
   state: SandboxStatusState;
   text: string | undefined;
   tone: StatusTone;
@@ -83,8 +78,6 @@ export function getSandboxStatusPresentation(state: SandboxStatusState): Sandbox
   return { ...STATUS_PRESENTATIONS[state] };
 }
 
-export const sandboxStatusPresentation = getSandboxStatusPresentation;
-
 export function formatSandboxStatus(
   state: SandboxStatusState,
   theme: StatusTheme,
@@ -94,8 +87,6 @@ export function formatSandboxStatus(
     ? undefined
     : theme.fg(presentation.tone, presentation.text);
 }
-
-export const renderSandboxStatus = formatSandboxStatus;
 
 export function setSandboxStatus(
   ctx: Pick<ExtensionContext, "ui">,
@@ -124,7 +115,7 @@ function removeRawDiagnosticBlocks(text: string): string {
   return text.replace(/\n*<sandbox_diagnostic>[\s\S]*?<\/sandbox_diagnostic>/g, "").trimEnd();
 }
 
-export function cleanDiagnosticVisibleText(text: string): string {
+function cleanDiagnosticVisibleText(text: string): string {
   return removeRawDiagnosticBlocks(text);
 }
 
@@ -218,5 +209,3 @@ export function formatSandboxDebug(
 
   return lines.join("\n");
 }
-
-export const renderSandboxDebug = formatSandboxDebug;
