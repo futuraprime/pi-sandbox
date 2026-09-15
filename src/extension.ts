@@ -1,16 +1,34 @@
 import { isAbsolute, relative } from "node:path";
 
 import { SandboxManager } from "@carderne/sandbox-runtime";
-import { type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   createBashToolDefinition,
+  isBashToolResult,
   isToolCallEventType,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { Key } from "@earendil-works/pi-tui";
+import { Container, Key, Text } from "@earendil-works/pi-tui";
 
 import { getConfigPaths, loadConfig } from "./config.ts";
-import { isGitUpstreamMutationCommand } from "./diagnostics.ts";
+import {
+  addUniqueDiagnostics,
+  finalizeDiagnostic,
+  formatCommandPreview,
+  getDiagnosticBlockData,
+  isGitUpstreamMutationCommand,
+  isMateriallyDifferent,
+  parseDiagnosticBlock,
+  parseFallbackDiagnosticFromOutput,
+  parseViolationEvent,
+  renderDiagnosticBlock,
+  renderDiagnosticNotice,
+  renderDiagnosticSummaryLines,
+  selectPrimaryViolation,
+  type SandboxDiagnostic,
+  type SandboxDiagnosticBlockData,
+  type SandboxIncident,
+} from "./diagnostics.ts";
 import { runGitCommand, setGitUpstream } from "./git-upstream.ts";
 import {
   canonicalizePath,
@@ -32,7 +50,6 @@ import {
 import { resolveDerivedFilesystemAllowances } from "./sandbox-filesystem.ts";
 import {
   createSandboxedBashOps,
-  extractBlockedWritePath,
   initializeSandbox,
   reinitializeSandbox,
   resolveAllowances,
@@ -100,6 +117,65 @@ function sandboxConfigMutationMessage(cwd: string): string {
     "Sandbox configuration files are protected. Use /sandbox to add rules; " +
     `protected paths are:\n  ${projectPath}\n  ${globalPath}`
   );
+}
+
+interface DiagnosticResultDetails {
+  sandboxDiagnostic?: SandboxDiagnosticBlockData;
+  sandboxVisibleText?: string;
+  truncation?: {
+    truncated: boolean;
+    totalLines?: number;
+    outputLines?: number;
+    outputBytes?: number;
+    truncatedBy?: "lines" | "bytes";
+    maxBytes?: number;
+  };
+  fullOutputPath?: string;
+}
+
+type DiagnosticTheme = ExtensionContext["ui"]["theme"];
+
+function renderSandboxDiagnosticResult(
+  result: { content?: Array<{ type: string; text?: string }>; details?: unknown },
+  expanded: boolean,
+  theme: DiagnosticTheme,
+): Container {
+  const details = (result.details ?? {}) as DiagnosticResultDetails;
+  const diagnostic = details.sandboxDiagnostic;
+  if (!diagnostic) return new Container();
+
+  const text = result.content?.find((content) => content.type === "text")?.text ?? "";
+  const visibleText = details.sandboxVisibleText ?? text;
+  const container = new Container();
+  container.addChild(
+    new Text(
+      `${theme.fg("warning", theme.bold("Sandbox intervention"))} ${theme.fg("muted", renderDiagnosticNotice(diagnostic))}`,
+      0,
+      0,
+    ),
+  );
+
+  if (!expanded) {
+    container.addChild(
+      new Text(theme.fg("dim", "Expand to view command output and full diagnostic details."), 0, 0),
+    );
+    return container;
+  }
+
+  const summary = renderDiagnosticSummaryLines(diagnostic)
+    .map((line) => theme.fg("dim", line))
+    .join("\n");
+  container.addChild(new Text(`\n${summary}`, 0, 0));
+  if (visibleText.trim()) {
+    container.addChild(new Text(`\n${theme.fg("toolOutput", visibleText.trim())}`, 0, 0));
+  }
+  const warnings: string[] = [];
+  if (details.fullOutputPath) warnings.push(`Full output: ${details.fullOutputPath}`);
+  if (details.truncation?.truncated) warnings.push("Output truncated");
+  if (warnings.length > 0) {
+    container.addChild(new Text(`\n${theme.fg("warning", `[${warnings.join(". ")}]`)}`, 0, 0));
+  }
+  return container;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -184,6 +260,188 @@ export default function (pi: ExtensionAPI) {
     if (relativePath === "") return ".";
     if (relativePath.startsWith("..")) return canonical;
     return relativePath.startsWith(".") ? relativePath : `./${relativePath}`;
+  }
+
+  function diagnosticPolicy(cwd: string) {
+    const config = loadConfig(cwd);
+    const effective = effectiveAllowances(cwd);
+    return {
+      cwd,
+      allowRead: effective.readPaths,
+      denyRead: config.filesystem?.denyRead ?? [],
+      allowWrite: effective.writePaths,
+      denyWrite: config.filesystem?.denyWrite ?? [],
+      allowedDomains: effective.domains,
+      deniedDomains: config.network?.deniedDomains ?? [],
+    };
+  }
+
+  function incidentFor(source: "bash" | "user_bash", command: string): SandboxIncident {
+    return {
+      id: `${source}-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      timestamp: new Date(),
+      source,
+      commandPreview: formatCommandPreview(command),
+      commandKey: command,
+      attributed: false,
+      violations: [],
+      primaryViolation: undefined,
+      promptShown: false,
+      promptChoice: "none",
+      promptCount: 0,
+      retried: false,
+      finalOutcome: "failure",
+      configMutation: "none",
+    };
+  }
+
+  function mutationForChoice(
+    choice: Exclude<PermissionPromptResult["action"], "abort"> | "abort" | "none",
+  ): SandboxIncident["configMutation"] {
+    if (choice === "project") return ".pi/sandbox.json";
+    if (choice === "global") return "~/.pi/agent/sandbox.json";
+    return "none";
+  }
+
+  async function promptForDiagnostic(
+    ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
+    diagnostic: SandboxDiagnostic,
+    incident: SandboxIncident,
+  ): Promise<"abort" | "session" | "project" | "global" | "none"> {
+    if (
+      !ctx.hasUI ||
+      !diagnostic.promptable ||
+      incident.promptCount >= 2 ||
+      (diagnostic.type !== "network" && diagnostic.type !== "read" && diagnostic.type !== "write")
+    ) {
+      return "none";
+    }
+
+    incident.promptShown = true;
+    incident.promptCount += 1;
+    const timeout = loadConfig(ctx.cwd).permissionPromptTimeoutSeconds;
+    const target = diagnostic.rawTarget ?? diagnostic.target;
+    const choice =
+      diagnostic.type === "network"
+        ? await promptDomainBlock(pi, ctx, target, timeout)
+        : diagnostic.type === "read"
+          ? await promptReadBlock(pi, ctx, target, timeout)
+          : await promptWriteBlock(pi, ctx, target, timeout);
+
+    incident.promptChoice = choice.action;
+    incident.configMutation = mutationForChoice(choice.action);
+    if (choice.action === "abort") return "abort";
+    await applyChoice(
+      choice.action,
+      diagnostic.type === "network" ? "domain" : diagnostic.type,
+      choice.value,
+      ctx.cwd,
+    );
+    return choice.action;
+  }
+
+  function createDiagnosticOperations(
+    ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
+    source: "bash" | "user_bash",
+    shellPath: string | undefined,
+    recordDiagnosticInContext: boolean,
+    onDetails?: (details: DiagnosticResultDetails | undefined) => void,
+  ): ReturnType<typeof createSandboxedBashOps> {
+    const baseOperations = createSandboxedBashOps(
+      shellPath,
+      loadConfig(ctx.cwd).network?.sshProxy !== false,
+    );
+    return {
+      async exec(command, cwd, execOptions) {
+        const incident = incidentFor(source, command);
+        let lastPrompted: SandboxDiagnostic | undefined;
+        let lastResult: { exitCode: number | null } = { exitCode: 1 };
+        let visibleOutput = "";
+
+        for (;;) {
+          let output = "";
+          const store = SandboxManager.getSandboxViolationStore();
+          const beforeCount = store.getViolationsForCommand(command).length;
+          lastResult = await baseOperations.exec(command, cwd, {
+            ...execOptions,
+            onData: (data) => {
+              output += data.toString();
+              visibleOutput += data.toString();
+              execOptions.onData(data);
+            },
+          });
+
+          let annotatedOutput = output;
+          try {
+            annotatedOutput = SandboxManager.annotateStderrWithSandboxFailures(command, output);
+          } catch {
+            // Some runtime versions do not annotate until a log monitor is active.
+          }
+
+          const events = store
+            .getViolationsForCommand(command)
+            .slice(beforeCount)
+            .map((event) => parseViolationEvent(event, process.env.SSH_AUTH_SOCK))
+            .map((diagnostic) => finalizeDiagnostic(diagnostic, diagnosticPolicy(cwd)));
+          const diagnostics = events.length
+            ? events
+            : [parseFallbackDiagnosticFromOutput(command, annotatedOutput)]
+                .filter((diagnostic): diagnostic is SandboxDiagnostic => diagnostic !== null)
+                .map((diagnostic) => finalizeDiagnostic(diagnostic, diagnosticPolicy(cwd)));
+
+          incident.violations = addUniqueDiagnostics(incident.violations, diagnostics);
+          incident.primaryViolation = selectPrimaryViolation(incident.violations);
+          incident.attributed = incident.violations.length > 0;
+          incident.finalOutcome = lastResult.exitCode === 0 ? "success" : "failure";
+
+          const primary = selectPrimaryViolation(diagnostics);
+          const canRetry =
+            lastResult.exitCode !== 0 &&
+            primary?.promptable === true &&
+            (lastPrompted === undefined || isMateriallyDifferent(lastPrompted, primary)) &&
+            incident.promptCount < 2;
+          if (canRetry) {
+            const choice = await promptForDiagnostic(ctx, primary, incident);
+            lastPrompted = primary;
+            if (choice !== "abort" && choice !== "none") {
+              incident.retried = true;
+              const retryNotice = "\n--- Sandbox permission granted, retrying ---\n";
+              visibleOutput += retryNotice;
+              execOptions.onData(Buffer.from(retryNotice));
+              continue;
+            }
+          }
+          break;
+        }
+
+        const block = renderDiagnosticBlock(incident);
+        const blockData = getDiagnosticBlockData(incident);
+        const visibleText = blockData
+          ? visibleOutput
+              .replace(/\n*<sandbox_diagnostic>[\s\S]*?<\/sandbox_diagnostic>\s*$/, "")
+              .trimEnd()
+          : visibleOutput;
+        onDetails?.(
+          blockData ? { sandboxDiagnostic: blockData, sandboxVisibleText: visibleText } : undefined,
+        );
+
+        if (block && blockData) {
+          if (source === "user_bash") {
+            if (recordDiagnosticInContext) {
+              pi.sendMessage({
+                customType: "sandbox-diagnostic",
+                content: block,
+                display: false,
+              });
+            }
+            execOptions.onData(Buffer.from(`\n${renderDiagnosticNotice(blockData)}\n`));
+          } else {
+            execOptions.onData(Buffer.from(`\n${block}\n`));
+          }
+        }
+        return lastResult;
+      },
+    };
   }
 
   function updateStatus(
@@ -310,79 +568,35 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const runBash = async () => {
-        if (!sandboxEnabled || !sandboxInitialized) {
-          return localBash.execute(id, params, signal, onUpdate, ctx);
-        }
-        if (sandboxCwd !== ctx.cwd) await refreshSandbox(ctx.cwd);
-        return createBashToolDefinition(localCwd, {
-          operations: createSandboxedBashOps(
-            userShellPath,
-            loadConfig(ctx.cwd).network?.sshProxy !== false,
-          ),
-          shellPath: userShellPath,
-        }).execute(id, params, signal, onUpdate, ctx);
-      };
-
-      let result: AgentToolResult<any>;
-      try {
-        result = await runBash();
-      } catch (error) {
-        if (!(error instanceof Error) || !error.message.includes("Operation not permitted")) {
-          throw error;
-        }
-        result = {
-          content: [
-            {
-              type: "text",
-              text: `Error: Command failed with OS-level sandbox restriction: ${error.message}`,
-            },
-          ],
-          details: {},
-        };
+      if (!sandboxEnabled || !sandboxInitialized) {
+        return localBash.execute(id, params, signal, onUpdate, ctx);
       }
+      if (sandboxCwd !== ctx.cwd) await refreshSandbox(ctx.cwd);
 
-      if (sandboxEnabled && sandboxInitialized && ctx?.hasUI) {
-        const output = result.content
-          .filter((content: any) => content.type === "text")
-          .map((content: any) => content.text)
-          .join("\n");
-        const blockedPath = extractBlockedWritePath(output);
-
-        if (blockedPath) {
-          const path = canonicalizePath(blockedPath);
-          const config = loadConfig(ctx.cwd);
-          const writePermission = await resolveWritePermission({
-            path,
-            allowWrite: effectiveWritePaths(ctx.cwd),
-            denyWrite: config.filesystem?.denyWrite ?? [],
-            cwd: ctx.cwd,
-            prompt: (path) =>
-              promptWriteBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds),
-            saveWritePermission: (choice, value) => applyChoice(choice, "write", value, ctx.cwd),
-          });
-          if (writePermission.action === "deny") {
-            return result;
-          }
-          if (writePermission.action === "allow") {
-            await refreshSandbox(ctx.cwd);
-            return runBash();
-          }
-          if (writePermission.action === "granted") {
-            onUpdate?.({
-              content: [
-                {
-                  type: "text",
-                  text: `\n--- Write access granted for "${writePermission.value}", retrying ---\n`,
-                },
-              ],
-              details: {},
-            });
-            return runBash();
-          }
-        }
+      let diagnosticDetails: DiagnosticResultDetails | undefined;
+      const sandboxedBash = createBashToolDefinition(localCwd, {
+        operations: createDiagnosticOperations(ctx, "bash", userShellPath, false, (details) => {
+          diagnosticDetails = details;
+        }),
+        shellPath: userShellPath,
+      });
+      const result = await sandboxedBash.execute(id, params, signal, onUpdate, ctx);
+      if (diagnosticDetails) {
+        result.details = {
+          ...result.details,
+          ...diagnosticDetails,
+        } as typeof result.details;
       }
       return result;
+    },
+    renderResult(result, options, theme, context) {
+      const details = (result.details ?? {}) as DiagnosticResultDetails;
+      if (!details.sandboxDiagnostic) {
+        return localBash.renderResult
+          ? localBash.renderResult(result as never, options as never, theme, context)
+          : new Text("", 0, 0);
+      }
+      return renderSandboxDiagnosticResult(result, options.expanded, theme);
     },
   });
 
@@ -440,10 +654,28 @@ export default function (pi: ExtensionAPI) {
       }
     }
     return {
-      operations: createSandboxedBashOps(
+      operations: createDiagnosticOperations(
+        ctx,
+        "user_bash",
         userShellPath,
-        loadConfig(ctx.cwd).network?.sshProxy !== false,
+        !event.excludeFromContext,
       ),
+    };
+  });
+
+  pi.on("tool_result", async (event) => {
+    if (!isBashToolResult(event)) return;
+    const textContent = event.content.find((content) => content.type === "text");
+    if (!textContent || textContent.type !== "text") return;
+
+    const parsed = parseDiagnosticBlock(textContent.text);
+    if (!parsed) return;
+    return {
+      details: {
+        ...(event.details as Record<string, unknown> | undefined),
+        sandboxDiagnostic: parsed.data,
+        sandboxVisibleText: parsed.visibleText,
+      },
     };
   });
 

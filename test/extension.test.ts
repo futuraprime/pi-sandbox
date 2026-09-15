@@ -16,6 +16,7 @@ import test, { mock } from "node:test";
 import { SandboxManager } from "@carderne/sandbox-runtime";
 import assert from "node:assert/strict";
 
+import { renderDiagnosticBlockData, type SandboxDiagnosticBlockData } from "../src/diagnostics.ts";
 import extension from "../src/extension.ts";
 import {
   gitUpstreamMutationCommands,
@@ -26,6 +27,7 @@ function makePi() {
   const commands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
   const handlers = new Map<string, (event: any, ctx: ExtensionContext) => Promise<any>>();
   const tools = new Map<string, any>();
+  const sentMessages: Array<{ customType: string; content: string; display: boolean }> = [];
   const pi = {
     registerFlag: () => undefined,
     getFlag: () => false,
@@ -42,8 +44,12 @@ function makePi() {
     on: (name: string, handler: (event: any, ctx: ExtensionContext) => Promise<any>) => {
       handlers.set(name, handler);
     },
+    sendMessage: (message: { customType: string; content: string; display: boolean }) => {
+      sentMessages.push(message);
+    },
+    events: { emit: () => undefined },
   } as unknown as ExtensionAPI;
-  return { pi, commands, handlers, tools };
+  return { pi, commands, handlers, tools, sentMessages };
 }
 
 function makeProjectTempDirectory(prefix: string): string {
@@ -512,6 +518,288 @@ test("blocks every positive Git tracking mutation before Bash execution and pass
     );
     assert.equal(userBash?.result?.exitCode, 1);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("tool_result keeps raw diagnostic context while attaching compact presentation details", async () => {
+  const { pi, handlers } = makePi();
+  extension(pi);
+  const diagnostic: SandboxDiagnosticBlockData = {
+    type: "write",
+    target: "/project/output.txt",
+    rule: "allowWrite",
+    prompted: true,
+    choice: "session",
+    retried: true,
+    finalOutcome: "success",
+    otherViolations: 1,
+    action: "allow and retry",
+  };
+  const rawText = `normal output\n${renderDiagnosticBlockData(diagnostic)}`;
+  const event = {
+    toolName: "bash",
+    content: [{ type: "text", text: rawText }],
+    details: { truncation: { truncated: true }, fullOutputPath: "/tmp/full-output" },
+  };
+
+  const result = await handlers.get("tool_result")?.(event, {} as ExtensionContext);
+  assert.equal(event.content[0]?.text, rawText);
+  assert.deepEqual(result, {
+    details: {
+      truncation: { truncated: true },
+      fullOutputPath: "/tmp/full-output",
+      sandboxDiagnostic: diagnostic,
+      sandboxVisibleText: "normal output",
+    },
+  });
+
+  assert.equal(
+    await handlers.get("tool_result")?.(
+      { toolName: "bash", content: [{ type: "text", text: "normal output" }], details: {} },
+      {} as ExtensionContext,
+    ),
+    undefined,
+  );
+});
+
+test("bash rendering hides raw metadata and reveals output and truncation only when expanded", () => {
+  const { pi, tools } = makePi();
+  extension(pi);
+  const bash = tools.get("bash");
+  const diagnostic: SandboxDiagnosticBlockData = {
+    type: "network",
+    target: "api.example.com",
+    rule: "allowedDomains",
+    prompted: false,
+    choice: "none",
+    retried: false,
+    finalOutcome: "failure",
+    otherViolations: 0,
+    action: "host not allowed; approve network access",
+  };
+  const rawBlock = renderDiagnosticBlockData(diagnostic);
+  const result = {
+    content: [{ type: "text", text: `normal output\n${rawBlock}` }],
+    details: {
+      sandboxDiagnostic: diagnostic,
+      sandboxVisibleText: "normal output",
+      truncation: { truncated: true },
+      fullOutputPath: "/tmp/full-output",
+    },
+  };
+  const theme = {
+    fg: (_colour: string, text: string) => text,
+    bold: (text: string) => text,
+  };
+
+  const collapsed = bash
+    .renderResult(result, { expanded: false }, theme, {})
+    .render(100)
+    .join("\n");
+  assert.match(collapsed, /Sandbox intervention/);
+  assert.doesNotMatch(collapsed, /normal output|<sandbox_diagnostic>|api\.example\.com/);
+
+  const expanded = bash.renderResult(result, { expanded: true }, theme, {}).render(100).join("\n");
+  assert.match(expanded, /normal output/);
+  assert.match(expanded, /Output truncated/);
+  assert.match(expanded, /Full output: \/tmp\/full-output/);
+  assert.doesNotMatch(expanded, /<sandbox_diagnostic>/);
+});
+
+test("user_bash streams normal output once without diagnostic metadata", async () => {
+  const root = makeProjectTempDirectory("user-bash-normal");
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const wrapMock = mock.method(
+    SandboxManager,
+    "wrapWithSandbox",
+    async () => "printf normal-output",
+  );
+
+  try {
+    const { pi, handlers, sentMessages } = makePi();
+    extension(pi);
+    const ctx = makeContext(root, []);
+    await handlers.get("session_start")?.({}, ctx);
+    const response = await handlers.get("user_bash")?.(
+      { command: "printf normal-output", excludeFromContext: false },
+      ctx,
+    );
+    let output = "";
+    const result = await response.operations.exec("printf normal-output", root, {
+      onData: (data: Buffer) => {
+        output += data.toString();
+      },
+      timeout: 5,
+      env: process.env,
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(output, "normal-output");
+    assert.deepEqual(sentMessages, []);
+  } finally {
+    wrapMock.mock.restore();
+    managerMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("user_bash shows a compact notice and sends raw diagnostic metadata invisibly", async () => {
+  const root = makeProjectTempDirectory("user-bash-diagnostic");
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => {
+    return "printf 'cat: /outside/secret: Operation not permitted\\n' >&2; exit 1";
+  });
+
+  try {
+    const { pi, handlers, sentMessages } = makePi();
+    extension(pi);
+    const ctx = makeContext(root, []);
+    ctx.hasUI = false;
+    await handlers.get("session_start")?.({}, ctx);
+
+    const response = await handlers.get("user_bash")?.(
+      { command: "cat /outside/secret", excludeFromContext: false },
+      ctx,
+    );
+    assert.ok(response?.operations);
+    let output = "";
+    const result = await response.operations.exec("cat /outside/secret", root, {
+      onData: (data: Buffer) => {
+        output += data.toString();
+      },
+      timeout: 5,
+      env: process.env,
+    });
+
+    assert.equal(result.exitCode, 1);
+    assert.match(output, /\[sandbox: read access; blocked or failed/);
+    assert.doesNotMatch(output, /<sandbox_diagnostic>/);
+    assert.equal(sentMessages.length, 1);
+    assert.deepEqual(
+      {
+        customType: sentMessages[0]?.customType,
+        display: sentMessages[0]?.display,
+      },
+      { customType: "sandbox-diagnostic", display: false },
+    );
+    assert.match(sentMessages[0]?.content ?? "", /<sandbox_diagnostic>/);
+    assert.match(sentMessages[0]?.content ?? "", /final_outcome: failure/);
+  } finally {
+    wrapMock.mock.restore();
+    managerMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("diagnostic retries prompt once per materially changed violation", async () => {
+  const root = makeProjectTempDirectory("diagnostic-retries");
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+  let attempt = 0;
+  const outputs = [
+    "printf 'touch: /outside/first: Operation not permitted\\n' >&2; exit 1",
+    "printf 'touch: /outside/second: Operation not permitted\\n' >&2; exit 1",
+    "printf success",
+  ];
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => {
+    const command = outputs[attempt] ?? outputs.at(-1)!;
+    attempt += 1;
+    return command;
+  });
+
+  try {
+    const { pi, handlers, sentMessages } = makePi();
+    extension(pi);
+    const ctx = makeContext(root, []);
+    let promptCount = 0;
+    (ctx.ui as any).custom = (factory: any) =>
+      new Promise((resolve) => {
+        let component: any;
+        component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          (result: unknown) => resolve(result),
+        );
+        promptCount += 1;
+        component.handleInput("s");
+      });
+    await handlers.get("session_start")?.({}, ctx);
+
+    const response = await handlers.get("user_bash")?.(
+      { command: "touch /outside/first /outside/second", excludeFromContext: false },
+      ctx,
+    );
+    let output = "";
+    const result = await response.operations.exec("touch /outside/first /outside/second", root, {
+      onData: (data: Buffer) => {
+        output += data.toString();
+      },
+      timeout: 5,
+      env: process.env,
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(promptCount, 2);
+    assert.equal(attempt, 3);
+    assert.match(output, /retried successfully/);
+    assert.match(sentMessages[0]?.content ?? "", /other_violations: 1/);
+    assert.match(sentMessages[0]?.content ?? "", /final_outcome: success/);
+  } finally {
+    wrapMock.mock.restore();
+    resetMock.mock.restore();
+    managerMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("diagnostic retries do not prompt twice for the same violation", async () => {
+  const root = makeProjectTempDirectory("diagnostic-duplicate");
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+  let attempt = 0;
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => {
+    attempt += 1;
+    return "printf 'touch: /outside/repeated: Operation not permitted\\n' >&2; exit 1";
+  });
+
+  try {
+    const { pi, handlers } = makePi();
+    extension(pi);
+    const ctx = makeContext(root, []);
+    let promptCount = 0;
+    (ctx.ui as any).custom = (factory: any) =>
+      new Promise((resolve) => {
+        let component: any;
+        component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          (result: unknown) => resolve(result),
+        );
+        promptCount += 1;
+        component.handleInput("s");
+      });
+    await handlers.get("session_start")?.({}, ctx);
+
+    const response = await handlers.get("user_bash")?.(
+      { command: "touch /outside/repeated", excludeFromContext: true },
+      ctx,
+    );
+    const result = await response.operations.exec("touch /outside/repeated", root, {
+      onData: () => undefined,
+      timeout: 5,
+      env: process.env,
+    });
+
+    assert.equal(result.exitCode, 1);
+    assert.equal(promptCount, 1);
+    assert.equal(attempt, 2);
+  } finally {
+    wrapMock.mock.restore();
+    resetMock.mock.restore();
+    managerMock.mock.restore();
     rmSync(root, { recursive: true, force: true });
   }
 });
