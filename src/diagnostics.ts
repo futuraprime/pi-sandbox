@@ -548,17 +548,69 @@ export function renderDiagnosticSummaryLines(data: SandboxDiagnosticBlockData): 
   ];
 }
 
+export const MAX_DEBUG_INCIDENTS = 5;
+
 export function formatCommandPreview(command: string): string {
   const squashed = command.replace(/\s+/g, " ").trim();
   return squashed.length <= 80 ? squashed : `${squashed.slice(0, 77)}...`;
 }
 
+/** Keep only incidents that contain useful sandbox attribution or a prompt. */
 export function retainIncident(incident: SandboxIncident): boolean {
   return incident.attributed || incident.promptShown;
 }
 
+/** Return incidents in chronological order, retaining the newest entries. */
 export function trimIncidents<T>(incidents: T[], max: number): T[] {
-  return incidents.length <= max ? incidents : incidents.slice(incidents.length - max);
+  const limit = Math.max(0, Math.floor(max));
+  return incidents.length <= limit ? incidents : incidents.slice(incidents.length - limit);
+}
+
+/**
+ * Store one incident in the caller-owned session history.
+ *
+ * This deliberately mutates only the supplied array: callers decide where the
+ * array lives, so history cannot accidentally become configuration state.
+ */
+export function recordIncident(
+  incidents: SandboxIncident[],
+  incident: SandboxIncident,
+  max = MAX_DEBUG_INCIDENTS,
+): boolean {
+  if (!retainIncident(incident)) return false;
+  incidents.push(incident);
+  incidents.splice(0, incidents.length, ...trimIncidents(incidents, max));
+  return true;
+}
+
+/** A bounded, memory-only incident history for one extension/session closure. */
+export class SandboxIncidentHistory {
+  private readonly incidents: SandboxIncident[] = [];
+  private readonly max: number;
+
+  constructor(max = MAX_DEBUG_INCIDENTS) {
+    this.max = Math.max(0, Math.floor(max));
+  }
+
+  record(incident: SandboxIncident): boolean {
+    return recordIncident(this.incidents, incident, this.max);
+  }
+
+  list(): SandboxIncident[] {
+    return [...this.incidents];
+  }
+
+  clear(): void {
+    this.incidents.length = 0;
+  }
+
+  get size(): number {
+    return this.incidents.length;
+  }
+}
+
+export function createIncidentHistory(max = MAX_DEBUG_INCIDENTS): SandboxIncidentHistory {
+  return new SandboxIncidentHistory(max);
 }
 
 export interface DiagnosticPolicyContext {

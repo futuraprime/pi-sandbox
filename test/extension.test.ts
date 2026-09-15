@@ -644,6 +644,60 @@ test("user_bash streams normal output once without diagnostic metadata", async (
   }
 });
 
+test("sandbox-debug retains five incidents in memory and resets on a new session", async () => {
+  const root = makeProjectTempDirectory("sandbox-debug-history");
+  const agentDir = join(root, "global-agent");
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => {
+    return "printf 'cat: /outside/debug-secret: Operation not permitted\\n' >&2; exit 1";
+  });
+
+  try {
+    const { pi, commands, handlers } = makePi();
+    extension(pi);
+    const notices: string[] = [];
+    const ctx = makeContext(root, notices);
+    ctx.hasUI = false;
+    await handlers.get("session_start")?.({}, ctx);
+
+    for (let index = 0; index < 6; index += 1) {
+      const response = await handlers.get("user_bash")?.(
+        { command: `cat /outside/debug-secret-${index}`, excludeFromContext: true },
+        ctx,
+      );
+      assert.ok(response?.operations);
+      await response.operations.exec(`cat /outside/debug-secret-${index}`, root, {
+        onData: () => undefined,
+        timeout: 5,
+        env: process.env,
+      });
+    }
+
+    await commands.get("sandbox-debug")?.("", ctx);
+    const debug = notices.at(-1) ?? "";
+    assert.match(debug, /Sandbox Debug/);
+    assert.match(debug, /debug-secret-5/);
+    assert.doesNotMatch(debug, /debug-secret-0/);
+    assert.match(debug, /Session-local/);
+    assert.equal(existsSync(join(root, ".pi", "sandbox.json")), false);
+    assert.equal(existsSync(join(agentDir, "sandbox.json")), false);
+
+    // A replacement session clears both history and session approvals without
+    // reading or writing a history file.
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("sandbox-debug")?.("", ctx);
+    assert.match(notices.at(-1) ?? "", /no attributed incidents/i);
+  } finally {
+    wrapMock.mock.restore();
+    managerMock.mock.restore();
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("user_bash shows a compact notice and sends raw diagnostic metadata invisibly", async () => {
   const root = makeProjectTempDirectory("user-bash-diagnostic");
   const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);

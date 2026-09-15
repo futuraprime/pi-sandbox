@@ -1,14 +1,14 @@
 import { isAbsolute, relative } from "node:path";
 
 import { SandboxManager } from "@carderne/sandbox-runtime";
-import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createBashToolDefinition,
   isBashToolResult,
   isToolCallEventType,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Key, Text } from "@earendil-works/pi-tui";
+import { Key, Text } from "@earendil-works/pi-tui";
 
 import { getConfigPaths, loadConfig } from "./config.ts";
 import {
@@ -21,12 +21,11 @@ import {
   parseDiagnosticBlock,
   parseFallbackDiagnosticFromOutput,
   parseViolationEvent,
+  recordIncident,
   renderDiagnosticBlock,
   renderDiagnosticNotice,
-  renderDiagnosticSummaryLines,
   selectPrimaryViolation,
   type SandboxDiagnostic,
-  type SandboxDiagnosticBlockData,
   type SandboxIncident,
 } from "./diagnostics.ts";
 import { runGitCommand, setGitUpstream } from "./git-upstream.ts";
@@ -57,8 +56,14 @@ import {
   supportsNodeEnvProxy,
 } from "./sandbox-runtime.ts";
 import {
+  formatSandboxDebug,
+  renderSandboxDiagnosticResult,
+  setSandboxStatus,
+  type DiagnosticResultDetails,
+  type SandboxStatusState,
+} from "./status.ts";
+import {
   formatSandboxConfiguration,
-  formatSandboxStatus,
   type PermissionPromptResult,
   promptDomainBlock,
   promptReadBlock,
@@ -119,65 +124,6 @@ function sandboxConfigMutationMessage(cwd: string): string {
   );
 }
 
-interface DiagnosticResultDetails {
-  sandboxDiagnostic?: SandboxDiagnosticBlockData;
-  sandboxVisibleText?: string;
-  truncation?: {
-    truncated: boolean;
-    totalLines?: number;
-    outputLines?: number;
-    outputBytes?: number;
-    truncatedBy?: "lines" | "bytes";
-    maxBytes?: number;
-  };
-  fullOutputPath?: string;
-}
-
-type DiagnosticTheme = ExtensionContext["ui"]["theme"];
-
-function renderSandboxDiagnosticResult(
-  result: { content?: Array<{ type: string; text?: string }>; details?: unknown },
-  expanded: boolean,
-  theme: DiagnosticTheme,
-): Container {
-  const details = (result.details ?? {}) as DiagnosticResultDetails;
-  const diagnostic = details.sandboxDiagnostic;
-  if (!diagnostic) return new Container();
-
-  const text = result.content?.find((content) => content.type === "text")?.text ?? "";
-  const visibleText = details.sandboxVisibleText ?? text;
-  const container = new Container();
-  container.addChild(
-    new Text(
-      `${theme.fg("warning", theme.bold("Sandbox intervention"))} ${theme.fg("muted", renderDiagnosticNotice(diagnostic))}`,
-      0,
-      0,
-    ),
-  );
-
-  if (!expanded) {
-    container.addChild(
-      new Text(theme.fg("dim", "Expand to view command output and full diagnostic details."), 0, 0),
-    );
-    return container;
-  }
-
-  const summary = renderDiagnosticSummaryLines(diagnostic)
-    .map((line) => theme.fg("dim", line))
-    .join("\n");
-  container.addChild(new Text(`\n${summary}`, 0, 0));
-  if (visibleText.trim()) {
-    container.addChild(new Text(`\n${theme.fg("toolOutput", visibleText.trim())}`, 0, 0));
-  }
-  const warnings: string[] = [];
-  if (details.fullOutputPath) warnings.push(`Full output: ${details.fullOutputPath}`);
-  if (details.truncation?.truncated) warnings.push("Output truncated");
-  if (warnings.length > 0) {
-    container.addChild(new Text(`\n${theme.fg("warning", `[${warnings.join(". ")}]`)}`, 0, 0));
-  }
-  return container;
-}
-
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("no-sandbox", {
     description: "Disable OS-level sandboxing for bash commands",
@@ -193,6 +139,9 @@ export default function (pi: ExtensionAPI) {
   let sandboxInitialized = false;
   let sandboxCwd: string | null = null;
   const allowances: SessionAllowances = { domains: [], readPaths: [], writePaths: [] };
+  // Session history intentionally lives in this extension closure. It is never
+  // serialized with either the project or global sandbox configuration.
+  const sandboxIncidents: SandboxIncident[] = [];
 
   const effectiveAllowances = (cwd: string) => resolveAllowances(loadConfig(cwd), allowances, cwd);
   const effectiveDomains = (cwd: string) => effectiveAllowances(cwd).domains;
@@ -303,6 +252,17 @@ export default function (pi: ExtensionAPI) {
     return "none";
   }
 
+  function storeIncident(incident: SandboxIncident): void {
+    recordIncident(sandboxIncidents, incident);
+  }
+
+  function resetSessionMemory(): void {
+    allowances.domains.length = 0;
+    allowances.readPaths.length = 0;
+    allowances.writePaths.length = 0;
+    sandboxIncidents.length = 0;
+  }
+
   async function promptForDiagnostic(
     ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
     diagnostic: SandboxDiagnostic,
@@ -346,6 +306,7 @@ export default function (pi: ExtensionAPI) {
     shellPath: string | undefined,
     recordDiagnosticInContext: boolean,
     onDetails?: (details: DiagnosticResultDetails | undefined) => void,
+    initialIncident?: SandboxIncident,
   ): ReturnType<typeof createSandboxedBashOps> {
     const baseOperations = createSandboxedBashOps(
       shellPath,
@@ -353,7 +314,7 @@ export default function (pi: ExtensionAPI) {
     );
     return {
       async exec(command, cwd, execOptions) {
-        const incident = incidentFor(source, command);
+        const incident = initialIncident ?? incidentFor(source, command);
         let lastPrompted: SandboxDiagnostic | undefined;
         let lastResult: { exitCode: number | null } = { exitCode: 1 };
         let visibleOutput = "";
@@ -439,6 +400,7 @@ export default function (pi: ExtensionAPI) {
             execOptions.onData(Buffer.from(`\n${block}\n`));
           }
         }
+        storeIncident(incident);
         return lastResult;
       },
     };
@@ -446,9 +408,9 @@ export default function (pi: ExtensionAPI) {
 
   function updateStatus(
     ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
-    config: ReturnType<typeof loadConfig>,
-  ) {
-    ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", formatSandboxStatus(config)));
+    state: SandboxStatusState,
+  ): void {
+    setSandboxStatus(ctx, state);
   }
 
   async function enableSandbox(
@@ -458,7 +420,7 @@ export default function (pi: ExtensionAPI) {
     if (sandboxEnabled) {
       if (sandboxInitialized && sandboxCwd !== ctx.cwd) {
         const refreshed = await refreshSandbox(ctx.cwd);
-        if (refreshed) updateStatus(ctx, loadConfig(ctx.cwd));
+        if (refreshed) updateStatus(ctx, "enabled");
         return refreshed;
       }
       ctx.ui.notify("Sandbox is already enabled", "info");
@@ -468,6 +430,7 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig(ctx.cwd);
     const platform = process.platform;
     if (platform !== "darwin" && platform !== "linux") {
+      updateStatus(ctx, "unsupported");
       ctx.ui.notify(`Sandbox not supported on ${platform}`, "warning");
       return false;
     }
@@ -481,12 +444,13 @@ export default function (pi: ExtensionAPI) {
       sandboxInitialized = true;
       sandboxCwd = ctx.cwd;
       warnIfAllDomainsAllowed(ctx, config);
-      updateStatus(ctx, config);
+      updateStatus(ctx, "enabled");
       return true;
     } catch (error) {
       sandboxEnabled = false;
       sandboxInitialized = false;
       sandboxCwd = null;
+      updateStatus(ctx, "error");
       ctx.ui.notify(
         `Sandbox initialization failed: ${error instanceof Error ? error.message : error}`,
         "error",
@@ -499,6 +463,7 @@ export default function (pi: ExtensionAPI) {
     ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
   ): Promise<boolean> {
     if (!sandboxEnabled) {
+      updateStatus(ctx, "disabled");
       ctx.ui.notify("Sandbox is already disabled", "info");
       return false;
     }
@@ -513,7 +478,7 @@ export default function (pi: ExtensionAPI) {
     sandboxEnabled = false;
     sandboxInitialized = false;
     sandboxCwd = null;
-    ctx.ui.setStatus("sandbox", "");
+    updateStatus(ctx, "disabled");
     return true;
   }
 
@@ -617,6 +582,8 @@ export default function (pi: ExtensionAPI) {
 
     const config = loadConfig(ctx.cwd);
     if (config.sandboxUserShell === false) return;
+    const incident = incidentFor("user_bash", event.command);
+    const recordDiagnosticInContext = !event.excludeFromContext;
     for (const domain of extractDomainsFromCommand(event.command)) {
       const domainPolicy = decideDomainPolicy(
         domain,
@@ -624,9 +591,27 @@ export default function (pi: ExtensionAPI) {
         config.network?.deniedDomains ?? [],
       );
       if (domainPolicy === "deny") {
+        const diagnostic: SandboxDiagnostic = {
+          type: "network",
+          target: domain,
+          rawTarget: domain,
+          rule: "deniedDomains",
+          promptable: false,
+          action: "blocked by deniedDomains; change policy",
+        };
+        incident.violations = addUniqueDiagnostics(incident.violations, [diagnostic]);
+        incident.primaryViolation = selectPrimaryViolation(incident.violations);
+        incident.attributed = true;
+        incident.finalOutcome = "failure";
+        const block = renderDiagnosticBlock(incident);
+        const data = getDiagnosticBlockData(incident);
+        if (recordDiagnosticInContext && block) {
+          pi.sendMessage({ customType: "sandbox-diagnostic", content: block, display: false });
+        }
+        storeIncident(incident);
         return {
           result: {
-            output: `Blocked: "${domain}" is denied by deniedDomains.`,
+            output: `Blocked: "${domain}" is denied by deniedDomains.${data ? `\n${renderDiagnosticNotice(data)}` : ""}`,
             exitCode: 1,
             cancelled: false,
             truncated: false,
@@ -634,23 +619,35 @@ export default function (pi: ExtensionAPI) {
         };
       }
       if (domainPolicy === "prompt") {
-        const choice = await promptDomainBlock(
-          pi,
-          ctx,
-          domain,
-          config.permissionPromptTimeoutSeconds,
-        );
-        if (choice.action === "abort") {
+        const diagnostic: SandboxDiagnostic = {
+          type: "network",
+          target: domain,
+          rawTarget: domain,
+          rule: "allowedDomains",
+          promptable: true,
+          action: "host not allowed; approve network access",
+        };
+        incident.violations = addUniqueDiagnostics(incident.violations, [diagnostic]);
+        incident.primaryViolation = selectPrimaryViolation(incident.violations);
+        incident.attributed = true;
+        const choice = await promptForDiagnostic(ctx, diagnostic, incident);
+        if (choice === "abort" || choice === "none") {
+          incident.finalOutcome = "failure";
+          const block = renderDiagnosticBlock(incident);
+          const data = getDiagnosticBlockData(incident);
+          if (recordDiagnosticInContext && block) {
+            pi.sendMessage({ customType: "sandbox-diagnostic", content: block, display: false });
+          }
+          storeIncident(incident);
           return {
             result: {
-              output: `Blocked: "${domain}" is not in allowedDomains. Use /sandbox to review your config.`,
+              output: `Blocked: "${domain}" is not in allowedDomains. Use /sandbox to review your config.${data ? `\n${renderDiagnosticNotice(data)}` : ""}`,
               exitCode: 1,
               cancelled: false,
               truncated: false,
             },
           };
         }
-        await applyChoice(choice.action, "domain", choice.value, ctx.cwd);
       }
     }
     return {
@@ -658,7 +655,9 @@ export default function (pi: ExtensionAPI) {
         ctx,
         "user_bash",
         userShellPath,
-        !event.excludeFromContext,
+        recordDiagnosticInContext,
+        undefined,
+        incident,
       ),
     };
   });
@@ -786,10 +785,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    // Approvals and incident history belong to this session only. Reset them
+    // before inspecting the new session's config; no file is involved.
+    resetSessionMemory();
+    updateStatus(ctx, "pending");
+
     if (pi.getFlag("no-sandbox") as boolean) {
       sandboxEnabled = false;
       sandboxInitialized = false;
       sandboxCwd = null;
+      updateStatus(ctx, "disabled");
       ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
       return;
     }
@@ -797,13 +802,14 @@ export default function (pi: ExtensionAPI) {
       sandboxEnabled = false;
       sandboxInitialized = false;
       sandboxCwd = null;
+      updateStatus(ctx, "disabled");
       ctx.ui.notify("Sandbox disabled via config", "info");
       return;
     }
     await enableSandbox(ctx, true);
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
     if (sandboxInitialized) {
       try {
         await SandboxManager.reset();
@@ -814,6 +820,10 @@ export default function (pi: ExtensionAPI) {
     sandboxEnabled = false;
     sandboxInitialized = false;
     sandboxCwd = null;
+    resetSessionMemory();
+    // session_shutdown receives the active context in normal extension
+    // lifecycles. The pure status contract remains usable when it does not.
+    if (ctx) updateStatus(ctx, "shutdown");
   });
 
   pi.registerShortcut(Key.alt("s"), {
@@ -832,6 +842,13 @@ export default function (pi: ExtensionAPI) {
     description: "Disable the sandbox for this session",
     handler: async (_args, ctx) => {
       if (await disableSandbox(ctx)) ctx.ui.notify("Sandbox disabled", "info");
+    },
+  });
+
+  pi.registerCommand("sandbox-debug", {
+    description: "Show recent sandbox incidents for bash and !cmd",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify(formatSandboxDebug(sandboxIncidents, { enabled: sandboxEnabled }), "info");
     },
   });
 
