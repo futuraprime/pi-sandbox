@@ -5,10 +5,14 @@
  * shell input or attempt to turn Bash into a general Git interface.
  */
 
+import { homedir } from "node:os";
+import { relative, resolve } from "node:path";
+
 import {
   canonicalizePath,
   decideDomainPolicy,
   decidePathPolicy,
+  matchesPattern,
   type PolicyDecision,
 } from "./policy.ts";
 
@@ -627,7 +631,12 @@ export function finalizeDiagnostic(
       rawTarget: target,
       rule: decision === "deny" ? "denyRead" : decision === "allow" ? "allowRead" : "allowRead",
       promptable: decision === "prompt",
-      action: actionForRead(target, decision, decision === "deny" ? "denyRead" : "allowRead"),
+      action: makeReadAction(
+        target,
+        decision,
+        decision === "deny" ? "denyRead" : "allowRead",
+        policy.cwd,
+      ),
     };
   }
   if (diagnostic.type === "write" && diagnostic.rawTarget) {
@@ -703,21 +712,147 @@ export function makeBrowserProcessFallbackDiagnostic(output: string): SandboxDia
   return makeBrowserProcessDiagnostic(service ?? CHROMIUM_MACH_SERVICE);
 }
 
+function isSshCommandSegment(words: ShellWords): boolean {
+  const index = skipWrapper(words);
+  const executable = executableName(words[index]);
+  if (executable === "ssh" || executable === "ssh-add") return true;
+  if (executable !== "git") return false;
+
+  let operation = index + 1;
+  const optionsWithValues = new Set([
+    "-C",
+    "-c",
+    "--config-env",
+    "--exec-path",
+    "--git-dir",
+    "--namespace",
+    "--super-prefix",
+    "--work-tree",
+  ]);
+  while (words[operation]?.startsWith("-")) {
+    const option = words[operation];
+    if (option === "--") return false;
+    operation += optionsWithValues.has(option) ? 2 : 1;
+  }
+  if (!/^(clone|fetch|pull|push|ls-remote)$/.test(words[operation] ?? "")) return false;
+
+  const args = words.slice(operation + 1);
+  if (args.some((word) => /^(?:ssh|git\+ssh):\/\//i.test(word))) return true;
+  if (args.some((word) => /^[^@\s]+@[^\s:]+:/.test(word))) return true;
+  if (args.some((word) => /^https?:\/\//i.test(word))) return false;
+  return true;
+}
+
 function clearlySshTargeted(command: string): boolean {
-  return shellCommandWords(command).some((words) => {
-    const index = skipWrapper(words);
-    const executable = executableName(words[index]);
-    if (executable === "ssh" || executable === "ssh-add") return true;
-    if (executable !== "git") return false;
-    let operation = index + 1;
-    while (words[operation]?.startsWith("-")) operation += 1;
-    if (!/^(clone|fetch|pull|push|ls-remote)$/.test(words[operation] ?? "")) return false;
-    const args = words.slice(operation + 1);
-    if (args.some((word) => /^(?:ssh|git\+ssh):\/\//i.test(word))) return true;
-    if (args.some((word) => /^[^@\s]+@[^\s:]+:/.test(word))) return true;
-    if (args.some((word) => /^https?:\/\//i.test(word))) return false;
-    return true;
-  });
+  return shellCommandWords(command).some(isSshCommandSegment);
+}
+
+/**
+ * Compound commands need an SSH-agent preflight because a later segment can
+ * inherit the agent environment after an earlier segment has changed state.
+ * A lone SSH command is left to the runtime/fallback diagnostic path.
+ */
+export function shouldPreflightSshAuth(command: string): boolean {
+  const segments = shellCommandWords(command);
+  return segments.length > 1 && segments.some(isSshCommandSegment);
+}
+
+/** Canonicalise a socket path while preserving unresolved descendants safely. */
+export function normaliseSocketPath(socketPath: string, cwd = process.cwd()): string {
+  const expanded =
+    socketPath === "~"
+      ? homedir()
+      : socketPath.startsWith("~/")
+        ? `${homedir()}${socketPath.slice(1)}`
+        : socketPath;
+  return canonicalizePath(resolve(cwd, expanded), cwd);
+}
+
+/** Match an exact socket path or a descendant without sibling-prefix matches. */
+export function socketPathMatches(
+  allowedSocket: string,
+  socketPath: string,
+  cwd = process.cwd(),
+): boolean {
+  const relativePath = relative(
+    normaliseSocketPath(allowedSocket, cwd),
+    normaliseSocketPath(socketPath, cwd),
+  );
+  return relativePath === "" || (!relativePath.startsWith("..") && !relativePath.startsWith("/"));
+}
+
+export async function grantSshSessionAccess(options: {
+  socketPath: string;
+  allowedSockets: string[];
+  reinitialize: () => Promise<boolean>;
+  platform?: NodeJS.Platform;
+}): Promise<boolean> {
+  const { socketPath, allowedSockets, reinitialize, platform = process.platform } = options;
+  if (platform === "linux") return false;
+
+  const added = !allowedSockets.some((allowedSocket) =>
+    socketPathMatches(allowedSocket, socketPath),
+  );
+  const addedIndex = added ? allowedSockets.push(socketPath) - 1 : -1;
+  try {
+    if (await reinitialize()) return true;
+  } catch {
+    // Reinitialisation failures deny the grant and must not leak session state.
+  }
+  if (added && allowedSockets[addedIndex] === socketPath) allowedSockets.splice(addedIndex, 1);
+  return false;
+}
+
+export async function runSshAuthPreflight(options: {
+  command: string;
+  sshAuthSock?: string;
+  allowedSockets: string[];
+  allowAllSockets: boolean;
+  requestAccess: (socketPath: string) => Promise<boolean>;
+  platform?: NodeJS.Platform;
+}): Promise<"not-needed" | "allowed" | "blocked"> {
+  const {
+    command,
+    sshAuthSock,
+    allowedSockets,
+    allowAllSockets,
+    requestAccess,
+    platform = process.platform,
+  } = options;
+  if (!sshAuthSock || !shouldPreflightSshAuth(command) || allowAllSockets) return "not-needed";
+  if (platform === "linux") return "blocked";
+  if (allowedSockets.some((allowedSocket) => socketPathMatches(allowedSocket, sshAuthSock))) {
+    return "not-needed";
+  }
+  return (await requestAccess(sshAuthSock)) ? "allowed" : "blocked";
+}
+
+const AUTH_ADJACENT_READ_PATTERNS = [
+  "~/.ssh",
+  "~/.gitconfig",
+  "~/.git-credentials",
+  "~/.config/gh",
+  "~/.config/git",
+];
+
+/** Identify auth-adjacent files without suggesting broad private-key reads. */
+export function isAuthAdjacentReadPath(filePath: string, cwd = process.cwd()): boolean {
+  const canonical = canonicalizePath(filePath, cwd);
+  return AUTH_ADJACENT_READ_PATTERNS.some((pattern) =>
+    matchesPattern(canonical, [pattern], cwd),
+  );
+}
+
+function makeReadAction(
+  filePath: string,
+  decision: PolicyDecision,
+  rule: string,
+  cwd = process.cwd(),
+): string {
+  if (isAuthAdjacentReadPath(filePath, cwd)) {
+    return "prefer SSH agent delegation; avoid broad allowRead";
+  }
+  return actionForRead(filePath, decision, rule);
 }
 
 export function makeSshAgentFallbackDiagnostic(
@@ -771,7 +906,7 @@ export function parseViolationEvent(
         rawTarget: target,
         rule: "allowRead",
         promptable: true,
-        action: "allow and retry",
+        action: makeReadAction(target, "prompt", "allowRead"),
       };
     }
   }
@@ -813,8 +948,16 @@ export function parseViolationEvent(
 }
 
 function extractOperationNotPermittedPath(output: string): string | null {
-  const match = output.match(/(?:^|\s)(\/(?:[^\s:'"]+))(?:\s|:|$).*Operation not permitted/im);
-  return match?.[1] ?? null;
+  const patterns = [
+    /(?:^|\s)(\/(?:[^\s:'"]+))(?:\s|:|$).*Operation not permitted/im,
+    /(?:Load key|Could not open)\s+"([^"]+)":\s*Operation not permitted/i,
+    /\bopen\s+([^:]+):\s*Operation not permitted/i,
+  ];
+  for (const pattern of patterns) {
+    const match = output.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+  return null;
 }
 
 /** Attribute a runtime failure when the platform did not provide an event. */
@@ -851,7 +994,9 @@ export function parseFallbackDiagnosticFromOutput(
       rawTarget: blockedPath,
       rule: looksLikeRead ? "allowRead" : "allowWrite",
       promptable: !looksLikeRead,
-      action: looksLikeRead ? "read access blocked; change policy" : "allow and retry",
+      action: looksLikeRead
+        ? makeReadAction(blockedPath, "deny", "denyRead")
+        : "allow and retry",
     };
   }
 

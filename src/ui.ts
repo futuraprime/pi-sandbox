@@ -9,7 +9,7 @@ import {
 import { allowsAllDomains, domainIsAllowed, matchesPattern } from "./policy.ts";
 import { type SessionAllowances } from "./sandbox-runtime.ts";
 
-export type PermissionChoice = "abort" | "session" | "project" | "global";
+export type PermissionChoice = "abort" | "session" | "project" | "global" | "ssh-session";
 
 export interface PermissionPromptResult {
   action: PermissionChoice;
@@ -72,13 +72,14 @@ export async function showPermissionPrompt(
   originalValue: string,
   validateValue: (value: string) => string | null,
   timeoutSeconds?: number,
+  promptOptions: PromptOption[] = permissionOptions(ctx.cwd),
 ): Promise<PermissionPromptResult> {
   if (!ctx.hasUI) return { action: "abort", value: originalValue };
 
   pi.events.emit("request-attention", { message: "Sandbox permission required" });
 
   const timeoutMs = permissionPromptTimeoutMs(timeoutSeconds);
-  const options = permissionOptions(ctx.cwd);
+  const options = promptOptions;
   const result = await ctx.ui.custom<PermissionPromptResult>((tui, theme, _kb, done) => {
     const input = new Input();
     let selectedIndex = 0;
@@ -109,7 +110,8 @@ export async function showPermissionPrompt(
     };
 
     const selectedOption = (): PromptOption => options[selectedIndex] ?? options[0]!;
-    const isAllowOption = (option: PromptOption): boolean => option.action !== "abort";
+    const isAllowOption = (option: PromptOption): boolean =>
+      option.action !== "abort" && option.action !== "ssh-session";
     const updateFocus = (): void => {
       input.focused = componentFocused && editing;
     };
@@ -346,6 +348,25 @@ export function promptWriteBlock(
   );
 }
 
+export function promptSshAuthBlock(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  timeoutSeconds?: number,
+): Promise<PermissionPromptResult> {
+  return showPermissionPrompt(
+    pi,
+    ctx,
+    "🔐 SSH auth blocked: allow SSH use for this session?",
+    "SSH agent",
+    () => null,
+    timeoutSeconds,
+    [
+      { label: "Allow SSH use for this session", key: "s", action: "ssh-session" },
+      { label: "Abort (keep blocked)", key: "esc", action: "abort" },
+    ],
+  );
+}
+
 export function warnIfAllDomainsAllowed(ctx: ExtensionContext, config: SandboxConfig): void {
   if (!allowsAllDomains(config.network?.allowedDomains)) return;
   ctx.ui.notify(
@@ -380,6 +401,14 @@ export function formatSandboxConfiguration(
       : []),
     `  Denied domains:  ${config.network?.deniedDomains?.join(", ") || "(none)"}`,
     ...(allowances.domains.length ? [`  Session allowed: ${allowances.domains.join(", ")}`] : []),
+    ...(config.network?.allowUnixSockets?.length
+      ? [`  Allow sockets:   ${config.network.allowUnixSockets.join(", ")}`]
+      : []),
+    ...((allowances.unixSockets ?? allowances.allowUnixSockets ?? []).length
+      ? [
+          `  Session sockets: ${(allowances.unixSockets ?? allowances.allowUnixSockets ?? []).join(", ")}`,
+        ]
+      : []),
     "",
     "Filesystem (bash + read/write/edit tools):",
     `  Deny Read:   ${config.filesystem?.denyRead?.join(", ") || "(none)"}`,

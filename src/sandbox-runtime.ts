@@ -10,7 +10,7 @@ import {
 import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-agent";
 
 import { type SandboxConfig } from "./config.ts";
-import { canonicalizePathPattern, decideDomainPolicy } from "./policy.ts";
+import { canonicalizePath, canonicalizePathPattern, decideDomainPolicy } from "./policy.ts";
 import { getProtectedSandboxConfigPaths } from "./sandbox-command.ts";
 import { getEffectiveFilesystemPolicy } from "./sandbox-filesystem.ts";
 
@@ -18,12 +18,17 @@ export interface SessionAllowances {
   domains: string[];
   readPaths: string[];
   writePaths: string[];
+  /** Session-only, path-scoped Unix-socket allowances (macOS only). */
+  unixSockets?: string[];
+  /** Compatibility spelling for callers that mirror the runtime config key. */
+  allowUnixSockets?: string[];
 }
 
 export interface EffectiveAllowances {
   domains: string[];
   readPaths: string[];
   writePaths: string[];
+  unixSockets: string[];
 }
 
 function unique(values: string[]): string[] {
@@ -35,6 +40,9 @@ const canonicalizeFilesystemPattern = (path: string, cwd: string) =>
 
 const canonicalizeFilesystemPatterns = (paths: string[], cwd = process.cwd()) =>
   unique(paths.map((path) => canonicalizeFilesystemPattern(path, cwd)));
+
+const canonicalizeSocketPaths = (paths: string[], cwd = process.cwd()) =>
+  unique(paths.map((path) => canonicalizePath(path, cwd)));
 
 function sandboxRuntimeReadPaths(platform: NodeJS.Platform): string[] {
   if (platform !== "linux") return [];
@@ -55,6 +63,7 @@ export function resolveAllowances(
     allowWrite: allowances?.writePaths,
   });
   const writePaths = unique(filesystem.allowWrite);
+  const sessionSockets = allowances?.unixSockets ?? allowances?.allowUnixSockets ?? [];
 
   return {
     domains: unique([...(config.network?.allowedDomains ?? []), ...(allowances?.domains ?? [])]),
@@ -62,6 +71,10 @@ export function resolveAllowances(
     // allowances also expand reads, while keeping linked metadata derived.
     readPaths: unique([...filesystem.allowRead, ...writePaths]),
     writePaths,
+    unixSockets: canonicalizeSocketPaths(
+      [...(config.network?.allowUnixSockets ?? []), ...sessionSockets],
+      cwd,
+    ),
   };
 }
 
@@ -88,6 +101,7 @@ export function buildRuntimeConfig(
       allowedDomains: [],
       deniedDomains: [],
       strictAllowlist: false,
+      allowUnixSockets: effective.unixSockets,
     },
     filesystem: {
       disabled: config.filesystem?.disabled,

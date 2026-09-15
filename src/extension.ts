@@ -24,6 +24,8 @@ import {
   recordIncident,
   renderDiagnosticBlock,
   renderDiagnosticNotice,
+  runSshAuthPreflight,
+  grantSshSessionAccess,
   selectPrimaryViolation,
   type SandboxDiagnostic,
   type SandboxIncident,
@@ -67,6 +69,7 @@ import {
   type PermissionPromptResult,
   promptDomainBlock,
   promptReadBlock,
+  promptSshAuthBlock,
   promptWriteBlock,
   warnIfAllDomainsAllowed,
 } from "./ui.ts";
@@ -124,7 +127,13 @@ function sandboxConfigMutationMessage(cwd: string): string {
   );
 }
 
-export default function (pi: ExtensionAPI) {
+export interface SandboxExtensionOptions {
+  /** Injectable platform seam for portable SSH preflight contracts. */
+  platform?: NodeJS.Platform;
+}
+
+export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}) {
+  const platform = options.platform ?? process.platform;
   pi.registerFlag("no-sandbox", {
     description: "Disable OS-level sandboxing for bash commands",
     type: "boolean",
@@ -138,7 +147,12 @@ export default function (pi: ExtensionAPI) {
   let sandboxEnabled = false;
   let sandboxInitialized = false;
   let sandboxCwd: string | null = null;
-  const allowances: SessionAllowances = { domains: [], readPaths: [], writePaths: [] };
+  const allowances: SessionAllowances = {
+    domains: [],
+    readPaths: [],
+    writePaths: [],
+    unixSockets: [],
+  };
   // Session history intentionally lives in this extension closure. It is never
   // serialized with either the project or global sandbox configuration.
   const sandboxIncidents: SandboxIncident[] = [];
@@ -147,6 +161,7 @@ export default function (pi: ExtensionAPI) {
   const effectiveDomains = (cwd: string) => effectiveAllowances(cwd).domains;
   const effectiveReadPaths = (cwd: string) => effectiveAllowances(cwd).readPaths;
   const effectiveWritePaths = (cwd: string) => effectiveAllowances(cwd).writePaths;
+  const effectiveUnixSockets = (cwd: string) => effectiveAllowances(cwd).unixSockets;
 
   async function refreshSandbox(cwd: string): Promise<boolean> {
     if (!sandboxInitialized) return true;
@@ -200,6 +215,12 @@ export default function (pi: ExtensionAPI) {
     if (values.includes(value)) return false;
     values.push(value);
     return true;
+  }
+
+  function sessionUnixSockets(): string[] {
+    if (allowances.unixSockets) return allowances.unixSockets;
+    allowances.unixSockets = [];
+    return allowances.unixSockets;
   }
 
   function projectRuleValue(value: string, cwd: string): string {
@@ -264,19 +285,99 @@ export default function (pi: ExtensionAPI) {
     allowances.domains.length = 0;
     allowances.readPaths.length = 0;
     allowances.writePaths.length = 0;
+    allowances.unixSockets?.splice(0, allowances.unixSockets.length);
     resetIncidentHistory();
+  }
+
+  async function applySshAuthChoice(socketPath: string, cwd: string): Promise<boolean> {
+    return grantSshSessionAccess({
+      socketPath,
+      allowedSockets: sessionUnixSockets(),
+      reinitialize: async () => {
+        await reinitializeSandbox(loadConfig(cwd), allowances, cwd);
+        sandboxCwd = cwd;
+        return true;
+      },
+      platform,
+    });
+  }
+
+  async function requestSshAuthAccess(
+    ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
+    socketPath: string,
+  ): Promise<"abort" | "ssh-session" | "none"> {
+    if (platform === "linux") return "none";
+    const choice = await promptSshAuthBlock(
+      pi,
+      ctx,
+      loadConfig(ctx.cwd).permissionPromptTimeoutSeconds,
+    );
+    if (choice.action !== "ssh-session") {
+      return choice.action === "abort" ? "abort" : "none";
+    }
+    if (await applySshAuthChoice(socketPath, ctx.cwd)) return "ssh-session";
+    ctx.ui.notify("Failed to reinitialise the sandbox; SSH-agent access was not granted.", "error");
+    return "none";
+  }
+
+  function sshDiagnostic(socketPath: string, promptable = true): SandboxDiagnostic {
+    return {
+      type: "ssh-auth",
+      target: "current SSH agent",
+      rawTarget: socketPath,
+      rule: "ssh agent socket blocked",
+      promptable,
+      action:
+        platform === "linux"
+          ? "path-scoped SSH-agent access is unavailable on Linux; agent remains blocked"
+          : "allow SSH use for this session",
+    };
+  }
+
+  async function runSshPreflight(
+    ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
+    command: string,
+    incident: SandboxIncident,
+  ): Promise<"not-needed" | "allowed" | "blocked"> {
+    const config = loadConfig(ctx.cwd);
+    const sshAuthSock = process.env.SSH_AUTH_SOCK;
+    const result = await runSshAuthPreflight({
+      command,
+      sshAuthSock,
+      allowedSockets: effectiveUnixSockets(ctx.cwd),
+      allowAllSockets: config.network?.allowAllUnixSockets === true,
+      platform,
+      requestAccess: async (socketPath) => {
+        const diagnostic = sshDiagnostic(socketPath);
+        incident.violations = addUniqueDiagnostics(incident.violations, [diagnostic]);
+        incident.primaryViolation = selectPrimaryViolation(incident.violations);
+        incident.attributed = true;
+        const choice = await promptForDiagnostic(ctx, diagnostic, incident);
+        return choice === "ssh-session";
+      },
+    });
+    if (result === "blocked" && sshAuthSock) {
+      const diagnostic = sshDiagnostic(sshAuthSock, platform !== "linux");
+      incident.violations = addUniqueDiagnostics(incident.violations, [diagnostic]);
+      incident.primaryViolation = selectPrimaryViolation(incident.violations);
+      incident.attributed = true;
+    }
+    return result;
   }
 
   async function promptForDiagnostic(
     ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
     diagnostic: SandboxDiagnostic,
     incident: SandboxIncident,
-  ): Promise<"abort" | "session" | "project" | "global" | "none"> {
+  ): Promise<"abort" | "session" | "project" | "global" | "ssh-session" | "none"> {
     if (
       !ctx.hasUI ||
       !diagnostic.promptable ||
       incident.promptCount >= 2 ||
-      (diagnostic.type !== "network" && diagnostic.type !== "read" && diagnostic.type !== "write")
+      (diagnostic.type !== "network" &&
+        diagnostic.type !== "read" &&
+        diagnostic.type !== "write" &&
+        diagnostic.type !== "ssh-auth")
     ) {
       return "none";
     }
@@ -285,6 +386,13 @@ export default function (pi: ExtensionAPI) {
     incident.promptCount += 1;
     const timeout = loadConfig(ctx.cwd).permissionPromptTimeoutSeconds;
     const target = diagnostic.rawTarget ?? diagnostic.target;
+    if (diagnostic.type === "ssh-auth") {
+      const choice = await requestSshAuthAccess(ctx, target);
+      incident.promptChoice = choice;
+      incident.configMutation = mutationForChoice(choice);
+      return choice;
+    }
+
     const choice =
       diagnostic.type === "network"
         ? await promptDomainBlock(pi, ctx, target, timeout)
@@ -324,6 +432,33 @@ export default function (pi: ExtensionAPI) {
         let visibleOutput = "";
 
         for (;;) {
+          const sshPreflight = await runSshPreflight(ctx, command, incident);
+          if (sshPreflight === "blocked") {
+            incident.finalOutcome = "failure";
+            const reason =
+              platform === "linux"
+                ? "Blocked: path-specific SSH-agent access is unavailable on Linux; agent access remains blocked."
+                : "Blocked: SSH agent access is not allowed.";
+            const block = renderDiagnosticBlock(incident);
+            const blockData = getDiagnosticBlockData(incident);
+            const visibleText = blockData ? `${reason}\n${renderDiagnosticNotice(blockData)}` : reason;
+            onDetails?.(
+              blockData
+                ? { sandboxDiagnostic: blockData, sandboxVisibleText: visibleText }
+                : undefined,
+            );
+            if (source === "user_bash" && blockData) {
+              if (recordDiagnosticInContext && block) {
+                pi.sendMessage({ customType: "sandbox-diagnostic", content: block, display: false });
+              }
+              execOptions.onData(Buffer.from(`\n${renderDiagnosticNotice(blockData)}\n`));
+            } else {
+              execOptions.onData(Buffer.from(`\n${reason}\n${block ?? ""}\n`));
+            }
+            storeIncident(incident);
+            return { exitCode: 1 };
+          }
+
           let output = "";
           const store = SandboxManager.getSandboxViolationStore();
           const beforeCount = store.getViolationsForCommand(command).length;
@@ -433,7 +568,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     const config = loadConfig(ctx.cwd);
-    const platform = process.platform;
     if (platform !== "darwin" && platform !== "linux") {
       updateStatus(ctx, "unsupported");
       ctx.ui.notify(`Sandbox not supported on ${platform}`, "warning");
@@ -589,6 +723,27 @@ export default function (pi: ExtensionAPI) {
     if (config.sandboxUserShell === false) return;
     const incident = incidentFor("user_bash", event.command);
     const recordDiagnosticInContext = !event.excludeFromContext;
+    const sshPreflight = await runSshPreflight(ctx, event.command, incident);
+    if (sshPreflight === "blocked") {
+      incident.finalOutcome = "failure";
+      const block = renderDiagnosticBlock(incident);
+      const data = getDiagnosticBlockData(incident);
+      if (recordDiagnosticInContext && block) {
+        pi.sendMessage({ customType: "sandbox-diagnostic", content: block, display: false });
+      }
+      const reason =
+        platform === "linux"
+          ? "Blocked: path-specific SSH-agent access is unavailable on Linux; agent access remains blocked."
+          : "Blocked: SSH agent access is not allowed.";
+      return {
+        result: {
+          output: `${reason}${data ? `\n${renderDiagnosticNotice(data)}` : ""}`,
+          exitCode: 1,
+          cancelled: false,
+          truncated: false,
+        },
+      };
+    }
     for (const domain of extractDomainsFromCommand(event.command)) {
       const domainPolicy = decideDomainPolicy(
         domain,
@@ -705,6 +860,25 @@ export default function (pi: ExtensionAPI) {
     const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
 
     if (sandboxInitialized && isToolCallEventType("bash", event)) {
+      const sshPreflight = await runSshAuthPreflight({
+        command: event.input.command,
+        sshAuthSock: process.env.SSH_AUTH_SOCK,
+        allowedSockets: effectiveUnixSockets(ctx.cwd),
+        allowAllSockets: config.network?.allowAllUnixSockets === true,
+        platform,
+        requestAccess: async (socketPath) =>
+          (await requestSshAuthAccess(ctx, socketPath)) === "ssh-session",
+      });
+      if (sshPreflight === "blocked") {
+        return {
+          block: true,
+          reason:
+            platform === "linux"
+              ? "SSH-agent access is blocked: path-scoped access is unavailable on Linux."
+              : "SSH-agent access is blocked for this session.",
+        };
+      }
+
       for (const domain of extractDomainsFromCommand(event.input.command)) {
         const domainPolicy = decideDomainPolicy(
           domain,
@@ -766,7 +940,13 @@ export default function (pi: ExtensionAPI) {
         allowWrite: effectiveWritePaths(ctx.cwd),
         denyWrite: config.filesystem?.denyWrite ?? [],
         cwd: ctx.cwd,
-        prompt: (path) => promptWriteBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds),
+        prompt: async (path) => {
+          const choice = await promptWriteBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds);
+          return choice as {
+            action: "abort" | "session" | "project" | "global";
+            value: string;
+          };
+        },
         saveWritePermission: (choice, value) => applyChoice(choice, "write", value, ctx.cwd),
       });
       if (writePermission.action === "deny") {
