@@ -759,6 +759,73 @@ test("user_bash streams normal output once without diagnostic metadata", async (
   }
 });
 
+test("domain policy blocks a compound SSH command before SSH-agent approval", async () => {
+  const root = makeProjectTempDirectory("ssh-domain-policy");
+  mkdirSync(join(root, ".pi"), { recursive: true });
+  writeFileSync(
+    join(root, ".pi", "sandbox.json"),
+    JSON.stringify({
+      network: {
+        allowedDomains: ["approved.example"],
+        deniedDomains: ["denied.example"],
+      },
+    }),
+  );
+  const socketPath = join(root, "agent.sock");
+  const originalSocket = process.env.SSH_AUTH_SOCK;
+  process.env.SSH_AUTH_SOCK = socketPath;
+  const initialized: unknown[] = [];
+  const managerMock = mock.method(SandboxManager, "initialize", async (config: unknown) => {
+    initialized.push(config);
+  });
+  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => {
+    throw new Error("domain policy should block before wrapped execution");
+  });
+
+  try {
+    const { pi, handlers, sentMessages } = makePi();
+    extension(pi, { platform: "darwin" });
+    const ctx = makeContext(root, []);
+    let promptCount = 0;
+    (ctx.ui as any).custom = () => {
+      promptCount += 1;
+      throw new Error("denied SSH domain must not prompt for SSH-agent access");
+    };
+
+    await handlers.get("session_start")?.({}, ctx);
+    const response = await handlers.get("user_bash")?.(
+      { command: "ssh denied.example; printf should-not-run", excludeFromContext: false },
+      ctx,
+    );
+
+    assert.ok(response?.result);
+    assert.equal(response.result.exitCode, 1);
+    assert.equal(response.operations, undefined);
+    assert.match(response.result.output, /denied\.example/);
+    assert.match(response.result.output, /deniedDomains/);
+    assert.equal(promptCount, 0);
+    assert.equal(resetMock.mock.callCount(), 0);
+    assert.equal(wrapMock.mock.callCount(), 0);
+    assert.equal(initialized.length, 1);
+    assert.equal(
+      (
+        (initialized[0] as { network?: { allowUnixSockets?: string[] } }).network
+          ?.allowUnixSockets ?? []
+      ).includes(socketPath),
+      false,
+    );
+    assert.equal(sentMessages.length, 1);
+  } finally {
+    wrapMock.mock.restore();
+    resetMock.mock.restore();
+    managerMock.mock.restore();
+    if (originalSocket === undefined) delete process.env.SSH_AUTH_SOCK;
+    else process.env.SSH_AUTH_SOCK = originalSocket;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("macOS SSH preflight grants session access only during diagnostic execution", async () => {
   const root = makeProjectTempDirectory("ssh-preflight-grant");
   allowSshTestDomain(root);
