@@ -7,6 +7,7 @@ import {
   permissionOptions,
   permissionPromptRemainingSeconds,
   permissionPromptTimeoutMs,
+  promptSshAuthBlock,
   showPermissionPrompt,
 } from "../src/ui.ts";
 
@@ -40,6 +41,20 @@ test("permissionPromptRemainingSeconds rounds up and stops at zero", () => {
   assert.equal(permissionPromptRemainingSeconds(deadlineMs, 9_999), 1);
   assert.equal(permissionPromptRemainingSeconds(deadlineMs, 10_000), 0);
   assert.equal(permissionPromptRemainingSeconds(deadlineMs, 11_000), 0);
+});
+
+test("SSH prompts expose only abort and ssh-session results", async () => {
+  const pi = { events: { emit: () => undefined } } as unknown as ExtensionAPI;
+  const ctx = {
+    cwd: "/workspace",
+    hasUI: true,
+    ui: {
+      custom: async () => ({ action: "ssh-session", value: "SSH agent" }),
+    },
+  } as unknown as ExtensionContext;
+
+  const result = await promptSshAuthBlock(pi, ctx);
+  assert.deepEqual(result, { action: "ssh-session", value: "SSH agent" });
 });
 
 test(

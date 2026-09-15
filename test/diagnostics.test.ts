@@ -1,3 +1,6 @@
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import assert from "node:assert/strict";
@@ -9,14 +12,19 @@ import {
   isMateriallyDifferent,
   makeBrowserProcessFallbackDiagnostic,
   makeBrowserProcessViolationDiagnostic,
+  grantSshSessionAccess,
   makeSshAgentFallbackDiagnostic,
+  normaliseSocketPath,
   parseDiagnosticBlock,
   parseFallbackDiagnosticFromOutput,
   parseViolationEvent,
   renderDiagnosticBlock,
   renderDiagnosticNotice,
   renderDiagnosticSummaryLines,
+  runSshAuthPreflight,
   selectPrimaryViolation,
+  shouldPreflightSshAuth,
+  socketPathMatches,
   type SandboxDiagnostic,
   type SandboxIncident,
 } from "../src/diagnostics.ts";
@@ -80,6 +88,109 @@ test("leaves ordinary operations and quoted prose alone", () => {
   }
 });
 
+test("detects only compound SSH commands for preflight", () => {
+  assert.equal(shouldPreflightSshAuth("ssh host"), false);
+  assert.equal(shouldPreflightSshAuth("ssh host; printf done"), true);
+  assert.equal(shouldPreflightSshAuth("printf done && git fetch git@example.com:repo"), true);
+  assert.equal(shouldPreflightSshAuth("printf 'ssh host; echo text'"), false);
+  assert.equal(shouldPreflightSshAuth("git clone https://example.com/repo"), false);
+});
+
+test("matches canonical socket scopes exactly and across descendants", () => {
+  const root = mkdtempSync(join(process.cwd(), ".pi-sandbox-socket-"));
+  const symlinkRoot = `${root}-link`;
+  symlinkSync(root, symlinkRoot, "dir");
+  try {
+    const scope = join(symlinkRoot, "run");
+    mkdirSync(scope);
+    const existing = join(scope, "agent.sock");
+    const nonexistent = join(scope, "new", "descendant.sock");
+    const canonicalExisting = normaliseSocketPath(existing);
+    assert.equal(normaliseSocketPath(`${scope}/../run/agent.sock`), canonicalExisting);
+    assert.equal(socketPathMatches(scope, existing), true);
+    assert.equal(socketPathMatches(scope, nonexistent), true);
+    assert.equal(socketPathMatches(existing, existing), true);
+    assert.equal(socketPathMatches(scope, `${symlinkRoot}/runtime`), false);
+    assert.equal(socketPathMatches(`${scope}-sibling`, existing), false);
+  } finally {
+    rmSync(symlinkRoot, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rolls back only a transactional macOS SSH allowance", async () => {
+  const root = mkdtempSync(join(process.cwd(), ".pi-sandbox-ssh-grant-"));
+  try {
+    const allowedSockets = [join(root, "existing.sock")];
+    const requested = join(root, "new", "agent.sock");
+    let reinitializations = 0;
+    const denied = await grantSshSessionAccess({
+      socketPath: requested,
+      allowedSockets,
+      cwd: root,
+      platform: "darwin",
+      reinitialize: async () => {
+        reinitializations += 1;
+        return false;
+      },
+    });
+    assert.equal(denied, false);
+    assert.equal(reinitializations, 1);
+    assert.deepEqual(allowedSockets, [join(root, "existing.sock")]);
+
+    const thrown = await grantSshSessionAccess({
+      socketPath: requested,
+      allowedSockets,
+      cwd: root,
+      platform: "darwin",
+      reinitialize: async () => {
+        throw new Error("refresh failed");
+      },
+    });
+    assert.equal(thrown, false);
+    assert.deepEqual(allowedSockets, [join(root, "existing.sock")]);
+
+    const existingDescendant = await grantSshSessionAccess({
+      socketPath: join(root, "existing.sock", "child"),
+      allowedSockets,
+      cwd: root,
+      platform: "darwin",
+      reinitialize: async () => true,
+    });
+    assert.equal(existingDescendant, true);
+    assert.deepEqual(allowedSockets, [join(root, "existing.sock")]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed for Linux SSH preflight and fallback diagnostics", async () => {
+  let requested = false;
+  assert.equal(
+    await runSshAuthPreflight({
+      command: "ssh host; echo done",
+      sshAuthSock: "/tmp/agent.sock",
+      allowedSockets: [],
+      allowAllSockets: false,
+      platform: "linux",
+      requestAccess: async () => {
+        requested = true;
+        return true;
+      },
+    }),
+    "blocked",
+  );
+  assert.equal(requested, false);
+  const diagnostic = makeSshAgentFallbackDiagnostic(
+    "/tmp/agent.sock",
+    "ssh host",
+    "Permission denied (publickey).",
+    "linux",
+  );
+  assert.equal(diagnostic?.promptable, false);
+  assert.doesNotMatch(diagnostic?.action ?? "", /allowAllUnixSockets/);
+});
+
 test("parses structured read, write, network, SSH-agent, browser, and ambiguous events", () => {
   assert.deepEqual(parseViolationEvent({ line: 'deny file-read-data "/project/read.txt"' }), {
     type: "read",
@@ -141,6 +252,33 @@ test("reclassifies structured and fallback targets through shared policy precede
   );
   assert.equal(deniedDomain.rule, "deniedDomains");
   assert.equal(deniedDomain.promptable, false);
+});
+
+test("uses safe read guidance for SSH and Git credential paths", () => {
+  const authPaths = [
+    join(homedir(), ".ssh", "id_ed25519"),
+    join(homedir(), ".ssh", "config"),
+    join(homedir(), ".git-credentials"),
+    join(homedir(), ".config", "gh", "hosts.yml"),
+  ];
+
+  for (const authPath of authPaths) {
+    const structured = parseViolationEvent({ line: `deny file-read-data "${authPath}"` });
+    const fallback = parseFallbackDiagnosticFromOutput(
+      `cat "${authPath}"`,
+      `cat: ${authPath}: Operation not permitted`,
+      undefined,
+    );
+
+    assert.equal(structured.action, "prefer SSH agent delegation; avoid broad allowRead");
+    assert.equal(fallback?.action, "prefer SSH agent delegation; avoid broad allowRead");
+    assert.doesNotMatch(`${structured.action}\n${fallback?.action}`, /allow and retry/i);
+  }
+
+  assert.equal(
+    parseViolationEvent({ line: 'deny file-read-data "/project/read.txt"' }).action,
+    "allow and retry",
+  );
 });
 
 test("selects promptable violations by type priority and detects changed retry targets", () => {

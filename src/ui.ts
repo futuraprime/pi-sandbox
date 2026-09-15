@@ -9,17 +9,19 @@ import {
 import { allowsAllDomains, domainIsAllowed, matchesPattern } from "./policy.ts";
 import { type SessionAllowances } from "./sandbox-runtime.ts";
 
-export type PermissionChoice = "abort" | "session" | "project" | "global" | "ssh-session";
+export type PermissionChoice = "abort" | "session" | "project" | "global";
+export type SshPermissionChoice = "abort" | "ssh-session";
+type PromptAction = PermissionChoice | SshPermissionChoice;
 
-export interface PermissionPromptResult {
-  action: PermissionChoice;
+export interface PermissionPromptResult<Action extends PromptAction = PermissionChoice> {
+  action: Action;
   value: string;
 }
 
-interface PromptOption {
+interface PromptOption<Action extends PromptAction = PromptAction> {
   label: string;
   key: string;
-  action: PermissionChoice;
+  action: Action;
   confirm?: boolean;
   hint?: string;
 }
@@ -43,7 +45,7 @@ export function permissionPromptRemainingSeconds(deadlineMs: number, nowMs = Dat
   return Math.max(0, Math.ceil((deadlineMs - nowMs) / 1000));
 }
 
-export function permissionOptions(cwd: string): PromptOption[] {
+export function permissionOptions(cwd: string): PromptOption<PermissionChoice>[] {
   const { globalPath, projectPath } = getConfigPaths(cwd);
   return [
     { label: "Allow for this session only", key: "s", action: "session" },
@@ -65,25 +67,25 @@ export function permissionOptions(cwd: string): PromptOption[] {
   ];
 }
 
-export async function showPermissionPrompt(
+export async function showPermissionPrompt<Action extends PromptAction = PermissionChoice>(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   title: string,
   originalValue: string,
   validateValue: (value: string) => string | null,
   timeoutSeconds?: number,
-  promptOptions: PromptOption[] = permissionOptions(ctx.cwd),
-): Promise<PermissionPromptResult> {
-  if (!ctx.hasUI) return { action: "abort", value: originalValue };
+  promptOptions: PromptOption<Action>[] = permissionOptions(ctx.cwd) as PromptOption<Action>[],
+): Promise<PermissionPromptResult<Action>> {
+  if (!ctx.hasUI) return { action: "abort" as Action, value: originalValue };
 
   pi.events.emit("request-attention", { message: "Sandbox permission required" });
 
   const timeoutMs = permissionPromptTimeoutMs(timeoutSeconds);
   const options = promptOptions;
-  const result = await ctx.ui.custom<PermissionPromptResult>((tui, theme, _kb, done) => {
+  const result = await ctx.ui.custom<PermissionPromptResult<Action>>((tui, theme, _kb, done) => {
     const input = new Input();
     let selectedIndex = 0;
-    let pendingAction: PermissionChoice | null = null;
+    let pendingAction: Action | null = null;
     let editing = false;
     let componentFocused = false;
     let error: string | null = null;
@@ -102,15 +104,15 @@ export async function showPermissionPrompt(
         countdown = undefined;
       }
     };
-    const finish = (result: PermissionPromptResult): void => {
+    const finish = (result: PermissionPromptResult<Action>): void => {
       if (resolved) return;
       resolved = true;
       clearPromptTimers();
       done(result);
     };
 
-    const selectedOption = (): PromptOption => options[selectedIndex] ?? options[0]!;
-    const isAllowOption = (option: PromptOption): boolean =>
+    const selectedOption = (): PromptOption<Action> => options[selectedIndex] ?? options[0]!;
+    const isAllowOption = (option: PromptOption<Action>): boolean =>
       option.action !== "abort" && option.action !== "ssh-session";
     const updateFocus = (): void => {
       input.focused = componentFocused && editing;
@@ -128,7 +130,7 @@ export async function showPermissionPrompt(
       error = null;
       updateFocus();
     };
-    const resolve = (action: PermissionChoice): void => {
+    const resolve = (action: Action): void => {
       if (action === "abort") {
         finish({ action, value: originalValue });
         return;
@@ -149,7 +151,7 @@ export async function showPermissionPrompt(
     if (timeoutMs !== undefined) {
       const deadlineMs = Date.now() + timeoutMs;
       remainingSeconds = permissionPromptRemainingSeconds(deadlineMs);
-      timeout = setTimeout(() => resolve("abort"), timeoutMs);
+      timeout = setTimeout(() => resolve("abort" as Action), timeoutMs);
       countdown = setInterval(
         () => {
           const nextRemainingSeconds = permissionPromptRemainingSeconds(deadlineMs);
@@ -219,7 +221,7 @@ export async function showPermissionPrompt(
       },
       handleInput(data: string): void {
         if (matchesKey(data, Key.ctrl("c"))) {
-          resolve("abort");
+          resolve("abort" as Action);
           return;
         }
         if (editing) {
@@ -246,7 +248,7 @@ export async function showPermissionPrompt(
           return;
         }
         if (matchesKey(data, Key.escape)) {
-          resolve("abort");
+          resolve("abort" as Action);
           return;
         }
         if (matchesKey(data, Key.tab) && isAllowOption(selectedOption())) {
@@ -292,7 +294,7 @@ export async function showPermissionPrompt(
     };
   });
 
-  return result ?? { action: "abort", value: originalValue };
+  return result ?? ({ action: "abort", value: originalValue } as PermissionPromptResult<Action>);
 }
 
 const validRule = (value: string, matches: boolean, target: string): string | null => {
@@ -352,8 +354,8 @@ export function promptSshAuthBlock(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   timeoutSeconds?: number,
-): Promise<PermissionPromptResult> {
-  return showPermissionPrompt(
+): Promise<PermissionPromptResult<SshPermissionChoice>> {
+  return showPermissionPrompt<SshPermissionChoice>(
     pi,
     ctx,
     "🔐 SSH auth blocked: allow SSH use for this session?",
@@ -404,10 +406,8 @@ export function formatSandboxConfiguration(
     ...(config.network?.allowUnixSockets?.length
       ? [`  Allow sockets:   ${config.network.allowUnixSockets.join(", ")}`]
       : []),
-    ...((allowances.unixSockets ?? allowances.allowUnixSockets ?? []).length
-      ? [
-          `  Session sockets: ${(allowances.unixSockets ?? allowances.allowUnixSockets ?? []).join(", ")}`,
-        ]
+    ...(allowances.unixSockets.length
+      ? [`  Session sockets: ${allowances.unixSockets.join(", ")}`]
       : []),
     "",
     "Filesystem (bash + read/write/edit tools):",

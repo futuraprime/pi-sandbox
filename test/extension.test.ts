@@ -58,6 +58,14 @@ function makeProjectTempDirectory(prefix: string): string {
   return mkdtempSync(join(process.cwd(), `.pi-sandbox-${prefix}-`));
 }
 
+function allowSshTestDomain(root: string): void {
+  mkdirSync(join(root, ".pi"), { recursive: true });
+  writeFileSync(
+    join(root, ".pi", "sandbox.json"),
+    JSON.stringify({ network: { allowedDomains: ["host"] } }),
+  );
+}
+
 function makeGitUpstreamFixture(): string {
   const repository = makeProjectTempDirectory("git-upstream-extension");
   git(repository, ["init", "-q", "-b", "main"]);
@@ -747,6 +755,327 @@ test("user_bash streams normal output once without diagnostic metadata", async (
   } finally {
     wrapMock.mock.restore();
     managerMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("macOS SSH preflight grants session access only during diagnostic execution", async () => {
+  const root = makeProjectTempDirectory("ssh-preflight-grant");
+  allowSshTestDomain(root);
+  const socketPath = join(root, "agent.sock");
+  const originalSocket = process.env.SSH_AUTH_SOCK;
+  process.env.SSH_AUTH_SOCK = socketPath;
+  const initialized: unknown[] = [];
+  const managerMock = mock.method(SandboxManager, "initialize", async (config: unknown) => {
+    initialized.push(config);
+  });
+  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => "printf granted");
+
+  try {
+    const { pi, handlers } = makePi();
+    extension(pi, { platform: "darwin" });
+    const ctx = makeContext(root, []);
+    let promptCount = 0;
+    (ctx.ui as any).custom = (factory: any) =>
+      new Promise((resolve) => {
+        const component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          (result: unknown) => resolve(result),
+        );
+        promptCount += 1;
+        component.handleInput("s");
+      });
+
+    await handlers.get("session_start")?.({}, ctx);
+    const response = await handlers.get("user_bash")?.(
+      { command: "ssh host; printf done", excludeFromContext: true },
+      ctx,
+    );
+    assert.ok(response?.operations);
+    const result = await response.operations.exec("ssh host; printf done", root, {
+      onData: () => undefined,
+      timeout: 5,
+      env: process.env,
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(promptCount, 1);
+    assert.equal(resetMock.mock.callCount(), 1);
+    assert.equal(initialized.length, 2);
+    assert.deepEqual(
+      (initialized[1] as { network?: { allowUnixSockets?: string[] } }).network?.allowUnixSockets,
+      [socketPath],
+    );
+    const persisted = JSON.parse(readFileSync(join(root, ".pi", "sandbox.json"), "utf8"));
+    assert.equal(persisted.network?.allowUnixSockets, undefined);
+    assert.equal(persisted.network?.allowAllUnixSockets, undefined);
+  } finally {
+    wrapMock.mock.restore();
+    managerMock.mock.restore();
+    resetMock.mock.restore();
+    if (originalSocket === undefined) delete process.env.SSH_AUTH_SOCK;
+    else process.env.SSH_AUTH_SOCK = originalSocket;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("macOS SSH preflight records one clean denied incident", async () => {
+  const root = makeProjectTempDirectory("ssh-preflight-deny");
+  allowSshTestDomain(root);
+  const originalSocket = process.env.SSH_AUTH_SOCK;
+  process.env.SSH_AUTH_SOCK = join(root, "agent.sock");
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => {
+    throw new Error("SSH preflight should block before execution");
+  });
+
+  try {
+    const { pi, handlers, sentMessages, commands } = makePi();
+    extension(pi, { platform: "darwin" });
+    const notices: string[] = [];
+    const ctx = makeContext(root, notices);
+    let promptCount = 0;
+    (ctx.ui as any).custom = (factory: any) =>
+      new Promise((resolve) => {
+        const component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          (result: unknown) => resolve(result),
+        );
+        promptCount += 1;
+        component.handleInput("esc");
+      });
+
+    await handlers.get("session_start")?.({}, ctx);
+    const response = await handlers.get("user_bash")?.(
+      { command: "ssh host; printf done", excludeFromContext: false },
+      ctx,
+    );
+    assert.ok(response?.operations);
+    let output = "";
+    const result = await response.operations.exec("ssh host; printf done", root, {
+      onData: (data: Buffer) => {
+        output += data.toString();
+      },
+      timeout: 5,
+      env: process.env,
+    });
+
+    assert.equal(result.exitCode, 1);
+    assert.equal(promptCount, 1);
+    assert.equal(wrapMock.mock.callCount(), 0);
+    assert.match(output, /SSH auth; left blocked/);
+    assert.doesNotMatch(output, /<sandbox_diagnostic>/);
+    assert.equal(sentMessages.length, 1);
+    await commands.get("sandbox-debug")?.("", ctx);
+    assert.match(notices.at(-1) ?? "", /ssh-preflight-deny/);
+    assert.match(notices.at(-1) ?? "", /prompted: yes/);
+  } finally {
+    wrapMock.mock.restore();
+    managerMock.mock.restore();
+    if (originalSocket === undefined) delete process.env.SSH_AUTH_SOCK;
+    else process.env.SSH_AUTH_SOCK = originalSocket;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("agent Bash retains a blocked SSH preflight for sandbox-debug", async () => {
+  const root = makeProjectTempDirectory("ssh-preflight-bash");
+  allowSshTestDomain(root);
+  const originalSocket = process.env.SSH_AUTH_SOCK;
+  process.env.SSH_AUTH_SOCK = join(root, "agent.sock");
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => {
+    throw new Error("SSH preflight should block before execution");
+  });
+
+  try {
+    const { pi, tools, commands, handlers, sentMessages } = makePi();
+    extension(pi, { platform: "darwin" });
+    const notices: string[] = [];
+    const ctx = makeContext(root, notices);
+    let promptCount = 0;
+    (ctx.ui as any).custom = (factory: any) =>
+      new Promise((resolve) => {
+        const component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          (result: unknown) => resolve(result),
+        );
+        promptCount += 1;
+        component.handleInput("esc");
+      });
+
+    await handlers.get("session_start")?.({}, ctx);
+
+    const bash = tools.get("bash");
+    assert.ok(bash);
+    await assert.rejects(
+      bash.execute(
+        "blocked-ssh",
+        { command: "ssh host; printf done", timeout: 5 },
+        undefined,
+        undefined,
+        ctx,
+      ),
+      /<sandbox_diagnostic>/,
+    );
+    assert.equal(promptCount, 1);
+    assert.equal(wrapMock.mock.callCount(), 0);
+    assert.deepEqual(sentMessages, []);
+
+    await commands.get("sandbox-debug")?.("", ctx);
+    const debug = notices.at(-1) ?? "";
+    assert.match(debug, /ssh host; printf done/);
+    assert.match(debug, /prompted: yes/);
+    assert.match(debug, /choice: abort/);
+  } finally {
+    wrapMock.mock.restore();
+    managerMock.mock.restore();
+    if (originalSocket === undefined) delete process.env.SSH_AUTH_SOCK;
+    else process.env.SSH_AUTH_SOCK = originalSocket;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("macOS SSH preflight rolls back a failed grant before retrying", async () => {
+  const root = makeProjectTempDirectory("ssh-preflight-rollback");
+  allowSshTestDomain(root);
+  const originalSocket = process.env.SSH_AUTH_SOCK;
+  process.env.SSH_AUTH_SOCK = join(root, "agent.sock");
+  let initializeCount = 0;
+  const managerMock = mock.method(SandboxManager, "initialize", async () => {
+    initializeCount += 1;
+    if (initializeCount === 2) throw new Error("test refresh failure");
+  });
+  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => "printf recovered");
+
+  try {
+    const { pi, handlers } = makePi();
+    extension(pi, { platform: "darwin" });
+    const ctx = makeContext(root, []);
+    let promptCount = 0;
+    (ctx.ui as any).custom = (factory: any) =>
+      new Promise((resolve) => {
+        const component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          (result: unknown) => resolve(result),
+        );
+        promptCount += 1;
+        component.handleInput("s");
+      });
+
+    await handlers.get("session_start")?.({}, ctx);
+    const first = await handlers.get("user_bash")?.(
+      { command: "ssh host; printf done", excludeFromContext: true },
+      ctx,
+    );
+    assert.ok(first?.operations);
+    const denied = await first.operations.exec("ssh host; printf done", root, {
+      onData: () => undefined,
+      timeout: 5,
+      env: process.env,
+    });
+    assert.equal(denied.exitCode, 1);
+
+    const second = await handlers.get("user_bash")?.(
+      { command: "ssh host; printf done", excludeFromContext: true },
+      ctx,
+    );
+    assert.ok(second?.operations);
+    const recovered = await second.operations.exec("ssh host; printf done", root, {
+      onData: () => undefined,
+      timeout: 5,
+      env: process.env,
+    });
+    assert.equal(recovered.exitCode, 0);
+    assert.equal(promptCount, 2);
+    assert.equal(resetMock.mock.callCount(), 2);
+  } finally {
+    wrapMock.mock.restore();
+    managerMock.mock.restore();
+    resetMock.mock.restore();
+    if (originalSocket === undefined) delete process.env.SSH_AUTH_SOCK;
+    else process.env.SSH_AUTH_SOCK = originalSocket;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Linux SSH preflight and lone-command fallback never prompt", async () => {
+  const root = makeProjectTempDirectory("ssh-preflight-linux");
+  allowSshTestDomain(root);
+  const originalSocket = process.env.SSH_AUTH_SOCK;
+  process.env.SSH_AUTH_SOCK = join(root, "agent.sock");
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  let wrapped = 0;
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => {
+    wrapped += 1;
+    return "printf 'Permission denied (publickey).\\n' >&2; exit 1";
+  });
+
+  try {
+    const { pi, handlers, sentMessages, commands } = makePi();
+    extension(pi, { platform: "linux" });
+    const notices: string[] = [];
+    const ctx = makeContext(root, notices);
+    let promptCount = 0;
+    (ctx.ui as any).custom = () => {
+      promptCount += 1;
+      throw new Error("Linux SSH auth must not prompt");
+    };
+    await handlers.get("session_start")?.({}, ctx);
+
+    const compound = await handlers.get("user_bash")?.(
+      { command: "ssh host; printf done", excludeFromContext: true },
+      ctx,
+    );
+    assert.ok(compound?.operations);
+    const preflightBlocked = await compound.operations.exec("ssh host; printf done", root, {
+      onData: () => undefined,
+      timeout: 5,
+      env: process.env,
+    });
+    assert.equal(preflightBlocked.exitCode, 1);
+    assert.equal(wrapped, 0);
+
+    const lone = await handlers.get("user_bash")?.(
+      { command: "ssh host", excludeFromContext: true },
+      ctx,
+    );
+    assert.ok(lone?.operations);
+    let output = "";
+    const fallbackBlocked = await lone.operations.exec("ssh host", root, {
+      onData: (data: Buffer) => {
+        output += data.toString();
+      },
+      timeout: 5,
+      env: process.env,
+    });
+    assert.equal(fallbackBlocked.exitCode, 1);
+    assert.equal(wrapped, 1);
+    assert.equal(promptCount, 0);
+    assert.match(output, /SSH auth; blocked or failed/);
+    assert.equal(output.match(/\[sandbox:/g)?.length, 1);
+    assert.doesNotMatch(output, /allowAllUnixSockets|<sandbox_diagnostic>/);
+    assert.equal(sentMessages.length, 0);
+
+    await commands.get("sandbox-debug")?.("", ctx);
+    const debug = notices.at(-1) ?? "";
+    assert.equal(debug.includes("prompted: no"), true);
+    assert.match(debug, /path-scoped SSH-agent access is unavailable on Linux/);
+  } finally {
+    wrapMock.mock.restore();
+    managerMock.mock.restore();
+    if (originalSocket === undefined) delete process.env.SSH_AUTH_SOCK;
+    else process.env.SSH_AUTH_SOCK = originalSocket;
     rmSync(root, { recursive: true, force: true });
   }
 });

@@ -79,6 +79,7 @@ test("buildRuntimeConfig adds session allowances without mutating config", () =>
     domains: ["example.com"],
     readPaths: ["/read"],
     writePaths: ["/write"],
+    unixSockets: [],
   });
   assert.deepEqual(runtime.network?.allowedDomains, []);
   assert.deepEqual(runtime.network?.deniedDomains, []);
@@ -87,6 +88,37 @@ test("buildRuntimeConfig adds session allowances without mutating config", () =>
   assert.equal(runtime.filesystem?.allowRead?.includes("/write"), true);
   assert.equal(runtime.filesystem?.allowWrite?.includes("/write"), true);
   assert.equal(DEFAULT_CONFIG.network?.allowedDomains?.includes("example.com"), false);
+});
+
+test("buildRuntimeConfig combines configured and session socket paths without mutation", () => {
+  const cwd = mkdtempSync(join(process.cwd(), ".pi-sandbox-sockets-"));
+  try {
+    const configuredSocket = join(cwd, "configured.sock");
+    const sessionSocket = join(cwd, "session", "agent.sock");
+    const config = {
+      ...DEFAULT_CONFIG,
+      network: {
+        ...DEFAULT_CONFIG.network!,
+        allowUnixSockets: [configuredSocket],
+      },
+    };
+    const allowances = {
+      domains: [],
+      readPaths: [],
+      writePaths: [],
+      unixSockets: [sessionSocket],
+    };
+    const runtime = buildRuntimeConfig(config, allowances, "darwin", cwd);
+
+    assert.deepEqual(runtime.network?.allowUnixSockets, [
+      canonicalizePath(configuredSocket),
+      canonicalizePath(sessionSocket),
+    ]);
+    assert.deepEqual(config.network?.allowUnixSockets, [configuredSocket]);
+    assert.deepEqual(allowances.unixSockets, [sessionSocket]);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 });
 
 test("buildRuntimeConfig canonicalizes non-glob filesystem paths", () => {
@@ -182,6 +214,7 @@ test("characterizes upstream runtime read expansion for write allowances", () =>
       domains: [],
       readPaths: [],
       writePaths: ["/session-write"],
+      unixSockets: [],
     },
     "/",
   );

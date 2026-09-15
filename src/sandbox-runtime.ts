@@ -19,9 +19,7 @@ export interface SessionAllowances {
   readPaths: string[];
   writePaths: string[];
   /** Session-only, path-scoped Unix-socket allowances (macOS only). */
-  unixSockets?: string[];
-  /** Compatibility spelling for callers that mirror the runtime config key. */
-  allowUnixSockets?: string[];
+  unixSockets: string[];
 }
 
 export interface EffectiveAllowances {
@@ -63,7 +61,7 @@ export function resolveAllowances(
     allowWrite: allowances?.writePaths,
   });
   const writePaths = unique(filesystem.allowWrite);
-  const sessionSockets = allowances?.unixSockets ?? allowances?.allowUnixSockets ?? [];
+  const sessionSockets = allowances?.unixSockets ?? [];
 
   return {
     domains: unique([...(config.network?.allowedDomains ?? []), ...(allowances?.domains ?? [])]),

@@ -109,13 +109,23 @@ test("recomputes replacement paths, fails closed, and does not mutate arrays", (
   };
   const firstRuntime = buildRuntimeConfig(
     runtimeConfig,
-    { domains: [], readPaths: sessionApproved.allowRead, writePaths: sessionApproved.allowWrite },
+    {
+      domains: [],
+      readPaths: sessionApproved.allowRead,
+      writePaths: sessionApproved.allowWrite,
+      unixSockets: [],
+    },
     process.platform,
     firstWorktree,
   );
   const secondRuntime = buildRuntimeConfig(
     runtimeConfig,
-    { domains: [], readPaths: sessionApproved.allowRead, writePaths: sessionApproved.allowWrite },
+    {
+      domains: [],
+      readPaths: sessionApproved.allowRead,
+      writePaths: sessionApproved.allowWrite,
+      unixSockets: [],
+    },
     process.platform,
     secondWorktree,
   );

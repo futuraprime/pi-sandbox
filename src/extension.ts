@@ -67,6 +67,7 @@ import {
 import {
   formatSandboxConfiguration,
   type PermissionPromptResult,
+  type SshPermissionChoice,
   promptDomainBlock,
   promptReadBlock,
   promptSshAuthBlock,
@@ -218,8 +219,6 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
   }
 
   function sessionUnixSockets(): string[] {
-    if (allowances.unixSockets) return allowances.unixSockets;
-    allowances.unixSockets = [];
     return allowances.unixSockets;
   }
 
@@ -266,7 +265,11 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
   }
 
   function mutationForChoice(
-    choice: Exclude<PermissionPromptResult["action"], "abort"> | "abort" | "none",
+    choice:
+      | Exclude<PermissionPromptResult["action"], "abort">
+      | SshPermissionChoice
+      | "abort"
+      | "none",
   ): SandboxIncident["configMutation"] {
     if (choice === "project") return ".pi/sandbox.json";
     if (choice === "global") return "~/.pi/agent/sandbox.json";
@@ -285,7 +288,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     allowances.domains.length = 0;
     allowances.readPaths.length = 0;
     allowances.writePaths.length = 0;
-    allowances.unixSockets?.splice(0, allowances.unixSockets.length);
+    allowances.unixSockets.splice(0, allowances.unixSockets.length);
     resetIncidentHistory();
   }
 
@@ -299,6 +302,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         return true;
       },
       platform,
+      cwd,
     });
   }
 
@@ -320,7 +324,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     return "none";
   }
 
-  function sshDiagnostic(socketPath: string, promptable = true): SandboxDiagnostic {
+  function sshDiagnostic(socketPath: string, promptable = platform !== "linux"): SandboxDiagnostic {
     return {
       type: "ssh-auth",
       target: "current SSH agent",
@@ -431,34 +435,36 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         let lastResult: { exitCode: number | null } = { exitCode: 1 };
         let visibleOutput = "";
 
-        for (;;) {
-          const sshPreflight = await runSshPreflight(ctx, command, incident);
-          if (sshPreflight === "blocked") {
-            incident.finalOutcome = "failure";
-            const reason =
-              platform === "linux"
-                ? "Blocked: path-specific SSH-agent access is unavailable on Linux; agent access remains blocked."
-                : "Blocked: SSH agent access is not allowed.";
-            const block = renderDiagnosticBlock(incident);
-            const blockData = getDiagnosticBlockData(incident);
-            const visibleText = blockData ? `${reason}\n${renderDiagnosticNotice(blockData)}` : reason;
-            onDetails?.(
-              blockData
-                ? { sandboxDiagnostic: blockData, sandboxVisibleText: visibleText }
-                : undefined,
-            );
-            if (source === "user_bash" && blockData) {
-              if (recordDiagnosticInContext && block) {
-                pi.sendMessage({ customType: "sandbox-diagnostic", content: block, display: false });
-              }
-              execOptions.onData(Buffer.from(`\n${renderDiagnosticNotice(blockData)}\n`));
-            } else {
-              execOptions.onData(Buffer.from(`\n${reason}\n${block ?? ""}\n`));
+        const sshPreflight = await runSshPreflight(ctx, command, incident);
+        if (sshPreflight === "blocked") {
+          incident.finalOutcome = "failure";
+          const reason =
+            platform === "linux"
+              ? "Blocked: path-specific SSH-agent access is unavailable on Linux; agent access remains blocked."
+              : "Blocked: SSH agent access is not allowed.";
+          const block = renderDiagnosticBlock(incident);
+          const blockData = getDiagnosticBlockData(incident);
+          const visibleText = blockData
+            ? `${reason}\n${renderDiagnosticNotice(blockData)}`
+            : reason;
+          onDetails?.(
+            blockData
+              ? { sandboxDiagnostic: blockData, sandboxVisibleText: visibleText }
+              : undefined,
+          );
+          if (source === "user_bash" && blockData) {
+            if (recordDiagnosticInContext && block) {
+              pi.sendMessage({ customType: "sandbox-diagnostic", content: block, display: false });
             }
-            storeIncident(incident);
-            return { exitCode: 1 };
+            execOptions.onData(Buffer.from(`\n${renderDiagnosticNotice(blockData)}\n`));
+          } else {
+            execOptions.onData(Buffer.from(`\n${reason}\n${block ?? ""}\n`));
           }
+          storeIncident(incident);
+          return { exitCode: 1 };
+        }
 
+        for (;;) {
           let output = "";
           const store = SandboxManager.getSandboxViolationStore();
           const beforeCount = store.getViolationsForCommand(command).length;
@@ -481,11 +487,18 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
           const events = store
             .getViolationsForCommand(command)
             .slice(beforeCount)
-            .map((event) => parseViolationEvent(event, process.env.SSH_AUTH_SOCK))
+            .map((event) => parseViolationEvent(event, process.env.SSH_AUTH_SOCK, platform))
             .map((diagnostic) => finalizeDiagnostic(diagnostic, diagnosticPolicy(cwd)));
           const diagnostics = events.length
             ? events
-            : [parseFallbackDiagnosticFromOutput(command, annotatedOutput)]
+            : [
+                parseFallbackDiagnosticFromOutput(
+                  command,
+                  annotatedOutput,
+                  process.env.SSH_AUTH_SOCK,
+                  platform,
+                ),
+              ]
                 .filter((diagnostic): diagnostic is SandboxDiagnostic => diagnostic !== null)
                 .map((diagnostic) => finalizeDiagnostic(diagnostic, diagnosticPolicy(cwd)));
 
@@ -723,27 +736,6 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     if (config.sandboxUserShell === false) return;
     const incident = incidentFor("user_bash", event.command);
     const recordDiagnosticInContext = !event.excludeFromContext;
-    const sshPreflight = await runSshPreflight(ctx, event.command, incident);
-    if (sshPreflight === "blocked") {
-      incident.finalOutcome = "failure";
-      const block = renderDiagnosticBlock(incident);
-      const data = getDiagnosticBlockData(incident);
-      if (recordDiagnosticInContext && block) {
-        pi.sendMessage({ customType: "sandbox-diagnostic", content: block, display: false });
-      }
-      const reason =
-        platform === "linux"
-          ? "Blocked: path-specific SSH-agent access is unavailable on Linux; agent access remains blocked."
-          : "Blocked: SSH agent access is not allowed.";
-      return {
-        result: {
-          output: `${reason}${data ? `\n${renderDiagnosticNotice(data)}` : ""}`,
-          exitCode: 1,
-          cancelled: false,
-          truncated: false,
-        },
-      };
-    }
     for (const domain of extractDomainsFromCommand(event.command)) {
       const domainPolicy = decideDomainPolicy(
         domain,
@@ -860,25 +852,6 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
 
     if (sandboxInitialized && isToolCallEventType("bash", event)) {
-      const sshPreflight = await runSshAuthPreflight({
-        command: event.input.command,
-        sshAuthSock: process.env.SSH_AUTH_SOCK,
-        allowedSockets: effectiveUnixSockets(ctx.cwd),
-        allowAllSockets: config.network?.allowAllUnixSockets === true,
-        platform,
-        requestAccess: async (socketPath) =>
-          (await requestSshAuthAccess(ctx, socketPath)) === "ssh-session",
-      });
-      if (sshPreflight === "blocked") {
-        return {
-          block: true,
-          reason:
-            platform === "linux"
-              ? "SSH-agent access is blocked: path-scoped access is unavailable on Linux."
-              : "SSH-agent access is blocked for this session.",
-        };
-      }
-
       for (const domain of extractDomainsFromCommand(event.input.command)) {
         const domainPolicy = decideDomainPolicy(
           domain,
@@ -940,13 +913,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         allowWrite: effectiveWritePaths(ctx.cwd),
         denyWrite: config.filesystem?.denyWrite ?? [],
         cwd: ctx.cwd,
-        prompt: async (path) => {
-          const choice = await promptWriteBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds);
-          return choice as {
-            action: "abort" | "session" | "project" | "global";
-            value: string;
-          };
-        },
+        prompt: (path) => promptWriteBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds),
         saveWritePermission: (choice, value) => applyChoice(choice, "write", value, ctx.cwd),
       });
       if (writePermission.action === "deny") {

@@ -781,25 +781,49 @@ export function socketPathMatches(
   return relativePath === "" || (!relativePath.startsWith("..") && !relativePath.startsWith("/"));
 }
 
+function sshAgentDiagnostic(socketPath: string, platform: NodeJS.Platform): SandboxDiagnostic {
+  const linux = platform === "linux";
+  return {
+    type: "ssh-auth",
+    target: "current SSH agent",
+    rawTarget: socketPath,
+    rule: "ssh agent socket blocked",
+    promptable: !linux,
+    action: linux
+      ? "path-scoped SSH-agent access is unavailable on Linux; agent remains blocked"
+      : "allow SSH use for this session",
+  };
+}
+
 export async function grantSshSessionAccess(options: {
   socketPath: string;
   allowedSockets: string[];
   reinitialize: () => Promise<boolean>;
   platform?: NodeJS.Platform;
+  cwd?: string;
 }): Promise<boolean> {
-  const { socketPath, allowedSockets, reinitialize, platform = process.platform } = options;
+  const {
+    socketPath,
+    allowedSockets,
+    reinitialize,
+    platform = process.platform,
+    cwd = process.cwd(),
+  } = options;
   if (platform === "linux") return false;
 
+  const canonicalSocketPath = normaliseSocketPath(socketPath, cwd);
   const added = !allowedSockets.some((allowedSocket) =>
-    socketPathMatches(allowedSocket, socketPath),
+    socketPathMatches(allowedSocket, canonicalSocketPath, cwd),
   );
-  const addedIndex = added ? allowedSockets.push(socketPath) - 1 : -1;
+  const addedIndex = added ? allowedSockets.push(canonicalSocketPath) - 1 : -1;
   try {
     if (await reinitialize()) return true;
   } catch {
     // Reinitialisation failures deny the grant and must not leak session state.
   }
-  if (added && allowedSockets[addedIndex] === socketPath) allowedSockets.splice(addedIndex, 1);
+  if (added && allowedSockets[addedIndex] === canonicalSocketPath) {
+    allowedSockets.splice(addedIndex, 1);
+  }
   return false;
 }
 
@@ -824,7 +848,11 @@ export async function runSshAuthPreflight(options: {
   if (allowedSockets.some((allowedSocket) => socketPathMatches(allowedSocket, sshAuthSock))) {
     return "not-needed";
   }
-  return (await requestAccess(sshAuthSock)) ? "allowed" : "blocked";
+  try {
+    return (await requestAccess(sshAuthSock)) ? "allowed" : "blocked";
+  } catch {
+    return "blocked";
+  }
 }
 
 const AUTH_ADJACENT_READ_PATTERNS = [
@@ -838,9 +866,7 @@ const AUTH_ADJACENT_READ_PATTERNS = [
 /** Identify auth-adjacent files without suggesting broad private-key reads. */
 export function isAuthAdjacentReadPath(filePath: string, cwd = process.cwd()): boolean {
   const canonical = canonicalizePath(filePath, cwd);
-  return AUTH_ADJACENT_READ_PATTERNS.some((pattern) =>
-    matchesPattern(canonical, [pattern], cwd),
-  );
+  return AUTH_ADJACENT_READ_PATTERNS.some((pattern) => matchesPattern(canonical, [pattern], cwd));
 }
 
 function makeReadAction(
@@ -859,6 +885,7 @@ export function makeSshAgentFallbackDiagnostic(
   sshAuthSock: string | undefined,
   command: string,
   output: string,
+  platform: NodeJS.Platform = process.platform,
 ): SandboxDiagnostic | null {
   if (!sshAuthSock) return null;
   const isSshTargeted = clearlySshTargeted(command);
@@ -866,31 +893,18 @@ export function makeSshAgentFallbackDiagnostic(
     /Error connecting to agent: Operation not permitted/i.test(output) && isSshTargeted;
   const publicKeyFailure = /Permission denied \(publickey\)/i.test(output) && isSshTargeted;
   if (!explicitFailure && !publicKeyFailure) return null;
-  return {
-    type: "ssh-auth",
-    target: "current SSH agent",
-    rawTarget: sshAuthSock,
-    rule: "ssh agent socket blocked",
-    promptable: true,
-    action: "allow SSH use for this session",
-  };
+  return sshAgentDiagnostic(sshAuthSock, platform);
 }
 
 /** Parse one structured sandbox-runtime violation into a stable diagnostic. */
 export function parseViolationEvent(
   violation: RuntimeDiagnosticEvent,
   sshAuthSock?: string,
+  platform: NodeJS.Platform = process.platform,
 ): SandboxDiagnostic {
   const line = violation.line.trim();
   if (sshAuthSock && line.includes(sshAuthSock)) {
-    return {
-      type: "ssh-auth",
-      target: "current SSH agent",
-      rawTarget: sshAuthSock,
-      rule: "ssh agent socket blocked",
-      promptable: true,
-      action: "allow SSH use for this session",
-    };
+    return sshAgentDiagnostic(sshAuthSock, platform);
   }
 
   const browser = makeBrowserProcessViolationDiagnostic(line);
@@ -965,10 +979,11 @@ export function parseFallbackDiagnosticFromOutput(
   command: string,
   output: string,
   sshAuthSock = process.env.SSH_AUTH_SOCK,
+  platform: NodeJS.Platform = process.platform,
 ): SandboxDiagnostic | null {
   const browser = makeBrowserProcessFallbackDiagnostic(output);
   if (browser) return browser;
-  const ssh = makeSshAgentFallbackDiagnostic(sshAuthSock, command, output);
+  const ssh = makeSshAgentFallbackDiagnostic(sshAuthSock, command, output, platform);
   if (ssh) return ssh;
 
   const host = output.match(
@@ -994,9 +1009,7 @@ export function parseFallbackDiagnosticFromOutput(
       rawTarget: blockedPath,
       rule: looksLikeRead ? "allowRead" : "allowWrite",
       promptable: !looksLikeRead,
-      action: looksLikeRead
-        ? makeReadAction(blockedPath, "deny", "denyRead")
-        : "allow and retry",
+      action: looksLikeRead ? makeReadAction(blockedPath, "deny", "denyRead") : "allow and retry",
     };
   }
 
