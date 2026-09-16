@@ -148,6 +148,12 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
   let sandboxEnabled = false;
   let sandboxInitialized = false;
   let sandboxCwd: string | null = null;
+  let sandboxExecutionBlocked = false;
+  // Generation/context ownership only protects asynchronous starts; it is not
+  // a general lifecycle state machine.
+  let sessionGeneration = 0;
+  let currentSessionContext: Parameters<typeof warnIfAllDomainsAllowed>[0] | undefined;
+  let sandboxRuntimeOwnerGeneration: number | null = null;
   const allowances: SessionAllowances = {
     domains: [],
     readPaths: [],
@@ -164,17 +170,43 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
   const effectiveWritePaths = (cwd: string) => effectiveAllowances(cwd).writePaths;
   const effectiveUnixSockets = (cwd: string) => effectiveAllowances(cwd).unixSockets;
 
-  async function refreshSandbox(cwd: string): Promise<boolean> {
+  async function refreshSandbox(
+    cwd: string,
+    expectedGeneration = sessionGeneration,
+  ): Promise<boolean> {
     if (!sandboxInitialized) return true;
     try {
       await reinitializeSandbox(loadConfig(cwd), allowances, cwd);
+      if (sessionGeneration !== expectedGeneration) return false;
       sandboxCwd = cwd;
+      sandboxRuntimeOwnerGeneration = expectedGeneration;
       return true;
     } catch (error) {
+      if (sessionGeneration !== expectedGeneration) return false;
       // Keep the sandbox state enabled so execution cannot fall back to local Bash.
       console.error(`Warning: Failed to reinitialize sandbox: ${error}`);
       return false;
     }
+  }
+
+  function ownsSessionStart(ownership: {
+    generation: number;
+    context: Parameters<typeof warnIfAllDomainsAllowed>[0];
+  }): boolean {
+    return (
+      ownership.generation === sessionGeneration && currentSessionContext === ownership.context
+    );
+  }
+
+  function sandboxExecutionBlockedResult() {
+    return {
+      result: {
+        output: "Sandbox is not ready; command execution remains blocked.",
+        exitCode: 1,
+        cancelled: false,
+        truncated: false,
+      },
+    };
   }
 
   async function applyChoice(
@@ -423,6 +455,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     recordDiagnosticInContext: boolean,
     onDetails?: (details: DiagnosticResultDetails | undefined) => void,
     initialIncident?: SandboxIncident,
+    expectedGeneration = sessionGeneration,
   ): ReturnType<typeof createSandboxedBashOps> {
     const baseOperations = createSandboxedBashOps(
       shellPath,
@@ -430,6 +463,9 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     );
     return {
       async exec(command, cwd, execOptions) {
+        if (sandboxExecutionBlocked || sessionGeneration !== expectedGeneration) {
+          throw new Error("Sandbox is not ready; command execution remains blocked.");
+        }
         const incident = initialIncident ?? incidentFor(source, command);
         let lastPrompted: SandboxDiagnostic | undefined;
         let lastResult: { exitCode: number | null } = { exitCode: 1 };
@@ -568,13 +604,35 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
   async function enableSandbox(
     ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
     setProxyEnvironment: boolean,
+    ownership?: { generation: number; context: Parameters<typeof warnIfAllDomainsAllowed>[0] },
+    blockOnFailure = false,
   ): Promise<boolean> {
+    const expectedGeneration = ownership?.generation ?? sessionGeneration;
+    if (
+      sessionGeneration !== expectedGeneration ||
+      (ownership !== undefined && !ownsSessionStart(ownership))
+    ) {
+      return false;
+    }
+
     if (sandboxEnabled) {
       if (sandboxInitialized && sandboxCwd !== ctx.cwd) {
-        const refreshed = await refreshSandbox(ctx.cwd);
-        if (refreshed) updateStatus(ctx, "enabled");
+        const refreshed = await refreshSandbox(ctx.cwd, expectedGeneration);
+        if (
+          sessionGeneration !== expectedGeneration ||
+          (ownership !== undefined && !ownsSessionStart(ownership))
+        ) {
+          return false;
+        }
+        if (refreshed) {
+          sandboxRuntimeOwnerGeneration = expectedGeneration;
+          sandboxExecutionBlocked = false;
+          updateStatus(ctx, "enabled");
+        }
         return refreshed;
       }
+      sandboxExecutionBlocked = false;
+      sandboxRuntimeOwnerGeneration = expectedGeneration;
       ctx.ui.notify("Sandbox is already enabled", "info");
       updateStatus(ctx, "enabled");
       return false;
@@ -582,6 +640,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
 
     const config = loadConfig(ctx.cwd);
     if (platform !== "darwin" && platform !== "linux") {
+      sandboxExecutionBlocked = false;
       updateStatus(ctx, "unsupported");
       ctx.ui.notify(`Sandbox not supported on ${platform}`, "warning");
       return false;
@@ -589,19 +648,37 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
 
     try {
       await initializeSandbox(config, allowances, ctx.cwd);
+      if (
+        sessionGeneration !== expectedGeneration ||
+        (ownership !== undefined && !ownsSessionStart(ownership))
+      ) {
+        // A late initialization is deliberately left unowned. Resetting here
+        // could tear down a newer runtime; shutdown owns cleanup at its boundary.
+        return false;
+      }
       if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
         process.env.NODE_USE_ENV_PROXY ??= "1";
       }
       sandboxEnabled = true;
       sandboxInitialized = true;
       sandboxCwd = ctx.cwd;
+      sandboxRuntimeOwnerGeneration = expectedGeneration;
+      sandboxExecutionBlocked = false;
       warnIfAllDomainsAllowed(ctx, config);
       updateStatus(ctx, "enabled");
       return true;
     } catch (error) {
+      if (
+        sessionGeneration !== expectedGeneration ||
+        (ownership !== undefined && !ownsSessionStart(ownership))
+      ) {
+        return false;
+      }
       sandboxEnabled = false;
       sandboxInitialized = false;
       sandboxCwd = null;
+      sandboxRuntimeOwnerGeneration = null;
+      sandboxExecutionBlocked = blockOnFailure;
       updateStatus(ctx, "error");
       ctx.ui.notify(
         `Sandbox initialization failed: ${error instanceof Error ? error.message : error}`,
@@ -614,7 +691,10 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
   async function disableSandbox(
     ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
   ): Promise<boolean> {
+    sessionGeneration += 1;
+    sandboxExecutionBlocked = true;
     if (!sandboxEnabled) {
+      sandboxExecutionBlocked = false;
       updateStatus(ctx, "disabled");
       ctx.ui.notify("Sandbox is already disabled", "info");
       return false;
@@ -630,6 +710,8 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     sandboxEnabled = false;
     sandboxInitialized = false;
     sandboxCwd = null;
+    sandboxRuntimeOwnerGeneration = null;
+    sandboxExecutionBlocked = false;
     updateStatus(ctx, "disabled");
     return true;
   }
@@ -685,16 +767,33 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         };
       }
 
+      if (sandboxExecutionBlocked) {
+        throw new Error("Sandbox is not ready; command execution remains blocked.");
+      }
       if (!sandboxEnabled || !sandboxInitialized) {
         return localBash.execute(id, params, signal, onUpdate, ctx);
       }
-      if (sandboxCwd !== ctx.cwd) await refreshSandbox(ctx.cwd);
+      const expectedGeneration = sessionGeneration;
+      if (sandboxCwd !== ctx.cwd) {
+        const refreshed = await refreshSandbox(ctx.cwd, expectedGeneration);
+        if (!refreshed || sessionGeneration !== expectedGeneration || sandboxExecutionBlocked) {
+          throw new Error("Sandbox is not ready; command execution remains blocked.");
+        }
+      }
 
       let diagnosticDetails: DiagnosticResultDetails | undefined;
       const sandboxedBash = createBashToolDefinition(localCwd, {
-        operations: createDiagnosticOperations(ctx, "bash", userShellPath, false, (details) => {
-          diagnosticDetails = details;
-        }),
+        operations: createDiagnosticOperations(
+          ctx,
+          "bash",
+          userShellPath,
+          false,
+          (details) => {
+            diagnosticDetails = details;
+          },
+          undefined,
+          expectedGeneration,
+        ),
         shellPath: userShellPath,
       });
       const result = await sandboxedBash.execute(id, params, signal, onUpdate, ctx);
@@ -729,8 +828,15 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         },
       };
     }
+    if (sandboxExecutionBlocked) return sandboxExecutionBlockedResult();
     if (!sandboxEnabled || !sandboxInitialized) return;
-    if (sandboxCwd !== ctx.cwd) await refreshSandbox(ctx.cwd);
+    const expectedGeneration = sessionGeneration;
+    if (sandboxCwd !== ctx.cwd) {
+      const refreshed = await refreshSandbox(ctx.cwd, expectedGeneration);
+      if (!refreshed || sessionGeneration !== expectedGeneration || sandboxExecutionBlocked) {
+        return sandboxExecutionBlockedResult();
+      }
+    }
 
     const config = loadConfig(ctx.cwd);
     if (config.sandboxUserShell === false) return;
@@ -810,6 +916,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         recordDiagnosticInContext,
         undefined,
         incident,
+        expectedGeneration,
       ),
     };
   });
@@ -845,6 +952,9 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       bashCommandMentionsSandboxConfig(event.input.command, ctx.cwd)
     ) {
       return { block: true, reason: sandboxConfigMutationMessage(ctx.cwd) };
+    }
+    if (sandboxExecutionBlocked && isToolCallEventType("bash", event)) {
+      return { block: true, reason: "Sandbox is not ready; command execution remains blocked." };
     }
     if (!sandboxEnabled) return;
     const config = loadConfig(ctx.cwd);
@@ -937,6 +1047,18 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    // Pi contexts expose lifecycle-guarded getters. Probe the values before
+    // claiming ownership so a context invalidated by replacement/reload is a
+    // no-op, while a still-valid context may legitimately be reused.
+    try {
+      void ctx.cwd;
+      void ctx.ui;
+    } catch {
+      return;
+    }
+    currentSessionContext = ctx;
+    const ownership = { generation: ++sessionGeneration, context: ctx };
+
     // Incident history is scoped to the replacement session. Session allowances
     // remain with the active runtime until session_shutdown tears it down.
     resetIncidentHistory();
@@ -946,6 +1068,8 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       sandboxEnabled = false;
       sandboxInitialized = false;
       sandboxCwd = null;
+      sandboxRuntimeOwnerGeneration = null;
+      sandboxExecutionBlocked = false;
       updateStatus(ctx, "disabled");
       ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
       return;
@@ -954,25 +1078,49 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       sandboxEnabled = false;
       sandboxInitialized = false;
       sandboxCwd = null;
+      sandboxRuntimeOwnerGeneration = null;
+      sandboxExecutionBlocked = false;
       updateStatus(ctx, "disabled");
       ctx.ui.notify("Sandbox disabled via config", "info");
       return;
     }
-    await enableSandbox(ctx, true);
+    sandboxExecutionBlocked = true;
+    await enableSandbox(ctx, true, ownership, true);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
-    if (sandboxInitialized) {
+    if (currentSessionContext && currentSessionContext !== ctx) return;
+    const shutdownGeneration = sessionGeneration;
+    sessionGeneration += 1;
+    currentSessionContext = undefined;
+    sandboxExecutionBlocked = true;
+
+    const ownsRuntimeAtShutdown =
+      sandboxInitialized && sandboxRuntimeOwnerGeneration === shutdownGeneration;
+    if (ownsRuntimeAtShutdown) {
       try {
         await SandboxManager.reset();
       } catch {
         // Ignore cleanup errors.
       }
+      // A replacement may have established a new runtime while reset was
+      // pending. Do not clear its state or replace its status with shutdown.
+      if (
+        sessionGeneration !== shutdownGeneration + 1 ||
+        currentSessionContext !== undefined ||
+        sandboxRuntimeOwnerGeneration !== shutdownGeneration
+      ) {
+        return;
+      }
     }
     sandboxEnabled = false;
     sandboxInitialized = false;
     sandboxCwd = null;
+    sandboxRuntimeOwnerGeneration = null;
     resetSessionMemory();
+    // A late initialization is not reset here: the shutdown reset boundary only
+    // owns a runtime known to be ready before shutdown. Resetting a stale result
+    // could tear down a newer runtime, so the unowned result remains fail-closed.
     // session_shutdown receives the active context in normal extension
     // lifecycles. The pure status contract remains usable when it does not.
     if (ctx) updateStatus(ctx, "shutdown");
