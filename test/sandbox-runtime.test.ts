@@ -280,9 +280,33 @@ test("extractBlockedWritePath handles Bash preflight output variants", () => {
   assert.equal(extractBlockedWritePath("bash: line 1: /tmp/file.txt: Permission denied"), null);
 });
 
-test.todo(
-  "R-02: Bash preflight classifies allow, prompt, hard-deny, retry, and output attribution",
-);
+test("R-02 runtime redirection fixtures preserve direct and nested Bash output", async (t) => {
+  const { cwd, exec } = createExecTestContext(t);
+  const directTarget = join(cwd, "direct-write-target");
+  const nestedTarget = join(cwd, "nested-write-target");
+  const commands = [
+    {
+      command: `printf 'bash: line 1: ${directTarget}: Operation not permitted\\n' >&2; exit 1`,
+      target: directTarget,
+    },
+    {
+      command: `bash -c ${shellQuote(`printf 'bash: line 1: ${nestedTarget}: Operation not permitted\\n' >&2; exit 1`)}`,
+      target: nestedTarget,
+    },
+  ];
+
+  for (const { command, target } of commands) {
+    let output = "";
+    const result = await exec(command, cwd, {
+      onData: (data: Buffer) => {
+        output += data.toString();
+      },
+    });
+
+    assert.equal(result.exitCode, 1);
+    assert.equal(extractBlockedWritePath(output), target);
+  }
+});
 
 test("supportsNodeEnvProxy observes Node release boundaries", () => {
   assert.equal(supportsNodeEnvProxy("22.20.0"), false);

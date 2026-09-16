@@ -246,6 +246,28 @@ test("reclassifies structured and fallback targets through shared policy precede
   assert.equal(finalFallback.rule, "denyRead");
   assert.equal(finalFallback.promptable, false);
 
+  const deniedWrite = finalizeDiagnostic(
+    parseViolationEvent({ line: 'deny file-write-data "/project/private/output.txt"' }),
+    policy,
+  );
+  assert.equal(deniedWrite.rule, "denyWrite");
+  assert.equal(deniedWrite.promptable, false);
+
+  const specificWrite = finalizeDiagnostic(
+    parseViolationEvent({ line: 'deny file-write-data "/project/private/output/public.txt"' }),
+    { ...policy, allowWrite: ["/project/private/output"] },
+  );
+  assert.equal(specificWrite.rule, "allowWrite");
+  assert.equal(specificWrite.promptable, false);
+  assert.equal(specificWrite.action, "write access allowed");
+
+  const unmatchedWrite = finalizeDiagnostic(
+    parseViolationEvent({ line: 'deny file-write-data "/outside/output.txt"' }),
+    policy,
+  );
+  assert.equal(unmatchedWrite.rule, "allowWrite");
+  assert.equal(unmatchedWrite.promptable, true);
+
   const deniedDomain = finalizeDiagnostic(
     parseViolationEvent({ line: "network blocked private.example.com" }),
     policy,

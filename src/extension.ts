@@ -214,7 +214,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     kind: "domain" | "read" | "write",
     value: string,
     cwd: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const commandKey =
       kind === "domain" ? "allowedDomains" : kind === "read" ? "allowRead" : "allowWrite";
     const storedValue =
@@ -224,15 +224,19 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
           ? projectRuleValue(value, cwd)
           : canonicalizePathPattern(value, cwd);
     let changed = false;
+    const sessionAllowanceValues =
+      kind === "domain"
+        ? allowances.domains
+        : kind === "read"
+          ? allowances.readPaths
+          : allowances.writePaths;
+    const sessionAllowanceValue = kind === "domain" ? value : canonicalizePathPattern(value, cwd);
+    const addedSessionAllowance = addSessionAllowance(
+      sessionAllowanceValues,
+      sessionAllowanceValue,
+    );
 
-    if (kind === "domain") {
-      changed = addSessionAllowance(allowances.domains, value);
-    } else {
-      changed = addSessionAllowance(
-        kind === "read" ? allowances.readPaths : allowances.writePaths,
-        canonicalizePathPattern(value, cwd),
-      );
-    }
+    changed = addedSessionAllowance;
 
     if (choice !== "session") {
       const { globalPath, projectPath } = getConfigPaths(cwd);
@@ -241,7 +245,12 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       changed ||= result.changed;
     }
 
-    if (changed) await refreshSandbox(cwd);
+    const refreshed = !changed || (await refreshSandbox(cwd));
+    if (!refreshed && addedSessionAllowance) {
+      const index = sessionAllowanceValues.indexOf(sessionAllowanceValue);
+      if (index >= 0) sessionAllowanceValues.splice(index, 1);
+    }
+    return refreshed;
   }
 
   function addSessionAllowance(values: string[], value: string): boolean {
@@ -439,13 +448,13 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     incident.promptChoice = choice.action;
     incident.configMutation = mutationForChoice(choice.action);
     if (choice.action === "abort") return "abort";
-    await applyChoice(
+    const refreshed = await applyChoice(
       choice.action,
       diagnostic.type === "network" ? "domain" : diagnostic.type,
       choice.value,
       ctx.cwd,
     );
-    return choice.action;
+    return refreshed ? choice.action : "none";
   }
 
   function createDiagnosticOperations(
@@ -1024,7 +1033,9 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         denyWrite: config.filesystem?.denyWrite ?? [],
         cwd: ctx.cwd,
         prompt: (path) => promptWriteBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds),
-        saveWritePermission: (choice, value) => applyChoice(choice, "write", value, ctx.cwd),
+        saveWritePermission: async (choice, value) => {
+          await applyChoice(choice, "write", value, ctx.cwd);
+        },
       });
       if (writePermission.action === "deny") {
         return {

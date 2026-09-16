@@ -1,6 +1,6 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1–5 and 6a complete; 6b–6d deferred
+- **Status:** In progress — slices 1–5, 6a, and 6b complete; 6c–6d deferred
 - **Date:** 2026-09-03
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
@@ -293,7 +293,9 @@ Plan the migration as nine expected `/execute`-sized slices, plus one conditiona
 
 **Slice 6a verified:** `src/sandbox-runtime.ts` now scopes `cleanupAfterCommand()` to successful runtime wrappers and runs it from the execution `finally` path for normal, nonzero, timeout, abort, and post-wrap process-creation failures. Original execution errors remain authoritative, and unchanged wrappers do not decrement another command's runtime cleanup state. `initializeSandbox()` preserves `allowPty` unchanged; inherited-pipe early completion, active post-exit draining, cleanup failures, asynchronous child-process errors, and exactly-once cleanup are covered in `test/sandbox-runtime.test.ts`. The fresh direct Node verification reports 119 passing tests, 4 TODOs, and no failures; the runtime-focused file reports 23 passing tests, 2 TODOs, and no failures. These mocked/runtime-fixture tests are not macOS Chromium or Git-over-SSH platform-parity evidence. See [`upstream-0.6.6-slice-6a-checkpoint.md`](../integration/upstream-0.6.6-slice-6a-checkpoint.md).
 
-**Slice 6a boundary:** Bash write prompting remains deferred to 6b. The 0.0.72 comparison/defaults/reset-recovery assessment remains deferred to 6c, and real macOS Chromium/Git-over-SSH acceptance remains deferred to 6d. The four existing TODO gates remain explicit; this slice does not resolve C-13, R-02, or the two prompt TODOs.
+**Slice 6b verified:** R-02 now applies the shared specificity policy to direct Bash and nested `bash -c` write failures. Allowed and hard/equal-deny outcomes are classified without prompting; unmatched writes prompt, and a more-specific allow overrides a broader deny. The shared approval path refreshes the active runtime before a retry (the focused write-retry contract exercises session scope), while abort, no-UI, and failed-refresh paths do not retry. Failed refreshes also roll back a newly added session allowance. Registered Bash and `user_bash` retain final diagnostic attribution for successful and failed retries, and repeated identical violations are not prompted twice. The R-02 runtime TODO is replaced with harmless direct and nested redirection fixtures. Focused affected suites report 80 passing tests, 1 TODO, and no failures; the full direct Node suite reports 125 passing tests, 3 TODOs, and no failures. These mocked/runtime-fixture tests do not prove real OS enforcement.
+
+**Slice 6b boundary:** C-13 and the two prompt/UI TODOs remain deferred. The sandbox-runtime 0.0.72 comparison, changed defaults, and reset/initialisation-failure recovery assessment remain deferred to 6c. Real macOS scoped Chromium and Git-over-SSH acceptance remains deferred to 6d. No dependency, runtime-version, lockfile, SSH policy/proxy, credential, or platform-probe changes are part of 6b.
 
 **Exit condition:** focused runtime tests and macOS checks either demonstrate parity on 0.0.72 or produce a bounded adaptation plan for the conditional slice.
 
