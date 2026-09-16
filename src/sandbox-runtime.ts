@@ -268,23 +268,17 @@ export function createSandboxedBashOps(shellPath?: string, sshProxy = true): Bas
         process.platform === "darwin" && socksProxyPort !== undefined
           ? `ssh() { /usr/bin/ssh -o 'ProxyCommand=/usr/bin/nc -X 5 -x localhost:${socksProxyPort} %h %p' "$@"; }; `
           : "";
-      const wrappedCommand = await SandboxManager.wrapWithSandbox(
-        `${sshProxyCommand}${command}`,
-        shell,
-      );
-
-      const child = spawn(shell, [...args, wrappedCommand], {
-        cwd,
-        env,
-        detached: true,
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-
+      const commandToWrap = `${sshProxyCommand}${command}`;
+      let cleanupRequired = false;
+      let child: ChildProcess | undefined;
       let timedOut = false;
       let timeoutHandle: NodeJS.Timeout | undefined;
+      let executionFailed = false;
+      let executionError: unknown;
+      let result: { exitCode: number | null } | undefined;
 
       const killProcessGroup = () => {
-        if (!child.pid) return;
+        if (!child?.pid) return;
         try {
           process.kill(-child.pid, "SIGKILL");
         } catch {
@@ -292,27 +286,56 @@ export function createSandboxedBashOps(shellPath?: string, sshProxy = true): Bas
         }
       };
 
-      if (timeout !== undefined && timeout > 0) {
-        timeoutHandle = setTimeout(() => {
-          timedOut = true;
-          killProcessGroup();
-        }, timeout * 1000);
-      }
-
-      child.stdout?.on("data", onData);
-      child.stderr?.on("data", onData);
-      signal?.addEventListener("abort", killProcessGroup, { once: true });
-
       try {
+        const wrappedCommand = await SandboxManager.wrapWithSandbox(commandToWrap, shell);
+        // The runtime only acquires a command-scoped cleanup resource when it
+        // returns an actual wrapper. Calling cleanup for an unchanged command
+        // could decrement the active count belonging to another command.
+        cleanupRequired = wrappedCommand !== commandToWrap;
+
+        child = spawn(shell, [...args, wrappedCommand], {
+          cwd,
+          env,
+          detached: true,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+
+        if (timeout !== undefined && timeout > 0) {
+          timeoutHandle = setTimeout(() => {
+            timedOut = true;
+            killProcessGroup();
+          }, timeout * 1000);
+        }
+
+        child.stdout?.on("data", onData);
+        child.stderr?.on("data", onData);
+        signal?.addEventListener("abort", killProcessGroup, { once: true });
+
         const exitCode = await waitForChildProcess(child);
         if (signal?.aborted) throw new Error("aborted");
         if (timedOut) throw new Error(`timeout:${timeout}`);
-        return { exitCode };
+        result = { exitCode };
+      } catch (error) {
+        executionFailed = true;
+        executionError = error;
       } finally {
         if (timeoutHandle) clearTimeout(timeoutHandle);
-        signal?.removeEventListener("abort", killProcessGroup);
-        SandboxManager.cleanupAfterCommand();
+        if (child) signal?.removeEventListener("abort", killProcessGroup);
+        if (cleanupRequired) {
+          try {
+            SandboxManager.cleanupAfterCommand();
+          } catch (cleanupError) {
+            // Never replace the command's original failure with cleanup noise.
+            if (!executionFailed) {
+              executionFailed = true;
+              executionError = cleanupError;
+            }
+          }
+        }
       }
+
+      if (executionFailed) throw executionError;
+      return result!;
     },
   };
 }

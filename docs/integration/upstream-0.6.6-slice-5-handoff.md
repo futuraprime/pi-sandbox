@@ -1,19 +1,19 @@
-# Upstream 0.6.6 Slice 5 handoff
+# Upstream 0.6.6 Slice 5 completion and Slice 6a handoff
 
 ## Branches and baseline
 
-- Integration branch: `feature/upstream-merge`
-- Slice branch: `feature/upstream-merge-slice-5`
-- Continue all remaining Slice 5 work on the existing Slice branch. Use focused checkpoint commits; do not create sibling mini-slice branches.
+- Integration branch: `feature/upstream-merge`.
+- Slice 5 was completed on its focused checkpoint branch and is integrated here.
+- Slice 6a is recorded on the integration branch; no dependency, runtime-version, or lockfile changes were made.
 - `upstream/main` is the upstream 0.6.6 baseline (`d76ad64a42532f83639f934019aabdeb8c20f4fa`, tag `v0.6.6`). Never push to `upstream` or open a pull request against it.
 - `origin/main` (`757f0586fc7d9877a37901e6976830672bc93ed8`, downstream 0.4.4) is a read-only behavioural reference.
-- The integration and Slice branches contain Slice 5 through commit `8595b33` before this handoff note.
+- Slice 5 is integrated through commit `1e16e22` before this handoff note.
 
 After transferring to another checkout:
 
 ```bash
 git fetch origin
-git switch feature/upstream-merge-slice-5
+git switch feature/upstream-merge
 node --import tsx --test test/**/*.test.ts
 pnpm run check
 pnpm run lint
@@ -21,6 +21,23 @@ pnpm run ci:fmt
 ```
 
 `pnpm test` may fail in the agent sandbox because the `tsx` CLI cannot create its IPC socket. The direct Node command above is the known-good replacement. Warnings about unreadable user-level pnpm/npm or sandbox configuration are expected in a restricted sandbox.
+
+## Slice 5 completion
+
+Slices 2–5 are complete. Slices 2–4 retain cumulative configuration/policy semantics, protected `/sandbox` persistence, and configuration protection. Slice 5 adds the diagnostics, status, secure Git/worktree, SSH-agent, and stale-lifecycle seams described below. The Slice 5 baseline verification was 112 passing tests, 4 explicit TODOs, and no failures; those TODOs remain deferred.
+
+## Slice 6a completion
+
+`src/sandbox-runtime.ts` now places wrapping and process setup inside one guarded execution path. Cleanup is required only after the runtime returns an actual wrapper, then runs once from `finally` for normal and nonzero exits, timeout, abort, and process-creation failure. A rejected wrapper is allowed to perform its own runtime rollback and is not allowed to decrement an unrelated command's cleanup state; unchanged commands likewise skip cleanup. Original execution errors remain authoritative if cleanup itself fails.
+
+`initializeSandbox()` passes `allowPty` unchanged for `true`, `false`, and omission. Runtime tests now cover cleanup failures after successful and failed execution, asynchronous child-process errors, and exactly-once cleanup while preserving early idle completion and active post-exit output draining. The focused runtime suite reports 23 passing tests and 2 deferred TODOs.
+
+## Explicitly deferred gates
+
+- **6b / R-02:** Bash write policy, prompting, retry, and output attribution.
+- **6c / R-06 and D-06:** comparison with sandbox-runtime 0.0.72, changed defaults, and reset-success/initialisation-failure recovery assessment. Runtime dependencies remain at the locked 0.0.70 baseline.
+- **6d / R-07–R-09:** real macOS scoped Chromium and Git-over-SSH acceptance, including unauthenticated SOCKS compatibility, domain filtering, and separate SSH-agent approval. Mocked tests are not platform-parity evidence.
+- **Existing TODO gates:** C-13, R-02, and the two prompt/UI TODOs remain unchanged; no TODO was closed by this checkpoint.
 
 ## Completed work
 
@@ -32,15 +49,22 @@ Completed Slice 5 areas:
 - **H-01/H-02:** secure `set_git_upstream`, origin-only existing-ref validation, fixed non-shell Git arguments, Git environment sanitization, cancellation, and pre-sandbox redirection of Bash tracking mutations (`8595b33`).
 - Shared positive and negative Git command fixtures are exercised at both classifier and extension-hook seams. Cancellation is covered before process creation and while a Git subprocess is running.
 
-Current verification at the handoff point:
+Historical Slice 5 verification at an earlier handoff point:
 
 - Full suite: 74 passed, 4 TODO, 0 failed.
-- TypeScript, oxlint, oxfmt check, and `git diff --check` pass.
+- TypeScript, oxlint, oxfmt check, and `git diff --check` passed at that earlier point.
+- This 74-pass result predates the later Slice 5 integration and Slice 6a work; it is not current verification.
+
+Fresh Slice 6a corrective verification:
+
+- Full suite: 119 passed, 4 TODO, 0 failed.
+- TypeScript, oxlint, oxfmt check, and `git diff --check` pass for the current checkout.
+- The focused runtime tests run on the Darwin host with mocked runtime-manager methods and a project-local non-executable shell fixture for the asynchronous spawn error. These tests are not macOS Chromium or Git-over-SSH platform-parity evidence; those checks remain deferred to 6d.
 - The remaining TODO gates include C-13 and R-02 and must stay deferred to their planned slices.
 
-## Remaining Slice 5 work
+## Historical Slice 5 scope (completed)
 
-Use `docs/integration/upstream-0.6.6-feature-ledger.md` as the contract and `origin/main` as the behavioural source. Keep `index.ts` as the thin export `export { default } from "./src/extension.ts";` and retain the split module architecture.
+The following records the Slice 5 implementation scope and remains useful as a parity index. Use `docs/integration/upstream-0.6.6-feature-ledger.md` as the contract and `origin/main` as the behavioural source. Keep `index.ts` as the thin export `export { default } from "./src/extension.ts";` and retain the split module architecture.
 
 ### 1. Slice 5c — core diagnostics and violation presentation
 

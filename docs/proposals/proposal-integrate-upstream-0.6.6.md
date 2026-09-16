@@ -1,6 +1,6 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1–4 complete
+- **Status:** In progress — slices 1–5 and 6a complete; 6b–6d deferred
 - **Date:** 2026-09-03
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
@@ -281,6 +281,8 @@ Plan the migration as nine expected `/execute`-sized slices, plus one conditiona
 
 **Exit condition:** diagnostics, Git, worktree, filesystem, and status tests pass through their integration seams.
 
+**Slice 5 verified:** diagnostics, status, Git/worktree, SSH-agent, and stale-lifecycle work is complete through the upstream-shaped seams. The full direct Node suite now covers 112 passing tests, 4 explicit TODO gates, and no failures at the Slice 5 baseline. Runtime execution contracts are recorded separately in the Slice 6a checkpoint; no runtime version, dependency, or lockfile changes were made.
+
 ### Slice 6: Runtime fixes and compatibility assessment
 
 - Retain upstream subprocess cleanup, Bash write prompting, and `allowPty` fixes.
@@ -288,6 +290,10 @@ Plan the migration as nine expected `/execute`-sized slices, plus one conditiona
 - Assess reset-then-initialise failure semantics: determine whether the previous runtime can be restored or the unavailable manager can be detected and kept fail-closed.
 - Test scoped Chromium behaviour without broad Unix-socket access.
 - Test macOS Git-over-SSH behaviour with unauthenticated SOCKS compatibility, domain filtering, and separate SSH-agent approval.
+
+**Slice 6a verified:** `src/sandbox-runtime.ts` now scopes `cleanupAfterCommand()` to successful runtime wrappers and runs it from the execution `finally` path for normal, nonzero, timeout, abort, and post-wrap process-creation failures. Original execution errors remain authoritative, and unchanged wrappers do not decrement another command's runtime cleanup state. `initializeSandbox()` preserves `allowPty` unchanged; inherited-pipe early completion, active post-exit draining, cleanup failures, asynchronous child-process errors, and exactly-once cleanup are covered in `test/sandbox-runtime.test.ts`. The fresh direct Node verification reports 119 passing tests, 4 TODOs, and no failures; the runtime-focused file reports 23 passing tests, 2 TODOs, and no failures. These mocked/runtime-fixture tests are not macOS Chromium or Git-over-SSH platform-parity evidence. See [`upstream-0.6.6-slice-6a-checkpoint.md`](../integration/upstream-0.6.6-slice-6a-checkpoint.md).
+
+**Slice 6a boundary:** Bash write prompting remains deferred to 6b. The 0.0.72 comparison/defaults/reset-recovery assessment remains deferred to 6c, and real macOS Chromium/Git-over-SSH acceptance remains deferred to 6d. The four existing TODO gates remain explicit; this slice does not resolve C-13, R-02, or the two prompt TODOs.
 
 **Exit condition:** focused runtime tests and macOS checks either demonstrate parity on 0.0.72 or produce a bounded adaptation plan for the conditional slice.
 

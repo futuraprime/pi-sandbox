@@ -1,10 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { mock, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { SandboxManager } from "@carderne/sandbox-runtime";
+import { SandboxManager, type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
 import assert from "node:assert/strict";
 
 import { DEFAULT_CONFIG } from "../src/config.ts";
@@ -16,6 +16,7 @@ import {
   createNetworkAskCallback,
   createSandboxedBashOps,
   extractBlockedWritePath,
+  initializeSandbox,
   resolveAllowances,
   supportsNodeEnvProxy,
 } from "../src/sandbox-runtime.ts";
@@ -24,12 +25,22 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-function createExecTestContext(t: TestContext) {
+function createExecTestContext(
+  t: TestContext,
+  wrapCommand: (command: string) => string = (command) => `:; ${command}`,
+  afterCleanup?: () => void,
+) {
   const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-exec-"));
   const backgroundPidPaths: string[] = [];
+  let cleanupCount = 0;
 
-  // Exercise exec without an OS sandbox session: identity wrap, no SSH proxy.
-  mock.method(SandboxManager, "wrapWithSandbox", async (command: string) => command);
+  // Exercise exec without an OS sandbox session while modeling a successful
+  // runtime wrapper so command cleanup remains observable.
+  mock.method(SandboxManager, "wrapWithSandbox", async (command: string) => wrapCommand(command));
+  mock.method(SandboxManager, "cleanupAfterCommand", () => {
+    cleanupCount += 1;
+    afterCleanup?.();
+  });
   t.after(() => {
     try {
       for (const pidPath of backgroundPidPaths) terminateRecordedProcess(pidPath);
@@ -42,6 +53,7 @@ function createExecTestContext(t: TestContext) {
   return {
     cwd,
     exec: createSandboxedBashOps(undefined, false).exec,
+    cleanupCount: () => cleanupCount,
     trackBackgroundProcess: (pidPath: string) => backgroundPidPaths.push(pidPath),
   };
 }
@@ -234,6 +246,20 @@ test("buildRuntimeConfig preserves allowPty at the runtime seam", () => {
   }
 });
 
+test("initializeSandbox passes allowPty unchanged to SandboxManager", async (t) => {
+  const observed: Array<boolean | undefined> = [];
+  mock.method(SandboxManager, "initialize", async (runtime: SandboxRuntimeConfig) => {
+    observed.push(runtime.allowPty);
+  });
+  t.after(() => mock.restoreAll());
+
+  for (const allowPty of [true, false, undefined]) {
+    await initializeSandbox({ ...DEFAULT_CONFIG, allowPty });
+  }
+
+  assert.deepEqual(observed, [true, false, undefined]);
+});
+
 test("extractBlockedWritePath recognizes shell sandbox errors", () => {
   assert.equal(
     extractBlockedWritePath("bash: line 1: /private/file: Operation not permitted"),
@@ -266,7 +292,7 @@ test("supportsNodeEnvProxy observes Node release boundaries", () => {
 });
 
 test("exec resolves when the command exits even if a daemonized grandchild holds the stdio pipes", async (t) => {
-  const { cwd, exec, trackBackgroundProcess } = createExecTestContext(t);
+  const { cwd, exec, cleanupCount, trackBackgroundProcess } = createExecTestContext(t);
   const { command, pidPath } = backgroundNodeCommand(cwd, "setInterval(() => {}, 1000);");
   trackBackgroundProcess(pidPath);
 
@@ -277,11 +303,12 @@ test("exec resolves when the command exits even if a daemonized grandchild holds
   const elapsed = Date.now() - started;
 
   assert.equal(exitCode, 0);
+  assert.equal(cleanupCount(), 1);
   assert.ok(elapsed < 2000, `exec returned after ${elapsed}ms; expected early teardown`);
 });
 
 test("exec drains output that stays active after the direct child exits", async (t) => {
-  const { cwd, exec, trackBackgroundProcess } = createExecTestContext(t);
+  const { cwd, exec, cleanupCount, trackBackgroundProcess } = createExecTestContext(t);
   const writerSource = `
 let tick = 0;
 const writer = setInterval(() => {
@@ -302,6 +329,7 @@ setInterval(() => {}, 1000);
   const output = Buffer.concat(chunks).toString("utf8");
 
   assert.equal(exitCode, 0);
+  assert.equal(cleanupCount(), 1);
   for (let tick = 1; tick <= 6; tick += 1) {
     assert.ok(output.includes(`stdout-${tick}\n`), `missing stdout token ${tick}`);
     assert.ok(output.includes(`stderr-${tick}\n`), `missing stderr token ${tick}`);
@@ -310,22 +338,24 @@ setInterval(() => {}, 1000);
 });
 
 test("exec returns a nonzero exit code", async (t) => {
-  const { cwd, exec } = createExecTestContext(t);
+  const { cwd, exec, cleanupCount } = createExecTestContext(t);
 
   assert.deepEqual(await exec("exit 7", cwd, { onData: () => {} }), { exitCode: 7 });
+  assert.equal(cleanupCount(), 1);
 });
 
 test("exec rejects after its command timeout", async (t) => {
-  const { cwd, exec } = createExecTestContext(t);
+  const { cwd, exec, cleanupCount } = createExecTestContext(t);
 
   await assert.rejects(
     exec("sleep 5", cwd, { onData: () => {}, timeout: 0.05 }),
     new Error("timeout:0.05"),
   );
+  assert.equal(cleanupCount(), 1);
 });
 
 test("exec rejects when an in-flight command is aborted", async (t) => {
-  const { cwd, exec } = createExecTestContext(t);
+  const { cwd, exec, cleanupCount } = createExecTestContext(t);
   const controller = new AbortController();
   const abortTimer = setTimeout(() => controller.abort(), 50);
   t.after(() => clearTimeout(abortTimer));
@@ -334,4 +364,83 @@ test("exec rejects when an in-flight command is aborted", async (t) => {
     exec("sleep 5", cwd, { onData: () => {}, signal: controller.signal }),
     new Error("aborted"),
   );
+  assert.equal(cleanupCount(), 1);
+});
+
+test("exec preserves wrapping failures without cleaning another command", async (t) => {
+  const wrappingError = new Error("wrap failed");
+  const { cwd, exec, cleanupCount } = createExecTestContext(t, () => {
+    throw wrappingError;
+  });
+
+  await assert.rejects(exec("true", cwd, { onData: () => {} }), wrappingError);
+  assert.equal(cleanupCount(), 0);
+});
+
+test("exec cleans up when process creation fails after wrapping", async (t) => {
+  const { cwd, exec, cleanupCount } = createExecTestContext(t);
+  const invalidEnv = {
+    ...process.env,
+    PI_SANDBOX_INVALID_ENV: Symbol("invalid"),
+  } as unknown as NodeJS.ProcessEnv;
+
+  await assert.rejects(
+    exec("true", cwd, { onData: () => {}, env: invalidEnv }),
+    /Cannot convert a Symbol value to a string/,
+  );
+  assert.equal(cleanupCount(), 1);
+});
+
+test("exec reports cleanup failures after a successful command", async (t) => {
+  const cleanupError = new Error("cleanup failed");
+  const { cwd, exec, cleanupCount } = createExecTestContext(t, undefined, () => {
+    throw cleanupError;
+  });
+
+  await assert.rejects(exec("true", cwd, { onData: () => {} }), (error) => {
+    assert.equal(error, cleanupError);
+    return true;
+  });
+  assert.equal(cleanupCount(), 1);
+});
+
+test("exec preserves an execution failure when cleanup also fails", async (t) => {
+  const cleanupError = new Error("cleanup failed");
+  const { cwd, exec, cleanupCount } = createExecTestContext(t, undefined, () => {
+    throw cleanupError;
+  });
+
+  await assert.rejects(exec("sleep 5", cwd, { onData: () => {}, timeout: 0.05 }), (error) => {
+    assert.notEqual(error, cleanupError);
+    assert.equal(error instanceof Error, true);
+    assert.equal((error as Error).message, "timeout:0.05");
+    return true;
+  });
+  assert.equal(cleanupCount(), 1);
+});
+
+test(
+  "exec cleans up after an asynchronous child-process error",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const { cwd, cleanupCount } = createExecTestContext(t);
+    const fixtureDir = mkdtempSync(join(process.cwd(), ".pi-sandbox-async-spawn-"));
+    t.after(() => rmSync(fixtureDir, { recursive: true, force: true }));
+    const shellPath = join(fixtureDir, "non-executable-shell");
+    writeFileSync(shellPath, "#!/bin/sh\n", { mode: 0o600 });
+    const exec = createSandboxedBashOps(shellPath, false).exec;
+
+    await assert.rejects(exec("true", cwd, { onData: () => {} }), (error) => {
+      assert.equal((error as NodeJS.ErrnoException).code, "EACCES");
+      return true;
+    });
+    assert.equal(cleanupCount(), 1);
+  },
+);
+
+test("exec does not clean up when the runtime returns an unchanged command", async (t) => {
+  const { cwd, exec, cleanupCount } = createExecTestContext(t, (command) => command);
+
+  assert.deepEqual(await exec("true", cwd, { onData: () => {} }), { exitCode: 0 });
+  assert.equal(cleanupCount(), 0);
 });
