@@ -1,9 +1,10 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1–5, 6a, and 6b complete; 6c–6d deferred
+- **Status:** In progress — slices 1–5, 6a, 6b, and 6c complete; 6d outstanding; 0.0.72 upgrade not approved
 - **Date:** 2026-09-03
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
+- **Slice 6c assessment:** [sandbox-runtime 0.0.70/0.0.72 assessment](../integration/upstream-0.6.6-slice-6c-assessment.md)
 
 ## Context
 
@@ -295,13 +296,15 @@ Plan the migration as nine expected `/execute`-sized slices, plus one conditiona
 
 **Slice 6b verified:** R-02 now applies the shared specificity policy to direct Bash and nested `bash -c` write failures. Allowed and hard/equal-deny outcomes are classified without prompting; unmatched writes prompt, and a more-specific allow overrides a broader deny. The shared approval path refreshes the active runtime before a retry (the focused write-retry contract exercises session scope), while abort, no-UI, and failed-refresh paths do not retry. Failed refreshes also roll back a newly added session allowance. Registered Bash and `user_bash` retain final diagnostic attribution for successful and failed retries, and repeated identical violations are not prompted twice. The R-02 runtime TODO is replaced with harmless direct and nested redirection fixtures. Focused affected suites report 80 passing tests, 1 TODO, and no failures; the full direct Node suite reports 125 passing tests, 3 TODOs, and no failures. These mocked/runtime-fixture tests do not prove real OS enforcement.
 
-**Slice 6b boundary:** C-13 and the two prompt/UI TODOs remain deferred. The sandbox-runtime 0.0.72 comparison, changed defaults, and reset/initialisation-failure recovery assessment remain deferred to 6c. Real macOS scoped Chromium and Git-over-SSH acceptance remains deferred to 6d. No dependency, runtime-version, lockfile, SSH policy/proxy, credential, or platform-probe changes are part of 6b.
+**Slice 6b boundary:** C-13 and the two prompt/UI TODOs remain deferred. The sandbox-runtime 0.0.72 comparison, changed defaults, and reset/initialisation-failure recovery assessment were deferred to 6c. Real macOS scoped Chromium and Git-over-SSH acceptance remains deferred to 6d. No dependency, runtime-version, lockfile, SSH policy/proxy, credential, or platform-probe changes are part of 6b.
+
+**Slice 6c assessment complete:** [the assessment](../integration/upstream-0.6.6-slice-6c-assessment.md) records stock 0.0.70 resolution, the historical fork provenance, the 0.0.72 source comparison, and the bounded reset/readiness findings. The 0.0.72 upgrade is **not approved** because stock 0.0.72 does not preserve the source-identified scoped Chromium policy; 6d macOS acceptance remains outstanding. Conditional Slice 7 adaptation is recommended only if 6d confirms a required compatibility failure. No dependency, runtime-version, lockfile, or code changes are part of 6c.
 
 **Exit condition:** focused runtime tests and macOS checks either demonstrate parity on 0.0.72 or produce a bounded adaptation plan for the conditional slice.
 
 ### Slice 7: Runtime adaptation, if required
 
-Run this slice only if sandbox-runtime 0.0.72 fails the parity checks in slice 6.
+Run this slice only if the outstanding 6d gates confirm that sandbox-runtime 0.0.72 fails a required parity check. The 6c source assessment makes scoped Chromium adaptation likely, but 6d real macOS evidence remains the trigger.
 
 - Port or replace the minimum downstream runtime patches needed for scoped Chromium and macOS Git-over-SSH parity.
 - Review any changed runtime defaults before enabling them.
