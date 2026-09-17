@@ -1,10 +1,11 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1–5, 6a, 6b, and 6c complete; 6d outstanding; 0.0.72 upgrade not approved
+- **Status:** In progress — slices 1–5, 6a, 6b, 6c, and 6d complete; stock 0.0.72 upgrade deferred; conditional Slice 7 triggered
 - **Date:** 2026-09-03
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
 - **Slice 6c assessment:** [sandbox-runtime 0.0.70/0.0.72 assessment](../integration/upstream-0.6.6-slice-6c-assessment.md)
+- **Slice 6d acceptance:** [macOS runtime acceptance](../integration/upstream-0.6.6-slice-6d-acceptance.md)
 
 ## Context
 
@@ -298,9 +299,11 @@ Plan the migration as nine expected `/execute`-sized slices, plus one conditiona
 
 **Slice 6b boundary:** C-13 and the two prompt/UI TODOs remain deferred. The sandbox-runtime 0.0.72 comparison, changed defaults, and reset/initialisation-failure recovery assessment were deferred to 6c. Real macOS scoped Chromium and Git-over-SSH acceptance remains deferred to 6d. No dependency, runtime-version, lockfile, SSH policy/proxy, credential, or platform-probe changes are part of 6b.
 
-**Slice 6c assessment complete:** [the assessment](../integration/upstream-0.6.6-slice-6c-assessment.md) records stock 0.0.70 resolution, the historical fork provenance, the 0.0.72 source comparison, and the bounded reset/readiness findings. The 0.0.72 upgrade is **not approved** because stock 0.0.72 does not preserve the source-identified scoped Chromium policy; 6d macOS acceptance remains outstanding. Conditional Slice 7 adaptation is recommended only if 6d confirms a required compatibility failure. No dependency, runtime-version, lockfile, or code changes are part of 6c.
+**Slice 6c assessment complete:** [the assessment](../integration/upstream-0.6.6-slice-6c-assessment.md) records stock 0.0.70 resolution, the historical fork provenance, the 0.0.72 source comparison, and the bounded reset/readiness findings. The 0.0.72 upgrade was not approved pending real macOS acceptance.
 
-**Exit condition:** focused runtime tests and macOS checks either demonstrate parity on 0.0.72 or produce a bounded adaptation plan for the conditional slice.
+**Slice 6d acceptance complete:** [the acceptance record](../integration/upstream-0.6.6-slice-6d-acceptance.md) records the pinned npm integrity and host provenance, real scoped Chromium enabled/disabled launches, BSD `nc` SOCKS and Git-over-SSH gates, domain filtering, HTTP proxy authentication separation, exact SSH-agent approval, extension-seam limitations, cleanup, and the reset/replacement-init readiness probe. Standalone SOCKS, domain, HTTP-auth, SSH-agent, and Git protocol checks passed, but stock 0.0.72 failed the scoped Chromium gate because its generated profile omits the downstream sysctl, loopback-bind, and Darwin user-temp file/socket grants. The upgrade remains deferred; conditional Slice 7 is triggered for the minimum scoped browser adaptation. Full extension lifecycle acceptance remains assigned to Slice 9. No dependency, runtime-version, lockfile, or production code changes were made.
+
+**Exit condition:** focused runtime tests and macOS checks either demonstrate parity on 0.0.72 or produce a bounded adaptation plan for the conditional slice. 6d produced that bounded adaptation plan; 0.0.72 is not approved for upgrade.
 
 ### Slice 7: Runtime adaptation, if required
 
