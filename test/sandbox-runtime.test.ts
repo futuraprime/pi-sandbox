@@ -150,6 +150,43 @@ test("buildRuntimeConfig does not pass unknown credential values to the runtime"
   assert.equal(runtime.credentials, undefined);
 });
 
+test("buildRuntimeConfig rejects environment JWT decode before the runtime sees it", () => {
+  const syntheticPlaintext = "synthetic-env-decode-value-must-not-be-logged";
+  const warnings: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => warnings.push(String(args[0]));
+  try {
+    const runtime = buildRuntimeConfig({
+      ...DEFAULT_CONFIG,
+      credentials: {
+        envVars: [
+          {
+            name: "PI_INVALID_JWT",
+            mode: "mask",
+            decode: "jwt",
+            onExtractNoMatch: "deny",
+            injectHosts: ["api.example.com"],
+          },
+          {
+            name: "PI_MISSING_CLAIM",
+            mode: "mask",
+            decode: "jwt",
+            maskClaims: ["access_token"],
+            onExtractNoMatch: "error",
+            injectHosts: ["api.example.com"],
+          },
+        ],
+      } as never,
+    });
+
+    assert.equal(runtime.credentials, undefined);
+    assert.equal(warnings.length, 2);
+    assert.ok(warnings.every((warning) => !warning.includes(syntheticPlaintext)));
+  } finally {
+    console.error = originalError;
+  }
+});
+
 test("buildRuntimeConfig adds session allowances without mutating config", () => {
   const runtime = buildRuntimeConfig(DEFAULT_CONFIG, {
     domains: ["example.com"],

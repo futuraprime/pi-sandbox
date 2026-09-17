@@ -1,7 +1,7 @@
 import type { CredentialEnvVarConfig, CredentialFileConfig } from "@carderne/sandbox-runtime";
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -135,6 +135,33 @@ test("macOS sandbox wrapper enforces environment deny and mask without plaintext
   );
 });
 
+test("characterizes environment JWT decode mismatch requiring boundary rejection", () => {
+  const syntheticPlaintext = "pi-sandbox-invalid-jwt-value-must-not-be-printed";
+  const registry = new SentinelRegistry();
+  const invalidJwt = buildMaskedEnvVars(
+    [
+      {
+        name: "PI_INVALID_JWT",
+        mode: "mask",
+        decode: "jwt",
+        onExtractNoMatch: "deny",
+        injectHosts: [INJECT_HOST],
+      },
+    ],
+    [INJECT_HOST],
+    registry,
+    { PI_INVALID_JWT: syntheticPlaintext },
+  );
+
+  // Runtime 0.0.72 leaves a failed JWT decode inherited rather than applying
+  // onExtractNoMatch. The config boundary rejects this policy before this
+  // runtime path can receive it; this direct characterization must not print
+  // or otherwise expose the synthetic value.
+  assert.deepEqual(invalidJwt.setEnvVars, {});
+  assert.deepEqual(invalidJwt.degradeToUnsetNames, []);
+  assert.equal(JSON.stringify(invalidJwt).includes(syntheticPlaintext), false);
+});
+
 test("denied environment values and structured extraction mismatch fail closed", () => {
   const registry = new SentinelRegistry();
   const denied = buildMaskedEnvVars(
@@ -186,6 +213,70 @@ test("denied environment values and structured extraction mismatch fail closed",
   );
 });
 
+test("file JWT decode mismatch honors fail-closed deny and error choices", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-credential-file-decode-"));
+  const syntheticPlaintext = "pi-sandbox-file-jwt-value-must-not-be-printed";
+  const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  const missingClaimJwt = [
+    encode({ alg: "HS256", typ: "JWT" }),
+    encode({ sub: syntheticPlaintext }),
+    "synthetic-signature",
+  ].join(".");
+  const cases = [
+    {
+      filename: "invalid-jwt.txt",
+      content: `credential=${syntheticPlaintext}\neyJnot-json.eyJnot-json.signature\n`,
+    },
+    {
+      filename: "missing-claim.txt",
+      content: `credential=${missingClaimJwt}\n`,
+    },
+  ];
+
+  try {
+    for (const onExtractNoMatch of ["deny", "error"] as const) {
+      for (const fileCase of cases) {
+        const realPath = join(root, `${onExtractNoMatch}-${fileCase.filename}`);
+        writeFileSync(realPath, fileCase.content, "utf8");
+        const registry = new SentinelRegistry();
+        const store = new MaskedFileStore();
+        try {
+          const build = () =>
+            buildMaskedFileBinds(
+              [
+                {
+                  path: realPath,
+                  mode: "mask",
+                  decode: "jwt",
+                  maskClaims: ["access_token"],
+                  onExtractNoMatch,
+                  injectHosts: [INJECT_HOST],
+                },
+              ],
+              [INJECT_HOST],
+              registry,
+              store,
+            );
+
+          if (onExtractNoMatch === "deny") {
+            const result = build();
+            assert.deepEqual(result.binds, []);
+            assert.deepEqual(result.degradeToDenyPaths, [realpathSync(realPath)]);
+          } else {
+            assert.throws(build, (error: unknown) => {
+              return !String(error).includes(syntheticPlaintext);
+            });
+          }
+        } finally {
+          store.dispose();
+        }
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("masked file material is fake while macOS wrapper denies the real path", (t) => {
   if (process.platform !== "darwin") {
     t.skip("macOS credential-file fallback");
@@ -233,6 +324,31 @@ test("masked file material is fake while macOS wrapper denies the real path", (t
       containsPlaintext([fakeContent, wrapped], SYNTHETIC_SECRET),
       false,
       "file reads and wrapper diagnostics must not contain plaintext",
+    );
+
+    const fileRun = spawnSync("/bin/sh", ["-c", wrapped], {
+      encoding: "utf8",
+      env: { ...process.env },
+    });
+    const spawnError = fileRun.error as NodeJS.ErrnoException | undefined;
+    if (spawnError?.code === "EPERM") {
+      assert.fail(
+        "outer harness returned EPERM while spawning nested sandbox-exec; direct file-denial evidence is unavailable",
+      );
+    }
+    assert.equal(spawnError, undefined, "direct nested sandbox-exec could not be spawned");
+    assert.notEqual(fileRun.status, 0, "reading the real credential file must fail");
+    assert.equal(fileRun.signal, null, "credential read should return a denial, not a signal");
+    assert.equal(fileRun.stdout, "", "denied credential file must not produce stdout");
+    assert.equal(
+      containsPlaintext([fileRun.stdout, fileRun.stderr], SYNTHETIC_SECRET),
+      false,
+      "denied credential read must not disclose plaintext in child output",
+    );
+    assert.equal(
+      fileRun.stderr.includes(realPath),
+      true,
+      "the child must report denial of the real path; otherwise nested execution may be blocked by the outer harness",
     );
   } finally {
     store.dispose();

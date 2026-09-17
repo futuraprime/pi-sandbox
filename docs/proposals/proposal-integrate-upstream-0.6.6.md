@@ -1,6 +1,6 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1–5, 6a, 6b, 6c, 6d, and 7 complete; exact 0.0.72 approved with a bounded consumer-side Chromium adapter and fresh network regressions
+- **Status:** In progress — slices 1–5, 6a, 6b, 6c, 6d, 7, and 8 closure complete; exact 0.0.72 approved with a bounded consumer-side Chromium adapter, fresh network regressions, and a fail-closed credential consumer boundary
 - **Date:** 2026-09-03
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
@@ -178,10 +178,11 @@ Upstream pi-sandbox 0.6.6 declares `@carderne/sandbox-runtime: ^0.0.70` but lock
 Evaluate sandbox-runtime 0.0.72's credential controls as part of runtime reconciliation:
 
 - `credentials.envVars` and `credentials.files` support `mode: "deny"`, which withholds the declared source from sandboxed processes;
-- `mode: "mask"` exposes a per-session sentinel rather than plaintext and substitutes the real credential only through the runtime proxy on egress to the entry's effective `injectHosts`;
+- supported `mode: "mask"` entries expose a per-session sentinel rather than plaintext and substitute the real credential only through the runtime proxy on egress to the entry's explicit `injectHosts`;
 - per-entry `injectHosts` must be explicitly narrowed for credentials rather than implicitly accepting every reachable host;
-- structured extraction must use `onExtractNoMatch: "deny"` or `"error"` for secret-bearing configuration so a failed match cannot expose plaintext through the default fail-open warning behaviour; and
-- file masking is Linux-only in 0.0.72 and degrades to deny on macOS, so it is out of scope for the initial downstream integration; use environment-variable masking on the macOS target instead.
+- environment-variable `decode: "jwt"` is rejected at the downstream validated config boundary, even with `onExtractNoMatch: "deny"` or `"error"`, because runtime 0.0.72 ignores that option when JWT verification or requested claims fail and leaves the inherited plaintext value in the sandbox;
+- whole-value environment masks and regex extraction remain supported, while accepted structured env extraction and file extraction/decode require `onExtractNoMatch: "deny"` or `"error"`; and
+- file masking is Linux-only in 0.0.72 and degrades to deny on macOS. The initial downstream scope therefore supports the safe macOS deny fallback and does not add Linux file-mask delivery.
 
 This is a capability for proxy-mediated network authentication, not a way to reveal plaintext to a trusted script inside the sandbox. The extension must not introduce a generic secret-bearing command runner. A sandboxed script may parse or pass a sentinel, while the proxy performs host-scoped substitution without exposing the real value to the process or agent.
 
@@ -324,9 +325,9 @@ Run this slice only if the outstanding 6d gates confirm that sandbox-runtime 0.0
 - Require fail-closed structured extraction and safe file-deny fallback on macOS.
 - Verify that plaintext credentials cannot appear in sandboxed processes, diagnostics, prompts, or command output.
 
-**Slice 8 verified:** [`upstream-0.6.6-slice-8-checkpoint.md`](../integration/upstream-0.6.6-slice-8-checkpoint.md) records the global-only trust decision, policy-only schema boundary, project warning/ignore behaviour, explicit host scopes, fail-closed extraction validation, rejection of plaintext injection, canonicalized runtime plumbing, direct macOS sandbox-wrapper execution, host-scoped substitution, sentinel/file non-disclosure, and cleanup. The direct runtime components and macOS wrapper passed; the full nested manager was not widened past the already-active outer sandbox's scoped mux-socket policy. Linux credential-file masking, project composition, generic secret-bearing runners, ordinary credential prompts, and unrelated lifecycle/prompt work remain deferred.
+**Slice 8 closure verified:** [`upstream-0.6.6-slice-8-checkpoint.md`](../integration/upstream-0.6.6-slice-8-checkpoint.md) records the global-only trust decision, policy-only schema boundary, project warning/ignore behaviour, explicit host scopes, rejection of all environment JWT decode declarations due to runtime 0.0.72's fail-open mismatch path, supported fail-closed extraction, rejection of plaintext injection, canonicalized runtime plumbing, direct macOS sandbox-wrapper execution, host-scoped substitution, sentinel/file non-disclosure, and cleanup. File decode mismatch tests confirm that the narrower accepted file surface honors `deny`/`error`; the real macOS wrapper executes the denied `cat` and reports a nonzero read denial without plaintext or a fake bind. The direct runtime components and macOS wrapper passed; the full nested manager was not widened past the already-active outer sandbox's scoped mux-socket policy. Linux credential-file masking, project composition, generic secret-bearing runners, ordinary credential prompts, and unrelated lifecycle/prompt work remain deferred.
 
-**Exit condition:** met for the bounded consumer/runtime seams: credential contract and direct macOS integration tests pass, including substitution only for explicitly configured hosts. Full manager orchestration remains a known harness limitation rather than a broadened permission or weakened assertion.
+**Exit condition:** met for the bounded consumer/runtime seams: credential contract and direct macOS integration tests pass, including substitution only for explicitly configured hosts and direct denied-file-read evidence. Full manager orchestration remains a known harness limitation rather than a broadened permission or weakened assertion.
 
 ### Slice 9: Permission prompts and lifecycle integration
 

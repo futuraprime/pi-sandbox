@@ -215,6 +215,19 @@ function validateCredentialEntry(
     return undefined;
   }
 
+  // sandbox-runtime 0.0.72 ignores onExtractNoMatch when JWT verification or
+  // claim matching fails for environment variables. The inherited value then
+  // remains visible in the sandbox, so no environment decode policy may cross
+  // this validated boundary. Whole-value and regex extraction masking remain
+  // supported because their fail-closed mismatch paths are handled below.
+  if (kind === "env" && entry.decode !== undefined) {
+    warnInvalidCredentials(
+      scope,
+      `entry ${kind}[${index}]; decode policies are not supported for environment variables with sandbox-runtime 0.0.72; use whole-value or regex extraction masking`,
+    );
+    return undefined;
+  }
+
   if (entry.mode === "mask") {
     if (!entry.injectHosts || entry.injectHosts.length === 0) {
       warnInvalidCredentials(

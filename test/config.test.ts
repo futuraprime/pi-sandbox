@@ -404,6 +404,42 @@ test("structured extraction accepts only fail-closed runtime choices", () => {
   }
 });
 
+test("rejects every environment decode policy regardless of its mismatch choice", () => {
+  const syntheticPlaintext = "synthetic-env-decode-value-must-not-be-logged";
+  const warnings: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => warnings.push(String(args[0]));
+  try {
+    const credentials = {
+      envVars: [
+        {
+          name: "PI_INVALID_JWT",
+          mode: "mask",
+          decode: "jwt",
+          onExtractNoMatch: "deny",
+          injectHosts: ["api.example.com"],
+        },
+        {
+          name: "PI_MISSING_CLAIM",
+          mode: "mask",
+          decode: "jwt",
+          maskClaims: ["access_token"],
+          onExtractNoMatch: "error",
+          injectHosts: ["api.example.com"],
+        },
+      ],
+    };
+    const merged = mergeConfigLayers(DEFAULT_CONFIG, { credentials }, {});
+
+    assert.equal(merged.credentials, undefined);
+    assert.equal(warnings.length, 2);
+    assert.ok(warnings.every((warning) => warning.includes("decode policies are not supported")));
+    assert.ok(warnings.every((warning) => !warning.includes(syntheticPlaintext)));
+  } finally {
+    console.error = originalError;
+  }
+});
+
 test("mask credentials require a nonempty explicit host scope", () => {
   for (const injectHosts of [undefined, []]) {
     assert.deepEqual(
