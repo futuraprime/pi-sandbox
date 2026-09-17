@@ -86,6 +86,70 @@ function backgroundNodeCommand(cwd: string, source: string): { command: string; 
   return { command, pidPath };
 }
 
+test("buildRuntimeConfig passes policy-only credentials and canonicalizes file paths", () => {
+  const cwd = mkdtempSync(join(process.cwd(), ".pi-sandbox-credentials-"));
+  try {
+    const runtime = buildRuntimeConfig(
+      {
+        ...DEFAULT_CONFIG,
+        credentials: {
+          files: [
+            {
+              path: "./protected/token.txt",
+              mode: "deny",
+            },
+          ],
+          envVars: [
+            {
+              name: "PI_SYNTHETIC_TOKEN",
+              mode: "mask",
+              injectHosts: ["api.example.com"],
+            },
+          ],
+        },
+      },
+      undefined,
+      "darwin",
+      cwd,
+    );
+
+    assert.deepEqual(runtime.credentials, {
+      files: [
+        {
+          path: canonicalizePath(join(cwd, "protected/token.txt")),
+          mode: "deny",
+        },
+      ],
+      envVars: [
+        {
+          name: "PI_SYNTHETIC_TOKEN",
+          mode: "mask",
+          injectHosts: ["api.example.com"],
+        },
+      ],
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("buildRuntimeConfig does not pass unknown credential values to the runtime", () => {
+  const runtime = buildRuntimeConfig({
+    ...DEFAULT_CONFIG,
+    credentials: {
+      envVars: [
+        {
+          name: "PI_SYNTHETIC_TOKEN",
+          mode: "deny",
+          value: "synthetic-secret-must-not-be-accepted",
+        },
+      ],
+    } as never,
+  });
+
+  assert.equal(runtime.credentials, undefined);
+});
+
 test("buildRuntimeConfig adds session allowances without mutating config", () => {
   const runtime = buildRuntimeConfig(DEFAULT_CONFIG, {
     domains: ["example.com"],

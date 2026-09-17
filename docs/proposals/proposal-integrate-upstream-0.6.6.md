@@ -324,7 +324,9 @@ Run this slice only if the outstanding 6d gates confirm that sandbox-runtime 0.0
 - Require fail-closed structured extraction and safe file-deny fallback on macOS.
 - Verify that plaintext credentials cannot appear in sandboxed processes, diagnostics, prompts, or command output.
 
-**Exit condition:** credential contract and macOS integration tests pass, including substitution only for explicitly configured hosts.
+**Slice 8 verified:** [`upstream-0.6.6-slice-8-checkpoint.md`](../integration/upstream-0.6.6-slice-8-checkpoint.md) records the global-only trust decision, policy-only schema boundary, project warning/ignore behaviour, explicit host scopes, fail-closed extraction validation, rejection of plaintext injection, canonicalized runtime plumbing, direct macOS sandbox-wrapper execution, host-scoped substitution, sentinel/file non-disclosure, and cleanup. The direct runtime components and macOS wrapper passed; the full nested manager was not widened past the already-active outer sandbox's scoped mux-socket policy. Linux credential-file masking, project composition, generic secret-bearing runners, ordinary credential prompts, and unrelated lifecycle/prompt work remain deferred.
+
+**Exit condition:** met for the bounded consumer/runtime seams: credential contract and direct macOS integration tests pass, including substitution only for explicitly configured hosts. Full manager orchestration remains a known harness limitation rather than a broadened permission or weakened assertion.
 
 ### Slice 9: Permission prompts and lifecycle integration
 
@@ -404,7 +406,7 @@ Run formatting, linting, TypeScript checking, and unit tests. Run platform-speci
 - Should users be able to remove inherited rules through a separate explicit command, while keeping empty-array composition cumulative?
 - Which upstream SSH proxy behaviour complements the downstream preflight and existing macOS `allowUnauthenticatedSocksProxy` flow, and which parts duplicate or weaken them?
 - Does sandbox-runtime 0.0.72 preserve the scoped Chromium and macOS Git-over-SSH behaviour from the pinned downstream fork, or must those patches be ported before adopting its credential support?
-- Should credential policies compose cumulatively across global and project configuration, or should credential declarations be global-only initially to reduce the risk of project-controlled injection policy?
+- Credential policy composition was resolved in Slice 8 as global-only initially; revisit only through an explicit trust review and composition contract.
 - Should `sandboxUserShell` be accepted, rejected, or exposed only through explicit per-session confirmation?
 - Should the pnpm and Node test-runner migration be adopted as part of this work or handled separately?
 

@@ -4,12 +4,13 @@ import { fileURLToPath } from "node:url";
 
 import {
   SandboxManager,
+  type CredentialsConfig,
   type SandboxAskCallback,
   type SandboxRuntimeConfig,
 } from "@carderne/sandbox-runtime";
 import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-agent";
 
-import { type SandboxConfig } from "./config.ts";
+import { type SandboxConfig, validateCredentials } from "./config.ts";
 import { canonicalizePath, canonicalizePathPattern, decideDomainPolicy } from "./policy.ts";
 import { getProtectedSandboxConfigPaths } from "./sandbox-command.ts";
 import { getEffectiveFilesystemPolicy } from "./sandbox-filesystem.ts";
@@ -41,6 +42,35 @@ const canonicalizeFilesystemPatterns = (paths: string[], cwd = process.cwd()) =>
 
 const canonicalizeSocketPaths = (paths: string[], cwd = process.cwd()) =>
   unique(paths.map((path) => canonicalizePath(path, cwd)));
+
+function canonicalizeCredentials(
+  credentials: CredentialsConfig | undefined,
+  cwd: string,
+): CredentialsConfig | undefined {
+  if (!credentials) return undefined;
+  return {
+    ...credentials,
+    ...(credentials.files
+      ? {
+          files: credentials.files.map((file) => ({
+            ...file,
+            path: canonicalizePath(file.path, cwd),
+            ...(file.injectHosts ? { injectHosts: [...file.injectHosts] } : {}),
+            ...(file.maskClaims ? { maskClaims: [...file.maskClaims] } : {}),
+          })),
+        }
+      : {}),
+    ...(credentials.envVars
+      ? {
+          envVars: credentials.envVars.map((envVar) => ({
+            ...envVar,
+            ...(envVar.injectHosts ? { injectHosts: [...envVar.injectHosts] } : {}),
+            ...(envVar.maskClaims ? { maskClaims: [...envVar.maskClaims] } : {}),
+          })),
+        }
+      : {}),
+  };
+}
 
 function sandboxRuntimeReadPaths(platform: NodeJS.Platform): string[] {
   if (platform !== "linux") return [];
@@ -171,6 +201,7 @@ export function buildRuntimeConfig(
 ): SandboxRuntimeConfig {
   const effective = resolveAllowances(config, allowances, cwd);
   const protectedConfigPaths = getProtectedSandboxConfigPaths(cwd);
+  const credentials = canonicalizeCredentials(validateCredentials(config.credentials), cwd);
   return {
     network: {
       ...config.network,
@@ -198,6 +229,7 @@ export function buildRuntimeConfig(
         cwd,
       ),
     },
+    credentials,
     ignoreViolations: config.ignoreViolations,
     enableWeakerNestedSandbox: config.enableWeakerNestedSandbox,
     allowBrowserProcess: config.allowBrowserProcess,

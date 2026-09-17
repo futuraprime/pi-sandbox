@@ -12,6 +12,7 @@ import {
   loadConfig,
   mergeConfigLayers,
   type SandboxConfig,
+  validateCredentials,
 } from "../src/config.ts";
 import { updateSandboxConfigFile } from "../src/sandbox-command.ts";
 
@@ -281,6 +282,160 @@ test("loadConfig warns and ignores malformed and non-object JSON values", () => 
     console.error = originalError;
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("credentials accept only global policy metadata and ignore project declarations", () => {
+  const warnings: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => warnings.push(String(args[0]));
+  try {
+    const merged = mergeConfigLayers(
+      DEFAULT_CONFIG,
+      {
+        credentials: {
+          envVars: [
+            {
+              name: "PI_SYNTHETIC_TOKEN",
+              mode: "mask",
+              injectHosts: ["api.example.com"],
+            },
+          ],
+        },
+      },
+      {
+        credentials: {
+          envVars: [
+            {
+              name: "PROJECT_TOKEN",
+              mode: "deny",
+            },
+          ],
+        },
+      },
+    );
+
+    assert.deepEqual(merged.credentials, {
+      envVars: [
+        {
+          name: "PI_SYNTHETIC_TOKEN",
+          mode: "mask",
+          injectHosts: ["api.example.com"],
+        },
+      ],
+    });
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /project credentials.*global-only/);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("credentials reject values and fail-open extraction policies without exposing input", () => {
+  const warnings: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => warnings.push(String(args[0]));
+  try {
+    const credentials = validateCredentials({
+      envVars: [
+        {
+          name: "PI_SYNTHETIC_TOKEN",
+          mode: "mask",
+          value: "synthetic-secret-must-not-be-accepted",
+          injectHosts: ["api.example.com"],
+        },
+        {
+          name: "PI_STRUCTURED_TOKEN",
+          mode: "mask",
+          extract: "token=(\\\\S+)",
+          injectHosts: ["api.example.com"],
+        },
+        {
+          name: "PI_VALID_TOKEN",
+          mode: "mask",
+          injectHosts: ["api.example.com"],
+        },
+      ],
+    });
+
+    assert.deepEqual(credentials, {
+      envVars: [
+        {
+          name: "PI_VALID_TOKEN",
+          mode: "mask",
+          injectHosts: ["api.example.com"],
+        },
+      ],
+    });
+    assert.equal(warnings.length, 2);
+    assert.ok(warnings.every((warning) => !warning.includes("synthetic-secret")));
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("structured extraction accepts only fail-closed runtime choices", () => {
+  for (const onExtractNoMatch of ["deny", "error"] as const) {
+    assert.deepEqual(
+      validateCredentials({
+        envVars: [
+          {
+            name: "PI_STRUCTURED_TOKEN",
+            mode: "mask",
+            extract: "token=(\\\\S+)",
+            onExtractNoMatch,
+            injectHosts: ["api.example.com"],
+          },
+        ],
+      }),
+      {
+        envVars: [
+          {
+            name: "PI_STRUCTURED_TOKEN",
+            mode: "mask",
+            extract: "token=(\\\\S+)",
+            onExtractNoMatch,
+            injectHosts: ["api.example.com"],
+          },
+        ],
+      },
+    );
+  }
+});
+
+test("mask credentials require a nonempty explicit host scope", () => {
+  for (const injectHosts of [undefined, []]) {
+    assert.deepEqual(
+      validateCredentials({
+        envVars: [{ name: "PI_SYNTHETIC_TOKEN", mode: "mask", injectHosts }],
+      }),
+      undefined,
+    );
+  }
+});
+
+test("credential policy is not editable through permission persistence", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-credential-persistence-"));
+  const configPath = join(root, "sandbox.json");
+  try {
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        credentials: {
+          envVars: [{ name: "PI_SYNTHETIC_TOKEN", mode: "deny" }],
+        },
+      }),
+      "utf8",
+    );
+    updateSandboxConfigFile(configPath, { key: "allowRead", value: "./docs" }, root);
+    assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
+      credentials: {
+        envVars: [{ name: "PI_SYNTHETIC_TOKEN", mode: "deny" }],
+      },
+      filesystem: { allowRead: ["./docs"] },
+    });
+  } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
