@@ -1,5 +1,5 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -81,6 +81,86 @@ export function createNetworkAskCallback(
   deniedDomains: string[] = [],
 ): SandboxAskCallback {
   return async ({ host }) => decideDomainPolicy(host, allowedDomains, deniedDomains) === "allow";
+}
+
+function getDarwinUserTempDir(): string | undefined {
+  try {
+    const tempDir = execFileSync("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"], {
+      encoding: "utf8",
+    }).trim();
+    return tempDir ? realpathSync(tempDir) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function findShellQuotedTokenEnd(command: string, start: number): number {
+  for (let index = start + 1; index < command.length; index += 1) {
+    if (command.startsWith(`'"'"'`, index)) {
+      index += 4;
+    } else if (command[index] === "'") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function isStockBrowserProfile(profile: string): boolean {
+  return (
+    profile.startsWith("(version 1)\n(deny default ") &&
+    profile.includes("\n; Network\n") &&
+    profile.includes("\n; Browser process support (Chrome/Chromium)\n") &&
+    profile.includes("\n(allow mach*)\n")
+  );
+}
+
+function shellQuoteInlineFragment(fragment: string): string {
+  return fragment.replaceAll("'", "'\"'\"'");
+}
+
+/**
+ * Add the four downstream Chromium grants missing from stock sandbox-runtime.
+ * The runtime owns profile generation; this only augments its generated macOS
+ * profile and is therefore shipped with the consumer rather than a workspace
+ * package-manager patch.
+ */
+export function augmentMacosBrowserProfile(
+  wrappedCommand: string,
+  allowBrowserProcess: boolean,
+): string {
+  if (process.platform !== "darwin" || !allowBrowserProcess) return wrappedCommand;
+
+  const browserTempDir = getDarwinUserTempDir();
+  if (!browserTempDir) return wrappedCommand;
+
+  const profilePrefix = "/usr/bin/sandbox-exec -p '";
+  const profilePrefixIndex = wrappedCommand.indexOf(profilePrefix);
+  if (profilePrefixIndex === -1) return wrappedCommand;
+
+  const profileStart = profilePrefixIndex + profilePrefix.length - 1;
+  const profileEnd = findShellQuotedTokenEnd(wrappedCommand, profileStart);
+  if (profileEnd === -1) return wrappedCommand;
+
+  const profile = wrappedCommand.slice(profileStart + 1, profileEnd);
+  const marker = "; pi-sandbox scoped Chromium resources";
+  if (profile.includes(marker) || !isStockBrowserProfile(profile)) return wrappedCommand;
+
+  const scopedRules = [
+    marker,
+    '(allow sysctl-read (sysctl-name "kern.hv_vmm_present"))',
+    '(allow network-bind (local ip "*:*"))',
+    '(allow network-inbound (local ip "*:*"))',
+    '(allow network-outbound (remote ip "localhost:*"))',
+    "(allow system-socket (socket-domain AF_UNIX))",
+    `(allow network-bind (local unix-socket (subpath ${JSON.stringify(browserTempDir)})))`,
+    `(allow network-outbound (remote unix-socket (subpath ${JSON.stringify(browserTempDir)})))`,
+    `(allow file-read* file-write* (subpath ${JSON.stringify(browserTempDir)}))`,
+  ].join("\n");
+
+  // The profile is already inside a shell single-quoted argument. Encode any
+  // apostrophe from the system-provided temp path without changing the shell
+  // quoting of the wrapped command or the generated profile.
+  return `${wrappedCommand.slice(0, profileEnd)}\n${shellQuoteInlineFragment(scopedRules)}${wrappedCommand.slice(profileEnd)}`;
 }
 
 export function buildRuntimeConfig(
@@ -287,7 +367,10 @@ export function createSandboxedBashOps(shellPath?: string, sshProxy = true): Bas
       };
 
       try {
-        const wrappedCommand = await SandboxManager.wrapWithSandbox(commandToWrap, shell);
+        const wrappedCommand = augmentMacosBrowserProfile(
+          await SandboxManager.wrapWithSandbox(commandToWrap, shell),
+          SandboxManager.getConfig()?.allowBrowserProcess === true,
+        );
         // The runtime only acquires a command-scoped cleanup resource when it
         // returns an actual wrapper. Calling cleanup for an unchanged command
         // could decrement the active count belonging to another command.

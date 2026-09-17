@@ -73,10 +73,8 @@ Note below that the order of precedence for filesystem read and write are opposi
   "enabled": true,
   "sandboxUserShell": false,       // Sandbox commands entered with `!`. Defaults to true
   "permissionPromptTimeoutSeconds": 600, // Defaults to 10 minutes; 0 waits indefinitely
-  "allowBrowserProcess": true,     // If you want to use agent-browser or similar Chrome setup
+  "allowBrowserProcess": true,     // Chrome setup; macOS adds scoped loopback/temp access
   "network": {
-    "allowLocalBinding": true,     // ditto
-    "allowAllUnixSockets": true,   // ditto
     "allowUnauthenticatedSocksProxy": true, // Enables Git-over-SSH on macOS
     "allowedDomains": ["github.com", "*.github.com"],
     "deniedDomains": []

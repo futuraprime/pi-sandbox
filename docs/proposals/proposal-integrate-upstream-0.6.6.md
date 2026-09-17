@@ -1,6 +1,6 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1–5, 6a, 6b, 6c, and 6d complete; stock 0.0.72 upgrade deferred; conditional Slice 7 triggered
+- **Status:** In progress — slices 1–5, 6a, 6b, 6c, 6d, and 7 complete; exact 0.0.72 approved with a bounded consumer-side Chromium adapter and fresh network regressions
 - **Date:** 2026-09-03
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
@@ -303,7 +303,7 @@ Plan the migration as nine expected `/execute`-sized slices, plus one conditiona
 
 **Slice 6d acceptance complete:** [the acceptance record](../integration/upstream-0.6.6-slice-6d-acceptance.md) records the pinned npm integrity and host provenance, real scoped Chromium enabled/disabled launches, BSD `nc` SOCKS and Git-over-SSH gates, domain filtering, HTTP proxy authentication separation, exact SSH-agent approval, extension-seam limitations, cleanup, and the reset/replacement-init readiness probe. Standalone SOCKS, domain, HTTP-auth, SSH-agent, and Git protocol checks passed, but stock 0.0.72 failed the scoped Chromium gate because its generated profile omits the downstream sysctl, loopback-bind, and Darwin user-temp file/socket grants. The upgrade remains deferred; conditional Slice 7 is triggered for the minimum scoped browser adaptation. Full extension lifecycle acceptance remains assigned to Slice 9. No dependency, runtime-version, lockfile, or production code changes were made.
 
-**Exit condition:** focused runtime tests and macOS checks either demonstrate parity on 0.0.72 or produce a bounded adaptation plan for the conditional slice. 6d produced that bounded adaptation plan; 0.0.72 is not approved for upgrade.
+**Exit condition:** focused runtime tests and macOS checks either demonstrate parity on 0.0.72 or produce a bounded adaptation plan for the conditional slice. 6d produced that bounded adaptation plan; 0.0.72 was not approved at that checkpoint.
 
 ### Slice 7: Runtime adaptation, if required
 
@@ -313,7 +313,9 @@ Run this slice only if the outstanding 6d gates confirm that sandbox-runtime 0.0
 - Review any changed runtime defaults before enabling them.
 - Repeat the focused runtime and macOS compatibility checks before upgrading the dependency.
 
-**Exit condition:** runtime 0.0.72 meets the downstream compatibility and security gates, or the upgrade is explicitly deferred with the existing runtime retained.
+**Slice 7 verified:** [`upstream-0.6.6-slice-7-checkpoint.md`](../integration/upstream-0.6.6-slice-7-checkpoint.md) records the exact `0.0.72` pin and integrity, the consumer-side adapter and its narrow profile contract, red stock-profile/green adapted-profile evidence, clean packed-consumer proof, real enabled/disabled Chromium and direct `sysctlbyname` results, and cleanup. The exact runtime is approved with the adapter: it adds only Darwin browser sysctl, loopback, and user-temp file/AF_UNIX grants when `allowBrowserProcess` is enabled, never broad Unix sockets. Fresh bounded 0.0.72 checks passed parent-proxy CONNECT/TLS/HTTP, authenticated HTTP separation, domain denial, BSD `nc` SOCKS compatibility, exact SSH-agent approval, and read-only Git-over-SSH. The full-manager rerun remained unsuitable inside the active outer sandbox because its nested mux socket was correctly denied; Slice 6d remains the prior full standalone-manager acceptance record. The extension known-hosts limitation and Slice 9 lifecycle boundaries remain unchanged; Slice 8 is next for credentials.
+
+**Exit condition:** runtime 0.0.72 meets the downstream compatibility and security gates, or the upgrade is explicitly deferred with the existing runtime retained. Slice 7 meets this condition through the bounded adapter; no credentials, upstream SSH proxy, prompt/UI, or lifecycle recovery work was pulled forward.
 
 ### Slice 8: Credential masking
 
