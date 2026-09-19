@@ -1,11 +1,12 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1–5, 6a, 6b, 6c, 6d, 7, and 8 closure complete; exact 0.0.72 approved with a bounded consumer-side Chromium adapter, fresh network regressions, and a fail-closed credential consumer boundary
+- **Status:** In progress — slices 1–5, 6a, 6b, 6c, 6d, 7, 8, and 9a complete; exact 0.0.72 approved with a bounded consumer-side Chromium adapter, fresh network regressions, a fail-closed credential consumer boundary, and tested permission-prompt/UI contracts; Slice 9b lifecycle recovery remains open
 - **Date:** 2026-09-03
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
 - **Slice 6c assessment:** [sandbox-runtime 0.0.70/0.0.72 assessment](../integration/upstream-0.6.6-slice-6c-assessment.md)
 - **Slice 6d acceptance:** [macOS runtime acceptance](../integration/upstream-0.6.6-slice-6d-acceptance.md)
+- **Slice 9a checkpoint:** [permission-prompt/UI contracts](../integration/upstream-0.6.6-slice-9a-checkpoint.md)
 
 ## Context
 
@@ -331,13 +332,26 @@ Run this slice only if the outstanding 6d gates confirm that sandbox-runtime 0.0
 
 ### Slice 9: Permission prompts and lifecycle integration
 
+Slice 9 remains in progress and is divided into the prompt/UI contract work and the lifecycle recovery work.
+
+#### Slice 9a: Permission-prompt/UI contracts (complete)
+
 - Adapt editable and validated prompt rules to downstream scope and persistence semantics.
 - Add timeout behaviour that aborts without persistence and emit attention events for prompts.
-- Complete extension lifecycle wiring, stale-context handling, cleanup, status, and sandbox reinitialisation.
-- Handle reset-success/initialisation-failure explicitly: restore the previous runtime when possible, otherwise block Bash until recovery, report the unavailable runtime, and roll back new session-only allowances.
-- Keep optional `/sandbox-allow`, SSH proxy, `sandboxUserShell`, and toggle decisions outside this slice unless separately approved.
+- Require explicit second confirmation for project/global grants across key, navigation, and edited flows while retaining one-step session grants.
+- Preserve project-relative presentation and scope-aware canonical persistence without weakening configuration protection or policy precedence.
 
-**Exit condition:** prompt, UI, lifecycle, and extension-seam tests pass without weakening configuration protection or policy precedence.
+**Slice 9a verified:** [`upstream-0.6.6-slice-9a-checkpoint.md`](../integration/upstream-0.6.6-slice-9a-checkpoint.md) records executable UI and extension contracts for edited domain/read/write rules, reset/non-match/acceptance behavior, project-relative and scope-aware persistence, repeated timeout blocking without session allowance, attention emission, and no-UI/hard-deny boundaries.
+
+#### Slice 9b: Lifecycle recovery (open)
+
+- Complete extension lifecycle wiring, stale-context handling, cleanup, status, and sandbox reinitialisation where not already covered.
+- Handle reset-success/initialisation-failure explicitly: restore the previous runtime when possible, otherwise block Bash until recovery, report the unavailable runtime, and roll back new session-only allowances.
+- Validate replacement recovery and explicit ready/unavailable state before claiming full Slice 9 completion.
+
+Keep optional `/sandbox-allow`, SSH proxy, `sandboxUserShell`, and toggle decisions outside Slice 9 unless separately approved.
+
+**Exit condition:** prompt, UI, lifecycle, and extension-seam tests pass without weakening configuration protection or policy precedence. Slice 9a meets only the prompt/UI portion; Slice 9b remains required.
 
 ### Slice 10: Parity, cleanup, and update rehearsal
 

@@ -10,12 +10,14 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test, { mock } from "node:test";
 
 import { SandboxManager } from "@carderne/sandbox-runtime";
 import assert from "node:assert/strict";
 
+import { DEFAULT_CONFIG, type SandboxConfig } from "../src/config.ts";
 import { renderDiagnosticBlockData, type SandboxDiagnosticBlockData } from "../src/diagnostics.ts";
 import extension from "../src/extension.ts";
 import {
@@ -70,6 +72,24 @@ function makePi(options: { noSandbox?: boolean } = {}) {
 
 function makeProjectTempDirectory(prefix: string): string {
   return mkdtempSync(join(process.cwd(), `.pi-sandbox-${prefix}-`));
+}
+
+function makePromptTestConfig(): SandboxConfig {
+  return {
+    ...DEFAULT_CONFIG,
+    network: {
+      ...DEFAULT_CONFIG.network!,
+      allowedDomains: [],
+      deniedDomains: [],
+    },
+    filesystem: {
+      ...DEFAULT_CONFIG.filesystem!,
+      allowRead: [],
+      allowWrite: [],
+      denyRead: [],
+      denyWrite: [],
+    },
+  };
 }
 
 function allowSshTestDomain(root: string): void {
@@ -724,6 +744,168 @@ test("/sandbox warns when persistence succeeds but active runtime refresh fails"
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("permission prompts persist confirmed scopes without serializing session grants", async () => {
+  const root = makeProjectTempDirectory("permission-scope");
+  const sessionTargetRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-permission-session-"));
+  const globalTargetRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-permission-global-"));
+  const writeTargetRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-permission-write-"));
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(root, "global-agent");
+  const initializeMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+
+  try {
+    const { pi, handlers } = makePi();
+    const config = makePromptTestConfig();
+    extension(pi, { configLoader: () => config });
+    const notices: string[] = [];
+    const ctx = makeContext(root, notices);
+    (ctx.ui as any).custom = <T>(factory: any): Promise<T> =>
+      new Promise<T>((resolve) => {
+        let component: any;
+        component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          (value: T) => {
+            component?.dispose?.();
+            resolve(value);
+          },
+        );
+        const action = (ctx as any).__nextPermissionAction as string;
+        for (const key of action === "session"
+          ? ["s"]
+          : action === "project"
+            ? ["P", "\r"]
+            : ["A", "\r"]) {
+          component.handleInput(key);
+        }
+      });
+
+    await handlers.get("session_start")?.({}, ctx);
+    const targetFor = (directory: string) => join(directory, "blocked.txt");
+    const checkRead = async (target: string, action: "session" | "project" | "global") => {
+      (ctx as any).__nextPermissionAction = action;
+      return handlers.get("tool_call")?.({ toolName: "read", input: { path: target } }, ctx);
+    };
+
+    const sessionTarget = targetFor(sessionTargetRoot);
+    assert.equal(await checkRead(sessionTarget, "session"), undefined);
+    // A second access is allowed by the in-memory grant, not by either config file.
+    assert.equal(await checkRead(sessionTarget, "session"), undefined);
+    assert.equal(existsSync(join(root, ".pi", "sandbox.json")), false);
+    assert.equal(existsSync(join(root, "global-agent", "sandbox.json")), false);
+
+    const projectTarget = join(root, "packages", "widget", "src", "index.ts");
+    assert.equal(await checkRead(projectTarget, "project"), undefined);
+    assert.deepEqual(JSON.parse(readFileSync(join(root, ".pi", "sandbox.json"), "utf8")), {
+      filesystem: { allowRead: ["packages/widget/src/index.ts"] },
+    });
+    assert.equal(existsSync(join(root, "global-agent", "sandbox.json")), false);
+
+    const globalTarget = targetFor(globalTargetRoot);
+    assert.equal(await checkRead(globalTarget, "global"), undefined);
+    const globalPath = join(root, "global-agent", "sandbox.json");
+    assert.deepEqual(JSON.parse(readFileSync(globalPath, "utf8")), {
+      filesystem: { allowRead: [join(realpathSync(globalTargetRoot), "blocked.txt")] },
+    });
+
+    (ctx as any).__nextPermissionAction = "project";
+    assert.equal(
+      await handlers.get("tool_call")?.(
+        { toolName: "bash", input: { command: "curl https://blocked.example.test" } },
+        ctx,
+      ),
+      undefined,
+    );
+    assert.deepEqual(JSON.parse(readFileSync(join(root, ".pi", "sandbox.json"), "utf8")), {
+      filesystem: { allowRead: ["packages/widget/src/index.ts"] },
+      network: { allowedDomains: ["blocked.example.test"] },
+    });
+
+    (ctx as any).__nextPermissionAction = "global";
+    const writeTarget = targetFor(writeTargetRoot);
+    assert.equal(
+      await handlers.get("tool_call")?.({ toolName: "write", input: { path: writeTarget } }, ctx),
+      undefined,
+    );
+    assert.deepEqual(JSON.parse(readFileSync(globalPath, "utf8")), {
+      filesystem: {
+        allowRead: [join(realpathSync(globalTargetRoot), "blocked.txt")],
+        allowWrite: [join(realpathSync(writeTargetRoot), "blocked.txt")],
+      },
+    });
+  } finally {
+    initializeMock.mock.restore();
+    resetMock.mock.restore();
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(root, { recursive: true, force: true });
+    rmSync(sessionTargetRoot, { recursive: true, force: true });
+    rmSync(globalTargetRoot, { recursive: true, force: true });
+    rmSync(writeTargetRoot, { recursive: true, force: true });
+  }
+});
+
+test("permission prompt timeout aborts without persistence, refresh, or session allowance", async () => {
+  const root = makeProjectTempDirectory("permission-timeout");
+  const targetRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-permission-timeout-target-"));
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(root, "global-agent");
+  let initializeCount = 0;
+  let resetCount = 0;
+  let promptCount = 0;
+  const initializeMock = mock.method(SandboxManager, "initialize", async () => {
+    initializeCount += 1;
+  });
+  const resetMock = mock.method(SandboxManager, "reset", async () => {
+    resetCount += 1;
+  });
+
+  try {
+    const { pi, handlers } = makePi();
+    const config = { ...makePromptTestConfig(), permissionPromptTimeoutSeconds: 0.01 };
+    extension(pi, { configLoader: () => config });
+    const ctx = makeContext(root, []);
+    (ctx.ui as any).custom = async <T>(factory: any): Promise<T> => {
+      promptCount += 1;
+      return new Promise<T>((resolve) => {
+        const component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          resolve,
+        );
+        void component;
+      });
+    };
+    await handlers.get("session_start")?.({}, ctx);
+    const beforeRefresh = { initializeCount, resetCount };
+    const target = join(targetRoot, "blocked.txt");
+    const firstResult = await handlers.get("tool_call")?.(
+      { toolName: "read", input: { path: target } },
+      ctx,
+    );
+    const secondResult = await handlers.get("tool_call")?.(
+      { toolName: "read", input: { path: target } },
+      ctx,
+    );
+    assert.equal(firstResult?.block, true);
+    assert.equal(secondResult?.block, true);
+    assert.equal(promptCount, 2);
+    assert.deepEqual({ initializeCount, resetCount }, beforeRefresh);
+    assert.equal(existsSync(join(root, ".pi", "sandbox.json")), false);
+    assert.equal(existsSync(join(root, "global-agent", "sandbox.json")), false);
+  } finally {
+    initializeMock.mock.restore();
+    resetMock.mock.restore();
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(root, { recursive: true, force: true });
+    rmSync(targetRoot, { recursive: true, force: true });
   }
 });
 

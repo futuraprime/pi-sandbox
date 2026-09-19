@@ -10,7 +10,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Key, Text } from "@earendil-works/pi-tui";
 
-import { getConfigPaths, loadConfig } from "./config.ts";
+import { getConfigPaths, loadConfig, type SandboxConfig } from "./config.ts";
 import {
   addUniqueDiagnostics,
   finalizeDiagnostic,
@@ -131,10 +131,13 @@ function sandboxConfigMutationMessage(cwd: string): string {
 export interface SandboxExtensionOptions {
   /** Injectable platform seam for portable SSH preflight contracts. */
   platform?: NodeJS.Platform;
+  /** Injectable configuration seam for isolated policy and prompt contracts. */
+  configLoader?: (cwd: string) => SandboxConfig;
 }
 
 export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}) {
   const platform = options.platform ?? process.platform;
+  const readConfig = options.configLoader ?? loadConfig;
   pi.registerFlag("no-sandbox", {
     description: "Disable OS-level sandboxing for bash commands",
     type: "boolean",
@@ -164,7 +167,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
   // serialized with either the project or global sandbox configuration.
   const sandboxIncidents: SandboxIncident[] = [];
 
-  const effectiveAllowances = (cwd: string) => resolveAllowances(loadConfig(cwd), allowances, cwd);
+  const effectiveAllowances = (cwd: string) => resolveAllowances(readConfig(cwd), allowances, cwd);
   const effectiveDomains = (cwd: string) => effectiveAllowances(cwd).domains;
   const effectiveReadPaths = (cwd: string) => effectiveAllowances(cwd).readPaths;
   const effectiveWritePaths = (cwd: string) => effectiveAllowances(cwd).writePaths;
@@ -176,7 +179,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
   ): Promise<boolean> {
     if (!sandboxInitialized) return true;
     try {
-      await reinitializeSandbox(loadConfig(cwd), allowances, cwd);
+      await reinitializeSandbox(readConfig(cwd), allowances, cwd);
       if (sessionGeneration !== expectedGeneration) return false;
       sandboxCwd = cwd;
       sandboxRuntimeOwnerGeneration = expectedGeneration;
@@ -265,15 +268,16 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
 
   function projectRuleValue(value: string, cwd: string): string {
     if (!isAbsolute(value) && !value.startsWith("~")) return value;
+    const canonicalCwd = canonicalizePath(cwd, cwd);
     const canonical = canonicalizePathPattern(value, cwd);
-    const relativePath = relative(cwd, canonical);
+    const relativePath = relative(canonicalCwd, canonical);
     if (relativePath === "") return ".";
     if (relativePath.startsWith("..")) return canonical;
     return relativePath.startsWith(".") ? relativePath : `./${relativePath}`;
   }
 
   function diagnosticPolicy(cwd: string) {
-    const config = loadConfig(cwd);
+    const config = readConfig(cwd);
     const effective = effectiveAllowances(cwd);
     return {
       cwd,
@@ -338,7 +342,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       socketPath,
       allowedSockets: sessionUnixSockets(),
       reinitialize: async () => {
-        await reinitializeSandbox(loadConfig(cwd), allowances, cwd);
+        await reinitializeSandbox(readConfig(cwd), allowances, cwd);
         sandboxCwd = cwd;
         return true;
       },
@@ -355,7 +359,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     const choice = await promptSshAuthBlock(
       pi,
       ctx,
-      loadConfig(ctx.cwd).permissionPromptTimeoutSeconds,
+      readConfig(ctx.cwd).permissionPromptTimeoutSeconds,
     );
     if (choice.action !== "ssh-session") {
       return choice.action === "abort" ? "abort" : "none";
@@ -384,7 +388,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     command: string,
     incident: SandboxIncident,
   ): Promise<"not-needed" | "allowed" | "blocked"> {
-    const config = loadConfig(ctx.cwd);
+    const config = readConfig(ctx.cwd);
     const sshAuthSock = process.env.SSH_AUTH_SOCK;
     const result = await runSshAuthPreflight({
       command,
@@ -429,7 +433,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
 
     incident.promptShown = true;
     incident.promptCount += 1;
-    const timeout = loadConfig(ctx.cwd).permissionPromptTimeoutSeconds;
+    const timeout = readConfig(ctx.cwd).permissionPromptTimeoutSeconds;
     const target = diagnostic.rawTarget ?? diagnostic.target;
     if (diagnostic.type === "ssh-auth") {
       const choice = await requestSshAuthAccess(ctx, target);
@@ -468,7 +472,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
   ): ReturnType<typeof createSandboxedBashOps> {
     const baseOperations = createSandboxedBashOps(
       shellPath,
-      loadConfig(ctx.cwd).network?.sshProxy !== false,
+      readConfig(ctx.cwd).network?.sshProxy !== false,
     );
     return {
       async exec(command, cwd, execOptions) {
@@ -647,7 +651,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       return false;
     }
 
-    const config = loadConfig(ctx.cwd);
+    const config = readConfig(ctx.cwd);
     if (platform !== "darwin" && platform !== "linux") {
       sandboxExecutionBlocked = false;
       updateStatus(ctx, "unsupported");
@@ -847,7 +851,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       }
     }
 
-    const config = loadConfig(ctx.cwd);
+    const config = readConfig(ctx.cwd);
     if (config.sandboxUserShell === false) return;
     const incident = incidentFor("user_bash", event.command);
     const recordDiagnosticInContext = !event.excludeFromContext;
@@ -966,7 +970,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       return { block: true, reason: "Sandbox is not ready; command execution remains blocked." };
     }
     if (!sandboxEnabled) return;
-    const config = loadConfig(ctx.cwd);
+    const config = readConfig(ctx.cwd);
     if (!config.enabled) return;
     const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
 
@@ -1085,7 +1089,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
       return;
     }
-    if (!loadConfig(ctx.cwd).enabled) {
+    if (!readConfig(ctx.cwd).enabled) {
       sandboxEnabled = false;
       sandboxInitialized = false;
       sandboxCwd = null;
@@ -1196,7 +1200,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
 
       ctx.ui.notify(
         formatSandboxConfiguration(
-          loadConfig(ctx.cwd),
+          readConfig(ctx.cwd),
           getConfigPaths(ctx.cwd),
           allowances,
           resolveDerivedFilesystemAllowances(ctx.cwd).linkedGitMetadata,

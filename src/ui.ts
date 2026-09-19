@@ -1,3 +1,5 @@
+import { isAbsolute, relative } from "node:path";
+
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Input, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -6,7 +8,8 @@ import {
   getConfigPaths,
   type SandboxConfig,
 } from "./config.ts";
-import { allowsAllDomains, domainIsAllowed, matchesPattern } from "./policy.ts";
+import { allowsAllDomains, canonicalizePath, domainIsAllowed, matchesPattern } from "./policy.ts";
+import { validateSandboxCommandValue } from "./sandbox-command.ts";
 import { type SessionAllowances } from "./sandbox-runtime.ts";
 
 export type PermissionChoice = "abort" | "session" | "project" | "global";
@@ -75,17 +78,21 @@ export async function showPermissionPrompt<Action extends PromptAction = Permiss
   validateValue: (value: string) => string | null,
   timeoutSeconds?: number,
   promptOptions: PromptOption<Action>[] = permissionOptions(ctx.cwd) as PromptOption<Action>[],
+  displayValue = originalValue,
 ): Promise<PermissionPromptResult<Action>> {
   if (!ctx.hasUI) return { action: "abort" as Action, value: originalValue };
-
-  pi.events.emit("request-attention", { message: "Sandbox permission required" });
 
   const timeoutMs = permissionPromptTimeoutMs(timeoutSeconds);
   const options = promptOptions;
   const result = await ctx.ui.custom<PermissionPromptResult<Action>>((tui, theme, _kb, done) => {
+    // This callback is invoked only when the UI has actually opened a prompt.
+    // Hard-deny and no-UI paths return before custom() is reached.
+    pi.events.emit("request-attention", { message: "Sandbox permission required" });
+
     const input = new Input();
     let selectedIndex = 0;
     let pendingAction: Action | null = null;
+    let currentValue = displayValue;
     let editing = false;
     let componentFocused = false;
     let error: string | null = null;
@@ -118,7 +125,7 @@ export async function showPermissionPrompt<Action extends PromptAction = Permiss
       input.focused = componentFocused && editing;
     };
     const beginEditing = (): void => {
-      input.setValue(originalValue);
+      input.setValue(currentValue);
       input.handleInput("\x05");
       editing = true;
       error = null;
@@ -126,9 +133,21 @@ export async function showPermissionPrompt<Action extends PromptAction = Permiss
       updateFocus();
     };
     const stopEditing = (): void => {
+      // Esc and navigation reset an uncommitted edit. It must not leak into a
+      // later scope selection.
+      input.setValue(currentValue);
       editing = false;
       error = null;
       updateFocus();
+    };
+    const validate = (value: string): boolean => {
+      const validationError = validateValue(value);
+      if (!validationError) return true;
+      error = validationError;
+      editing = true;
+      updateFocus();
+      tui.requestRender();
+      return false;
     };
     const resolve = (action: Action): void => {
       if (action === "abort") {
@@ -136,16 +155,23 @@ export async function showPermissionPrompt<Action extends PromptAction = Permiss
         return;
       }
 
-      const value = editing ? input.getValue().trim() : originalValue;
-      const validationError = validateValue(value);
-      if (validationError) {
-        error = validationError;
-        editing = true;
-        updateFocus();
+      if (editing) {
+        const value = input.getValue().trim();
+        if (!validate(value)) return;
+        currentValue = value;
+        stopEditing();
+      } else if (!validate(currentValue)) {
+        return;
+      }
+
+      const option = options.find((candidate) => candidate.action === action);
+      if (option?.confirm && pendingAction !== action) {
+        pendingAction = action;
         tui.requestRender();
         return;
       }
-      finish({ action, value });
+      pendingAction = null;
+      finish({ action, value: currentValue });
     };
 
     if (timeoutMs !== undefined) {
@@ -212,7 +238,7 @@ export async function showPermissionPrompt<Action extends PromptAction = Permiss
         }
         lines.push("");
         const footer = editing
-          ? "↑↓ navigate, enter confirm, esc reset, ctrl+c cancel"
+          ? "↑↓ navigate, enter select/confirm, esc reset, ctrl+c cancel"
           : pendingAction
             ? "↑↓ navigate, tab edit, enter confirm, esc/ctrl+c cancel"
             : "↑↓ navigate, tab edit, enter select, esc/ctrl+c cancel";
@@ -269,18 +295,9 @@ export async function showPermissionPrompt<Action extends PromptAction = Permiss
         }
         for (let i = 0; i < options.length; i++) {
           const option = options[i]!;
-          if (data === option.key) {
-            resolve(option.action);
-            return;
-          }
           if (data.toLowerCase() === option.key.toLowerCase()) {
-            if (option.confirm) {
-              pendingAction = option.action;
-              selectedIndex = i;
-            } else {
-              resolve(option.action);
-            }
-            tui.requestRender();
+            selectedIndex = i;
+            resolve(option.action);
             return;
           }
         }
@@ -302,6 +319,27 @@ const validRule = (value: string, matches: boolean, target: string): string | nu
   return matches ? null : `Rule must match the blocked ${target}.`;
 };
 
+function projectRelativePromptValue(value: string, cwd: string): string {
+  const canonicalCwd = canonicalizePath(cwd, cwd);
+  const canonical = canonicalizePath(value, cwd);
+  const relativePath = relative(canonicalCwd, canonical);
+  if (relativePath === "") return ".";
+  if (isAbsolute(relativePath) || relativePath.startsWith("..")) return canonical;
+  return relativePath;
+}
+
+function validateRule(
+  key: "allowRead" | "allowWrite" | "allowedDomains",
+  value: string,
+  cwd: string,
+  matchesTarget: (value: string) => boolean,
+  target: string,
+): string | null {
+  const syntaxError = validateSandboxCommandValue(key, value, cwd);
+  if (syntaxError) return syntaxError;
+  return validRule(value, matchesTarget(value), target);
+}
+
 export function promptDomainBlock(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -313,7 +351,14 @@ export function promptDomainBlock(
     ctx,
     `🌐 Network blocked: "${domain}" is not in allowedDomains`,
     domain,
-    (value) => validRule(value, domainIsAllowed(domain, [value]), `domain "${domain}"`),
+    (value) =>
+      validateRule(
+        "allowedDomains",
+        value,
+        ctx.cwd,
+        (candidate) => domainIsAllowed(domain, [candidate]),
+        `domain "${domain}"`,
+      ),
     timeoutSeconds,
   );
 }
@@ -329,8 +374,17 @@ export function promptReadBlock(
     ctx,
     `📖 Read blocked: "${path}" is not in allowRead`,
     path,
-    (value) => validRule(value, matchesPattern(path, [value]), `path "${path}"`),
+    (value) =>
+      validateRule(
+        "allowRead",
+        value,
+        ctx.cwd,
+        (candidate) => matchesPattern(path, [candidate], ctx.cwd),
+        `path "${path}"`,
+      ),
     timeoutSeconds,
+    undefined,
+    projectRelativePromptValue(path, ctx.cwd),
   );
 }
 
@@ -345,8 +399,17 @@ export function promptWriteBlock(
     ctx,
     `📝 Write blocked: "${path}" is not in allowWrite`,
     path,
-    (value) => validRule(value, matchesPattern(path, [value]), `path "${path}"`),
+    (value) =>
+      validateRule(
+        "allowWrite",
+        value,
+        ctx.cwd,
+        (candidate) => matchesPattern(path, [candidate], ctx.cwd),
+        `path "${path}"`,
+      ),
     timeoutSeconds,
+    undefined,
+    projectRelativePromptValue(path, ctx.cwd),
   );
 }
 

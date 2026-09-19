@@ -112,6 +112,32 @@ test("hard filesystem denies do not prompt while more-specific allows can overri
   assert.deepEqual(calls, []);
 });
 
+test("hard denies remain prompt-free across direct path and network policy", async () => {
+  const root = "/policy-hard-deny";
+  assert.equal(decidePathPolicy(join(root, "read.txt"), [], [root], root), "deny");
+  assert.equal(decideWritePolicy(join(root, "write.txt"), [], [root], root), "deny");
+  assert.equal(decideDomainPolicy("api.example.com", [], ["api.example.com"]), "deny");
+
+  let promptCalls = 0;
+  assert.deepEqual(
+    await resolveWritePermission({
+      path: join(root, "write.txt"),
+      allowWrite: [],
+      denyWrite: [root],
+      cwd: root,
+      prompt: async () => {
+        promptCalls += 1;
+        return { action: "session" as const, value: root };
+      },
+      saveWritePermission: async () => {
+        promptCalls += 1;
+      },
+    }),
+    { action: "deny" },
+  );
+  assert.equal(promptCalls, 0);
+});
+
 test("resolves write permission without prompting for denied or allowed paths", async () => {
   const calls: string[] = [];
   const prompt = async () => {
