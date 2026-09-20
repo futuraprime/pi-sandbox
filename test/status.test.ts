@@ -87,6 +87,11 @@ test("uses compact lifecycle status states and clears on shutdown", () => {
   assert.equal(formatSandboxStatus("disabled", theme), "<ꗃ>");
   assert.equal(formatSandboxStatus("pending", theme), "<ꗃ>");
   assert.equal(formatSandboxStatus("unsupported", theme), "<ꗃ>");
+  assert.equal(formatSandboxStatus("unavailable", theme), "<ꗃ>");
+  assert.equal(
+    getSandboxStatusPresentation("unavailable").description,
+    "Sandbox unavailable; command execution blocked",
+  );
   assert.equal(formatSandboxStatus("error", theme), "<ꗃ>");
   assert.equal(formatSandboxStatus("shutdown", theme), undefined);
   assert.equal(getSandboxStatusPresentation("enabled").description, "Sandbox enabled");

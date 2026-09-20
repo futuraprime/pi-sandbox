@@ -1,12 +1,13 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1–5, 6a, 6b, 6c, 6d, 7, 8, and 9a complete; exact 0.0.72 approved with a bounded consumer-side Chromium adapter, fresh network regressions, a fail-closed credential consumer boundary, and tested permission-prompt/UI contracts; Slice 9b lifecycle recovery remains open
+- **Status:** In progress — slices 1–5, 6a, 6b, 6c, 6d, 7, 8, 9a, and 9b complete; exact 0.0.72 approved with a bounded consumer-side Chromium adapter, fresh network regressions, a fail-closed credential consumer boundary, and tested permission-prompt/UI/lifecycle contracts; Slice 10 parity and cleanup remains open
 - **Date:** 2026-09-03
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
 - **Slice 6c assessment:** [sandbox-runtime 0.0.70/0.0.72 assessment](../integration/upstream-0.6.6-slice-6c-assessment.md)
 - **Slice 6d acceptance:** [macOS runtime acceptance](../integration/upstream-0.6.6-slice-6d-acceptance.md)
 - **Slice 9a checkpoint:** [permission-prompt/UI contracts](../integration/upstream-0.6.6-slice-9a-checkpoint.md)
+- **Slice 9b checkpoint:** [lifecycle recovery](../integration/upstream-0.6.6-slice-9b-checkpoint.md)
 
 ## Context
 
@@ -315,7 +316,7 @@ Run this slice only if the outstanding 6d gates confirm that sandbox-runtime 0.0
 - Review any changed runtime defaults before enabling them.
 - Repeat the focused runtime and macOS compatibility checks before upgrading the dependency.
 
-**Slice 7 verified:** [`upstream-0.6.6-slice-7-checkpoint.md`](../integration/upstream-0.6.6-slice-7-checkpoint.md) records the exact `0.0.72` pin and integrity, the consumer-side adapter and its narrow profile contract, red stock-profile/green adapted-profile evidence, clean packed-consumer proof, real enabled/disabled Chromium and direct `sysctlbyname` results, and cleanup. The exact runtime is approved with the adapter: it adds only Darwin browser sysctl, loopback, and user-temp file/AF_UNIX grants when `allowBrowserProcess` is enabled, never broad Unix sockets. Fresh bounded 0.0.72 checks passed parent-proxy CONNECT/TLS/HTTP, authenticated HTTP separation, domain denial, BSD `nc` SOCKS compatibility, exact SSH-agent approval, and read-only Git-over-SSH. The full-manager rerun remained unsuitable inside the active outer sandbox because its nested mux socket was correctly denied; Slice 6d remains the prior full standalone-manager acceptance record. The extension known-hosts limitation and Slice 9 lifecycle boundaries remain unchanged; Slice 8 is next for credentials.
+**Slice 7 verified:** [`upstream-0.6.6-slice-7-checkpoint.md`](../integration/upstream-0.6.6-slice-7-checkpoint.md) records the exact `0.0.72` pin and integrity, the consumer-side adapter and its narrow profile contract, red stock-profile/green adapted-profile evidence, clean packed-consumer proof, real enabled/disabled Chromium and direct `sysctlbyname` results, and cleanup. The exact runtime is approved with the adapter: it adds only Darwin browser sysctl, loopback, and user-temp file/AF_UNIX grants when `allowBrowserProcess` is enabled, never broad Unix sockets. Fresh bounded 0.0.72 checks passed parent-proxy CONNECT/TLS/HTTP, authenticated HTTP separation, domain denial, BSD `nc` SOCKS compatibility, exact SSH-agent approval, and read-only Git-over-SSH. The full-manager rerun remained unsuitable inside the active outer sandbox because its nested mux socket was correctly denied; Slice 6d remains the prior full standalone-manager acceptance record. At that checkpoint, the extension known-hosts limitation and the then-open Slice 9 lifecycle boundary remained unchanged; Slice 8 followed for credentials.
 
 **Exit condition:** runtime 0.0.72 meets the downstream compatibility and security gates, or the upgrade is explicitly deferred with the existing runtime retained. Slice 7 meets this condition through the bounded adapter; no credentials, upstream SSH proxy, prompt/UI, or lifecycle recovery work was pulled forward.
 
@@ -332,7 +333,7 @@ Run this slice only if the outstanding 6d gates confirm that sandbox-runtime 0.0
 
 ### Slice 9: Permission prompts and lifecycle integration
 
-Slice 9 remains in progress and is divided into the prompt/UI contract work and the lifecycle recovery work.
+Slice 9 is complete and is divided into the prompt/UI contract work and the lifecycle recovery work.
 
 #### Slice 9a: Permission-prompt/UI contracts (complete)
 
@@ -343,15 +344,17 @@ Slice 9 remains in progress and is divided into the prompt/UI contract work and 
 
 **Slice 9a verified:** [`upstream-0.6.6-slice-9a-checkpoint.md`](../integration/upstream-0.6.6-slice-9a-checkpoint.md) records executable UI and extension contracts for edited domain/read/write rules, reset/non-match/acceptance behavior, project-relative and scope-aware persistence, repeated timeout blocking without session allowance, attention emission, and no-UI/hard-deny boundaries.
 
-#### Slice 9b: Lifecycle recovery (open)
+#### Slice 9b: Lifecycle recovery (complete)
 
-- Complete extension lifecycle wiring, stale-context handling, cleanup, status, and sandbox reinitialisation where not already covered.
-- Handle reset-success/initialisation-failure explicitly: restore the previous runtime when possible, otherwise block Bash until recovery, report the unavailable runtime, and roll back new session-only allowances.
-- Validate replacement recovery and explicit ready/unavailable state before claiming full Slice 9 completion.
+- Complete extension lifecycle wiring with explicit disabled, unsupported, initializing, ready, unavailable, shutting-down, and shutdown states.
+- Handle reset-success/initialisation-failure explicitly: restore the prior runtime only on an exact policy snapshot match; otherwise block Bash and direct tool execution until explicit recovery, report the unavailable runtime, and roll back newly added session-only allowances when refresh fails.
+- Serialize manager reset/initialize ownership and guard stale start, recovery, replacement, and shutdown completions from mutating a newer lifecycle.
+
+**Slice 9b verified:** [`upstream-0.6.6-slice-9b-checkpoint.md`](../integration/upstream-0.6.6-slice-9b-checkpoint.md) records the focused extension/status/runtime evidence, including fail-closed replacement failure, exact-equivalence restoration, persisted-but-blocked policy, explicit recovery, stale completion protection, serialized cleanup, and status presentation. The full nested SandboxManager orchestration remains constrained by the active outer sandbox mux socket policy; no permission broadening was used.
 
 Keep optional `/sandbox-allow`, SSH proxy, `sandboxUserShell`, and toggle decisions outside Slice 9 unless separately approved.
 
-**Exit condition:** prompt, UI, lifecycle, and extension-seam tests pass without weakening configuration protection or policy precedence. Slice 9a meets only the prompt/UI portion; Slice 9b remains required.
+**Exit condition:** met for Slice 9. Prompt, UI, lifecycle, and extension-seam tests pass without weakening configuration protection or policy precedence. Slice 10 parity, cleanup, and update rehearsal remains open.
 
 ### Slice 10: Parity, cleanup, and update rehearsal
 
@@ -420,7 +423,7 @@ Run formatting, linting, TypeScript checking, and unit tests. Run platform-speci
 - Should an explicit `/sandbox-allow` command remain alongside `/sandbox`, or should `/sandbox` gain an optional interactive scope selector?
 - Should users be able to remove inherited rules through a separate explicit command, while keeping empty-array composition cumulative?
 - Which upstream SSH proxy behaviour complements the downstream preflight and existing macOS `allowUnauthenticatedSocksProxy` flow, and which parts duplicate or weaken them?
-- Does sandbox-runtime 0.0.72 preserve the scoped Chromium and macOS Git-over-SSH behaviour from the pinned downstream fork, or must those patches be ported before adopting its credential support?
+- **Resolved in Slices 6d–8:** stock sandbox-runtime 0.0.72 needed the bounded consumer-side Chromium adapter; the exact runtime is now approved with that adapter, while the extension known-hosts limitation remains conservatively unavailable for disposable isolation.
 - Credential policy composition was resolved in Slice 8 as global-only initially; revisit only through an explicit trust review and composition contract.
 - Should `sandboxUserShell` be accepted, rejected, or exposed only through explicit per-session confirmation?
 - Should the pnpm and Node test-runner migration be adopted as part of this work or handled separately?

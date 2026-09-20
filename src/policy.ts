@@ -181,7 +181,10 @@ export async function resolveWritePermission({
     action: "abort" | "session" | "project" | "global";
     value: string;
   }>;
-  saveWritePermission: (choice: "session" | "project" | "global", value: string) => Promise<void>;
+  saveWritePermission: (
+    choice: "session" | "project" | "global",
+    value: string,
+  ) => Promise<void | boolean>;
 }) {
   const policy = decideWritePolicy(path, allowWrite, denyWrite, cwd);
   if (policy !== "prompt") return { action: policy };
@@ -189,7 +192,8 @@ export async function resolveWritePermission({
   const choice = await prompt(path);
   if (choice.action === "abort") return { action: "abort", value: choice.value };
 
-  await saveWritePermission(choice.action, choice.value);
+  const saved = await saveWritePermission(choice.action, choice.value);
+  if (saved === false) return { action: "blocked", value: choice.value };
   return { action: "granted", value: choice.value };
 }
 

@@ -15,6 +15,7 @@ export type SandboxStatusState =
   | "disabled"
   | "pending"
   | "unsupported"
+  | "unavailable"
   | "error"
   | "shutdown";
 
@@ -59,6 +60,12 @@ const STATUS_PRESENTATIONS: Record<SandboxStatusState, SandboxStatusPresentation
     text: "ꗃ",
     tone: "error",
     description: "Sandbox unsupported on this platform",
+  },
+  unavailable: {
+    state: "unavailable",
+    text: "ꗃ",
+    tone: "error",
+    description: "Sandbox unavailable; command execution blocked",
   },
   error: {
     state: "error",
