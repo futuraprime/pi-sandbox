@@ -80,6 +80,10 @@ test("macOS sandbox wrapper enforces environment deny and mask without plaintext
     t.skip("macOS sandbox wrapper");
     return;
   }
+  if (process.env.SANDBOX_RUNTIME === "1") {
+    t.skip("nested sandbox-exec is unavailable inside the sandbox runtime");
+    return;
+  }
 
   const maskedRegistry = new SentinelRegistry();
   const { setEnvVars } = buildMaskedEnvVars(
@@ -280,6 +284,10 @@ test("file JWT decode mismatch honors fail-closed deny and error choices", () =>
 test("masked file material is fake while macOS wrapper denies the real path", (t) => {
   if (process.platform !== "darwin") {
     t.skip("macOS credential-file fallback");
+    return;
+  }
+  if (process.env.SANDBOX_RUNTIME === "1") {
+    t.skip("nested sandbox-exec is unavailable inside the sandbox runtime");
     return;
   }
 

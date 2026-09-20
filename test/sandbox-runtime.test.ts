@@ -332,13 +332,10 @@ test("characterizes upstream runtime read expansion for write allowances", () =>
     "/",
   );
 
-  // C-13 keeps the direct-tool and runtime meanings of allowWrite as an
-  // explicit decision. Preserve the upstream result until that comparison.
+  // allowWrite also grants read access to match the direct-tool contract.
   assert.deepEqual(effective.readPaths, ["/configured-write", "/session-write"]);
   assert.deepEqual(effective.writePaths, ["/configured-write", "/session-write"]);
 });
-
-test.todo("C-13: decide whether runtime allowWrite also grants direct-tool read access");
 
 test("buildRuntimeConfig preserves allowPty at the runtime seam", () => {
   for (const allowPty of [true, false, undefined]) {

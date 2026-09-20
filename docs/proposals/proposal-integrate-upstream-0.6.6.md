@@ -356,6 +356,8 @@ Keep optional `/sandbox-allow`, SSH proxy, `sandboxUserShell`, and toggle decisi
 
 **Exit condition:** met for Slice 9. Prompt, UI, lifecycle, and extension-seam tests pass without weakening configuration protection or policy precedence. Slice 10 parity, cleanup, and update rehearsal remains open.
 
+**Pre-Slice-10 review:** [upstream 0.6.6 integration review](../reviews/upstream-0.6.6-integration-review.md) confirms upstream and downstream features are correctly combined through Slice 9, records the clean typecheck/lint/format state and 157 pass / 2 environment-only fail / 1 deferred-todo test result, and lists the Slice 10 caveats (sandbox-nested test skips, adapter fragility, mocked platform evidence, stale docs).
+
 ### Slice 10: Parity, cleanup, and update rehearsal
 
 - Review completed behaviour against the feature ledger and downstream `main`.

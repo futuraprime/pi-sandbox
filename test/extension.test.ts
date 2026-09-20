@@ -1042,6 +1042,83 @@ test("permission prompts persist confirmed scopes without serializing session gr
   }
 });
 
+test("direct reads inherit configured and session allowWrite with denyRead specificity", async () => {
+  const root = makeProjectTempDirectory("direct-read-write-allowance");
+  const configuredRoot = join(root, "configured");
+  const sessionRoot = join(root, "session");
+  mkdirSync(configuredRoot, { recursive: true });
+  mkdirSync(sessionRoot, { recursive: true });
+  const configuredTarget = join(configuredRoot, "configured.txt");
+  const sessionTarget = join(sessionRoot, "session.txt");
+  const config = makePromptTestConfig();
+  config.filesystem = {
+    ...config.filesystem!,
+    allowRead: [],
+    allowWrite: [configuredRoot],
+    denyRead: [root],
+  };
+  const initializeMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+
+  try {
+    const { pi, handlers } = makePi();
+    extension(pi, { configLoader: () => config });
+    const ctx = makeContext(root, []);
+    (ctx.ui as any).custom = (factory: any) =>
+      new Promise((resolve) => {
+        const component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          resolve,
+        );
+        component.handleInput("s");
+      });
+
+    await handlers.get("session_start")?.({}, ctx);
+
+    // A more-specific configured allowWrite overrides a broad denyRead for
+    // direct reads, but an equal-specificity denyRead still wins.
+    assert.equal(
+      await handlers.get("tool_call")?.(
+        { toolName: "read", input: { path: configuredTarget } },
+        ctx,
+      ),
+      undefined,
+    );
+    config.filesystem.denyRead = [configuredRoot];
+    const configuredDenied = await handlers.get("tool_call")?.(
+      { toolName: "read", input: { path: configuredTarget } },
+      ctx,
+    );
+    assert.equal(configuredDenied?.block, true);
+    assert.match(configuredDenied?.reason ?? "", /denyRead/);
+
+    // The same direct-read contract applies to a session-only write grant.
+    config.filesystem.denyRead = [];
+    assert.equal(
+      await handlers.get("tool_call")?.({ toolName: "write", input: { path: sessionTarget } }, ctx),
+      undefined,
+    );
+    config.filesystem.denyRead = [root];
+    assert.equal(
+      await handlers.get("tool_call")?.({ toolName: "read", input: { path: sessionTarget } }, ctx),
+      undefined,
+    );
+    config.filesystem.denyRead = [sessionTarget];
+    const sessionDenied = await handlers.get("tool_call")?.(
+      { toolName: "read", input: { path: sessionTarget } },
+      ctx,
+    );
+    assert.equal(sessionDenied?.block, true);
+    assert.match(sessionDenied?.reason ?? "", /denyRead/);
+  } finally {
+    initializeMock.mock.restore();
+    resetMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("permission prompt timeout aborts without persistence, refresh, or session allowance", async () => {
   const root = makeProjectTempDirectory("permission-timeout");
   const targetRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-permission-timeout-target-"));
