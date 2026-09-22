@@ -1,5 +1,6 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -365,42 +366,63 @@ function waitForChildProcess(child: ChildProcess): Promise<number | null> {
   });
 }
 
-const gitSshVerificationOptions = [
-  "-F",
-  "/dev/null",
-  "-o",
-  "BatchMode=yes",
-  "-o",
-  "StrictHostKeyChecking=yes",
-  "-o",
-  "UpdateHostKeys=no",
-  "-o",
-  "VerifyHostKeyDNS=no",
-  "-o",
-  "KnownHostsCommand=none",
-  "-o",
-  "UserKnownHostsFile=~/.ssh/known_hosts",
-  "-o",
-  "GlobalKnownHostsFile=/etc/ssh/ssh_known_hosts",
-  "-o",
-  "IdentityFile=none",
-  "-o",
-  "IdentityAgent=SSH_AUTH_SOCK",
-  "-o",
-  "IdentitiesOnly=no",
-  "-o",
-  "PreferredAuthentications=publickey",
-  "-o",
-  "PasswordAuthentication=no",
-  "-o",
-  "KbdInteractiveAuthentication=no",
-  "-o",
-  "GSSAPIAuthentication=no",
-  "-o",
-  "ControlMaster=no",
-  "-o",
-  "ControlPath=none",
-].map((argument) => `'${argument.replaceAll("'", "'\\''")}'`);
+function gitSshVerificationOptions(home: string | undefined): string[] | undefined {
+  // OpenSSH expands `~` using the account home, not the command's HOME. Use an
+  // explicit path from the execution environment and reject values that could
+  // be reinterpreted as OpenSSH tokens or its whitespace-separated file list.
+  if (
+    !home ||
+    !isAbsolute(home) ||
+    home.includes("%") ||
+    home.includes("'") ||
+    home.includes('"') ||
+    /\s/.test(home) ||
+    [...home].some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 0x1f || code === 0x7f;
+    })
+  ) {
+    return undefined;
+  }
+
+  const knownHostsPath = resolve(home, ".ssh", "known_hosts");
+  return [
+    "-F",
+    "/dev/null",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "StrictHostKeyChecking=yes",
+    "-o",
+    "UpdateHostKeys=no",
+    "-o",
+    "VerifyHostKeyDNS=no",
+    "-o",
+    "KnownHostsCommand=none",
+    "-o",
+    `UserKnownHostsFile=${knownHostsPath}`,
+    "-o",
+    "GlobalKnownHostsFile=/etc/ssh/ssh_known_hosts",
+    "-o",
+    "IdentityFile=none",
+    "-o",
+    "IdentityAgent=SSH_AUTH_SOCK",
+    "-o",
+    "IdentitiesOnly=no",
+    "-o",
+    "PreferredAuthentications=publickey",
+    "-o",
+    "PasswordAuthentication=no",
+    "-o",
+    "KbdInteractiveAuthentication=no",
+    "-o",
+    "GSSAPIAuthentication=no",
+    "-o",
+    "ControlMaster=no",
+    "-o",
+    "ControlPath=none",
+  ].map((argument) => `'${argument.replaceAll("'", "'\\''")}'`);
+}
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
@@ -411,7 +433,10 @@ function shellQuote(value: string): string {
  * standard known_hosts file; no user SSH config, key files, or host-key writes
  * are used. An unavailable proxy fails closed rather than connecting directly.
  */
-export function buildGitSshCommand(socksProxyPort?: number): string {
+export function buildGitSshCommand(socksProxyPort?: number, home?: string): string {
+  const verificationOptions = gitSshVerificationOptions(home);
+  if (!verificationOptions) return "'/usr/bin/false'";
+
   const validProxyPort =
     Number.isInteger(socksProxyPort) && socksProxyPort! > 0 && socksProxyPort! <= 65535;
   const proxyCommand = validProxyPort
@@ -419,7 +444,7 @@ export function buildGitSshCommand(socksProxyPort?: number): string {
     : "/usr/bin/false";
   return [
     "'/usr/bin/ssh'",
-    ...gitSshVerificationOptions,
+    ...verificationOptions,
     "'-o'",
     shellQuote(`ProxyCommand=${proxyCommand}`),
   ].join(" ");
@@ -429,16 +454,19 @@ function gitSshEnvironmentPrefix(
   command: string,
   platform: NodeJS.Platform,
   socksProxyPort: number | undefined,
+  home: string | undefined,
 ): string {
   if (!usesGitSshTransport(command)) return "unset GIT_SSH_COMMAND; ";
 
+  const verificationOptions = gitSshVerificationOptions(home);
+  if (!verificationOptions) return "export GIT_SSH_COMMAND=/usr/bin/false; ";
+
   if (platform === "darwin") {
-    return `export GIT_SSH_COMMAND=${shellQuote(buildGitSshCommand(socksProxyPort))}; `;
+    return `export GIT_SSH_COMMAND=${shellQuote(buildGitSshCommand(socksProxyPort, home))}; `;
   }
 
   if (platform === "linux") {
-    const verificationOptions = gitSshVerificationOptions.join(" ");
-    return `GIT_SSH_COMMAND="${"${GIT_SSH_COMMAND:-/usr/bin/false}"} ${verificationOptions}"; export GIT_SSH_COMMAND; `;
+    return `GIT_SSH_COMMAND="${"${GIT_SSH_COMMAND:-/usr/bin/false}"} ${verificationOptions.join(" ")}"; export GIT_SSH_COMMAND; `;
   }
 
   return "export GIT_SSH_COMMAND=/usr/bin/false; ";
@@ -454,7 +482,8 @@ export function createSandboxedBashOps(shellPath?: string): BashOperations {
         process.platform === "darwin" && usesGitSshTransport(command)
           ? SandboxManager.getSocksProxyPort()
           : undefined;
-      const commandToWrap = `${gitSshEnvironmentPrefix(command, process.platform, socksProxyPort)}${command}`;
+      const home = env === undefined ? process.env.HOME : env.HOME;
+      const commandToWrap = `${gitSshEnvironmentPrefix(command, process.platform, socksProxyPort, home)}${command}`;
       let cleanupRequired = false;
       let child: ChildProcess | undefined;
       let timedOut = false;

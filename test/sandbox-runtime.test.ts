@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -460,19 +461,67 @@ setInterval(() => {}, 1000);
   assert.ok(elapsed < 2000, `exec returned after ${elapsed}ms; expected idle teardown`);
 });
 
-test("Git SSH transport enforces host keys, uses only the approved agent, and fails closed", () => {
-  const command = buildGitSshCommand(45678);
-  assert.match(command, /StrictHostKeyChecking=yes/);
-  assert.match(command, /UpdateHostKeys=no/);
-  assert.match(command, /UserKnownHostsFile=~\/\.ssh\/known_hosts/);
-  assert.match(command, /IdentityFile=none/);
-  assert.match(command, /IdentityAgent=SSH_AUTH_SOCK/);
-  assert.match(command, /ProxyCommand=\/usr\/bin\/nc -X 5 -x localhost:45678 %h %p/);
-  assert.doesNotMatch(command, /StrictHostKeyChecking=(?:no|accept-new)/);
+test("Git SSH transport enforces host keys and OpenSSH uses the isolated HOME trust path", () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-sandbox-isolated-home-"));
+  try {
+    const knownHostsPath = join(home, ".ssh", "known_hosts");
+    const command = buildGitSshCommand(45678, home);
+    assert.match(command, /StrictHostKeyChecking=yes/);
+    assert.match(command, /UpdateHostKeys=no/);
+    assert.ok(command.includes(`UserKnownHostsFile=${knownHostsPath}`));
+    assert.match(command, /IdentityFile=none/);
+    assert.match(command, /IdentityAgent=SSH_AUTH_SOCK/);
+    assert.match(command, /ProxyCommand=\/usr\/bin\/nc -X 5 -x localhost:45678 %h %p/);
+    assert.doesNotMatch(command, /StrictHostKeyChecking=(?:no|accept-new)/);
 
-  const unavailableProxy = buildGitSshCommand(undefined);
-  assert.match(unavailableProxy, /ProxyCommand=\/usr\/bin\/false/);
-  assert.doesNotMatch(unavailableProxy, /ProxyCommand=\/usr\/bin\/nc/);
+    // Exercise the generated command through OpenSSH's config parser. This
+    // catches its `~` behavior, which resolves against the account home.
+    const sshConfig = execFileSync("/bin/sh", ["-c", `${command} -G localhost`], {
+      encoding: "utf8",
+      env: { ...process.env, HOME: home },
+    });
+    assert.ok(sshConfig.split("\n").includes(`userknownhostsfile ${knownHostsPath}`));
+
+    const unavailableProxy = buildGitSshCommand(undefined, home);
+    assert.match(unavailableProxy, /ProxyCommand=\/usr\/bin\/false/);
+    assert.doesNotMatch(unavailableProxy, /ProxyCommand=\/usr\/bin\/nc/);
+    assert.equal(buildGitSshCommand(45678), "'/usr/bin/false'");
+    assert.equal(buildGitSshCommand(45678, `${home} unsafe`), "'/usr/bin/false'");
+    assert.equal(buildGitSshCommand(45678, `${home}'unsafe`), "'/usr/bin/false'");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Git SSH derives trust path from execution HOME and fails closed without one", async (t) => {
+  let wrappedCommand = "";
+  const { cwd, exec } = createExecTestContext(t, (command) => {
+    wrappedCommand = command;
+    return ":";
+  });
+  const home = mkdtempSync(join(tmpdir(), "pi-sandbox-exec-home-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  if (process.platform === "darwin") {
+    mock.method(SandboxManager, "getSocksProxyPort", () => 45678);
+  }
+
+  await exec("git push git@example.com:org/repo", cwd, {
+    onData: () => {},
+    env: { ...process.env, HOME: home },
+  });
+  assert.ok(wrappedCommand.includes(join(home, ".ssh", "known_hosts")));
+
+  const envWithoutHome = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => name !== "HOME"),
+  );
+  await exec("git push git@example.com:org/repo", cwd, {
+    onData: () => {},
+    env: envWithoutHome,
+  });
+  assert.equal(
+    wrappedCommand,
+    "export GIT_SSH_COMMAND=/usr/bin/false; git push git@example.com:org/repo",
+  );
 });
 
 test("ordinary SSH is not wrapped while recognized Git SSH receives a scoped transport", async (t) => {
