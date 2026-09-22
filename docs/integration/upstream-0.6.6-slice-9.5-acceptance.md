@@ -1,7 +1,7 @@
 # Slice 9.5: Git-specific SSH transport acceptance
 
 - **Status:** Implementation regressions are the local gate; bare-macOS push acceptance is **PENDING**.
-- **Environment:** No disposable SSH remote or test credentials were used for this implementation. The delegated environment may be nested under `SANDBOX_RUNTIME=1`, so it is not evidence of bare-macOS SSH enforcement.
+- **Environment:** No disposable SSH remote or test credentials were used for this implementation. The current Pi session is sandboxed by this package (`SANDBOX_RUNTIME=1`); that variable does not indicate a separate outer sandbox. No end-to-end disposable-remote push was run.
 - **Required release evidence:** A successful Git push from a bare macOS Pi sandbox to a disposable SSH remote, with the checks below recorded. Read-only `ls-remote` is not a substitute.
 
 ## Transport contract
@@ -12,11 +12,11 @@ The transport invokes OpenSSH with user SSH configuration disabled, host-key che
 
 ## Different-worktree handoff
 
-Create a separate worktree from `feature/upstream-merge` at or after the commit containing this checklist. Run `pnpm install --frozen-lockfile`, `pnpm test`, `pnpm run check`, `pnpm run lint`, and `pnpm run ci:fmt` there before platform acceptance; check that the worktree is not nested under `SANDBOX_RUNTIME=1`. Perform the checklist below and append dated observations to this file in that worktree. Record fingerprints and outcomes, not private keys, agent contents, or secret-bearing logs. Do not mark Slice 9.5 accepted until both the local checks and the real disposable-remote push gate pass. Never push to the `upstream` remote.
+Create a separate worktree from `feature/upstream-merge` at or after the commit containing this checklist. From a regular macOS shell (not a command inside the current sandboxed Pi session), run `pnpm install --frozen-lockfile`, `pnpm test`, `pnpm run check`, `pnpm run lint`, and `pnpm run ci:fmt` there before platform acceptance. Then launch Pi with this package's sandbox enabled to run the Git commands under test; `SANDBOX_RUNTIME=1` inside that sandbox is expected. Perform the checklist below and append dated observations to this file in that worktree. Record fingerprints and outcomes, not private keys, agent contents, or secret-bearing logs. Do not mark Slice 9.5 accepted until both the local checks and the real disposable-remote push gate pass. Never push to the `upstream` remote.
 
 ## Disposable bare-macOS acceptance checklist (not yet run)
 
-Use a clean macOS host outside any outer sandbox. Do not use a real remote, a personal SSH key, the user's normal `HOME`, or the user's normal Pi agent directory. Use a temporary home, a temporary Pi agent directory, a loopback-only test `sshd`, a test-only client key held by a temporary `ssh-agent`, and a bare repository under a temporary directory. Confirm `/usr/bin/sshd`, `/usr/bin/ssh-keygen`, Git, and the extension's runtime dependencies are available before starting.
+Use a regular macOS shell to set up the disposable fixture; run the Git probes inside Pi with this package's sandbox enabled. Do not use a real remote, a personal SSH key, the user's normal `HOME`, or the user's normal Pi agent directory. Use a temporary home, a temporary Pi agent directory, a loopback-only test `sshd`, a test-only client key held by a temporary `ssh-agent`, and a bare repository under a temporary directory. Confirm `/usr/bin/sshd`, `/usr/bin/ssh-keygen`, Git, and the extension's runtime dependencies are available before starting.
 
 1. Create a temporary root and isolated home/project, with mode `0700` on private directories. Generate a disposable client key and disposable `sshd` host key with empty passphrases **only inside that temporary root**. Create a bare repository there.
 2. Start a disposable `sshd` on `127.0.0.1` and a high, unused port. Configure it to accept only the generated client public key, disable passwords and forwarding, and force the authorized key through `git-shell`. Keep its PID/config/logs and repository inside the temporary root.
