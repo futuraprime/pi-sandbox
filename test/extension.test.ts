@@ -183,6 +183,12 @@ function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
+function stripOrdinarySshEnvironmentPrefix(command: string): string {
+  const prefix = "unset GIT_SSH_COMMAND; ";
+  assert.ok(command.startsWith(prefix), `expected ordinary-command environment prefix: ${command}`);
+  return command.slice(prefix.length);
+}
+
 function blockedWriteCommand(path: string, nested = false): string {
   const failure = `printf 'bash: line 1: ${path}: Operation not permitted\\n' >&2; exit 1`;
   return nested ? `bash -c ${shellQuote(failure)}` : failure;
@@ -1577,7 +1583,7 @@ test("user_bash streams normal output once without diagnostic metadata", async (
   }
 });
 
-test("domain policy blocks a compound SSH command before SSH-agent approval", async () => {
+test("domain policy blocks a Git SSH command before SSH-agent approval", async () => {
   const root = makeProjectTempDirectory("ssh-domain-policy");
   mkdirSync(join(root, ".pi"), { recursive: true });
   writeFileSync(
@@ -1613,7 +1619,10 @@ test("domain policy blocks a compound SSH command before SSH-agent approval", as
 
     await handlers.get("session_start")?.({}, ctx);
     const response = await handlers.get("user_bash")?.(
-      { command: "ssh denied.example; printf should-not-run", excludeFromContext: false },
+      {
+        command: "git push git@denied.example:repo; printf should-not-run",
+        excludeFromContext: false,
+      },
       ctx,
     );
 
@@ -1644,7 +1653,7 @@ test("domain policy blocks a compound SSH command before SSH-agent approval", as
   }
 });
 
-test("macOS SSH preflight grants session access only during diagnostic execution", async () => {
+test("macOS Git SSH preflight grants session access only during diagnostic execution", async () => {
   const root = makeProjectTempDirectory("ssh-preflight-grant");
   allowSshTestDomain(root);
   const socketPath = join(root, "agent.sock");
@@ -1676,11 +1685,11 @@ test("macOS SSH preflight grants session access only during diagnostic execution
 
     await handlers.get("session_start")?.({}, ctx);
     const response = await handlers.get("user_bash")?.(
-      { command: "ssh host; printf done", excludeFromContext: true },
+      { command: "git push git@host:repo; printf done", excludeFromContext: true },
       ctx,
     );
     assert.ok(response?.operations);
-    const result = await response.operations.exec("ssh host; printf done", root, {
+    const result = await response.operations.exec("git push git@host:repo; printf done", root, {
       onData: () => undefined,
       timeout: 5,
       env: process.env,
@@ -1707,7 +1716,7 @@ test("macOS SSH preflight grants session access only during diagnostic execution
   }
 });
 
-test("macOS SSH preflight records one clean denied incident", async () => {
+test("macOS Git SSH preflight records one clean denied incident", async () => {
   const root = makeProjectTempDirectory("ssh-preflight-deny");
   allowSshTestDomain(root);
   const originalSocket = process.env.SSH_AUTH_SOCK;
@@ -1737,12 +1746,12 @@ test("macOS SSH preflight records one clean denied incident", async () => {
 
     await handlers.get("session_start")?.({}, ctx);
     const response = await handlers.get("user_bash")?.(
-      { command: "ssh host; printf done", excludeFromContext: false },
+      { command: "git push git@host:repo; printf done", excludeFromContext: false },
       ctx,
     );
     assert.ok(response?.operations);
     let output = "";
-    const result = await response.operations.exec("ssh host; printf done", root, {
+    const result = await response.operations.exec("git push git@host:repo; printf done", root, {
       onData: (data: Buffer) => {
         output += data.toString();
       },
@@ -1828,7 +1837,7 @@ test("agent Bash retains a blocked SSH preflight for sandbox-debug", async () =>
   }
 });
 
-test("macOS SSH preflight rolls back a failed grant before retrying", async () => {
+test("macOS Git SSH preflight rolls back a failed grant before retrying", async () => {
   const root = makeProjectTempDirectory("ssh-preflight-rollback");
   allowSshTestDomain(root);
   const originalSocket = process.env.SSH_AUTH_SOCK;
@@ -1860,11 +1869,11 @@ test("macOS SSH preflight rolls back a failed grant before retrying", async () =
 
     await handlers.get("session_start")?.({}, ctx);
     const first = await handlers.get("user_bash")?.(
-      { command: "ssh host; printf done", excludeFromContext: true },
+      { command: "git push git@host:repo; printf done", excludeFromContext: true },
       ctx,
     );
     assert.ok(first?.operations);
-    const denied = await first.operations.exec("ssh host; printf done", root, {
+    const denied = await first.operations.exec("git push git@host:repo; printf done", root, {
       onData: () => undefined,
       timeout: 5,
       env: process.env,
@@ -1872,7 +1881,7 @@ test("macOS SSH preflight rolls back a failed grant before retrying", async () =
     assert.equal(denied.exitCode, 1);
 
     const second = await handlers.get("user_bash")?.(
-      { command: "ssh host; printf done", excludeFromContext: true },
+      { command: "git push git@host:repo; printf done", excludeFromContext: true },
       ctx,
     );
     assert.equal(second?.result?.exitCode, 1);
@@ -2106,11 +2115,12 @@ test("Bash write diagnostics apply shared specificity to direct and nested comma
     events.push("reset");
   });
   const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async (command: string) => {
-    events.push(`wrap:${command}`);
-    const attempt = attempts.get(command) ?? 0;
-    attempts.set(command, attempt + 1);
-    const commandOutcomes = outcomes.get(command);
-    assert.ok(commandOutcomes, `missing deterministic runtime fixture for ${command}`);
+    const fixtureCommand = stripOrdinarySshEnvironmentPrefix(command);
+    events.push(`wrap:${fixtureCommand}`);
+    const attempt = attempts.get(fixtureCommand) ?? 0;
+    attempts.set(fixtureCommand, attempt + 1);
+    const commandOutcomes = outcomes.get(fixtureCommand);
+    assert.ok(commandOutcomes, `missing deterministic runtime fixture for ${fixtureCommand}`);
     return commandOutcomes[Math.min(attempt, commandOutcomes.length - 1)]!;
   });
 
@@ -2342,10 +2352,11 @@ test("registered Bash attributes successful and failed write retries in final re
   const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
   const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
   const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async (command: string) => {
-    const attempt = attempts.get(command) ?? 0;
-    attempts.set(command, attempt + 1);
-    const commandOutcomes = outcomes.get(command);
-    assert.ok(commandOutcomes, `missing deterministic runtime fixture for ${command}`);
+    const fixtureCommand = stripOrdinarySshEnvironmentPrefix(command);
+    const attempt = attempts.get(fixtureCommand) ?? 0;
+    attempts.set(fixtureCommand, attempt + 1);
+    const commandOutcomes = outcomes.get(fixtureCommand);
+    assert.ok(commandOutcomes, `missing deterministic runtime fixture for ${fixtureCommand}`);
     return commandOutcomes[Math.min(attempt, commandOutcomes.length - 1)]!;
   });
 

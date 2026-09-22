@@ -25,6 +25,7 @@ import {
   selectPrimaryViolation,
   shouldPreflightSshAuth,
   socketPathMatches,
+  usesGitSshTransport,
   type SandboxDiagnostic,
   type SandboxIncident,
 } from "../src/diagnostics.ts";
@@ -88,12 +89,39 @@ test("leaves ordinary operations and quoted prose alone", () => {
   }
 });
 
-test("detects only compound SSH commands for preflight", () => {
+test("recognizes scoped Git SSH network operations but not generic SSH or HTTPS", () => {
+  for (const command of [
+    "git clone ssh://git@example.com/org/repo",
+    "git fetch git@example.com:org/repo",
+    "git pull origin",
+    "git push origin",
+    "git ls-remote origin",
+    "git -C /work fetch origin",
+    "bash -c 'git push origin'",
+  ]) {
+    assert.equal(usesGitSshTransport(command), true, command);
+  }
+  for (const command of [
+    "ssh host",
+    "git status",
+    "git clone https://example.com/org/repo",
+    "git clone https://user@example.com:443/org/repo",
+    "git fetch git://example.com/org/repo",
+    "printf 'git push origin'",
+  ]) {
+    assert.equal(usesGitSshTransport(command), false, command);
+  }
+
   assert.equal(shouldPreflightSshAuth("ssh host"), false);
   assert.equal(shouldPreflightSshAuth("ssh host; printf done"), true);
   assert.equal(shouldPreflightSshAuth("printf done && git fetch git@example.com:repo"), true);
   assert.equal(shouldPreflightSshAuth("printf 'ssh host; echo text'"), false);
   assert.equal(shouldPreflightSshAuth("git clone https://example.com/repo"), false);
+  assert.equal(
+    shouldPreflightSshAuth("printf done && git fetch https://user@example.com:443/repo"),
+    false,
+  );
+  assert.equal(shouldPreflightSshAuth("printf done && git fetch git://example.com/repo"), false);
 });
 
 test("matches canonical socket scopes exactly and across descendants", () => {

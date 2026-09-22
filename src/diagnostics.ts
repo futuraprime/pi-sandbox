@@ -187,6 +187,28 @@ function gitOperation(words: ShellWords): GitOperation | null {
   return name ? { name: name.toLowerCase(), arguments: words.slice(operationIndex + 1) } : null;
 }
 
+function isGitSshTransportSegment(words: ShellWords): boolean {
+  const operation = gitOperation(words);
+  if (!operation || !/^(?:clone|fetch|pull|push|ls-remote)$/.test(operation.name)) return false;
+
+  const args = operation.arguments;
+  if (args.some((word) => /^(?:ssh|git\+ssh):\/\//i.test(word))) return true;
+  if (args.some((word) => /^(?:https?|git):\/\//i.test(word))) return false;
+  if (args.some((word) => /^[^@\s]+@[^\s:]+:/.test(word))) return true;
+  // A remote name or omitted URL can refer to an SSH remote configured in Git.
+  return true;
+}
+
+/** Route only recognized Git network operations through the SSH transport. */
+export function usesGitSshTransport(command: string): boolean {
+  if (typeof command !== "string" || command.length === 0) return false;
+  return shellCommandWords(command).some((words) => {
+    if (isGitSshTransportSegment(words)) return true;
+    const nested = nestedShellCommand(words);
+    return nested !== null && usesGitSshTransport(nested);
+  });
+}
+
 function isGitUpstreamOption(word: string): boolean {
   if (
     word === "--set-upstream" ||
@@ -716,31 +738,7 @@ function isSshCommandSegment(words: ShellWords): boolean {
   const index = skipWrapper(words);
   const executable = executableName(words[index]);
   if (executable === "ssh" || executable === "ssh-add") return true;
-  if (executable !== "git") return false;
-
-  let operation = index + 1;
-  const optionsWithValues = new Set([
-    "-C",
-    "-c",
-    "--config-env",
-    "--exec-path",
-    "--git-dir",
-    "--namespace",
-    "--super-prefix",
-    "--work-tree",
-  ]);
-  while (words[operation]?.startsWith("-")) {
-    const option = words[operation];
-    if (option === "--") return false;
-    operation += optionsWithValues.has(option) ? 2 : 1;
-  }
-  if (!/^(clone|fetch|pull|push|ls-remote)$/.test(words[operation] ?? "")) return false;
-
-  const args = words.slice(operation + 1);
-  if (args.some((word) => /^(?:ssh|git\+ssh):\/\//i.test(word))) return true;
-  if (args.some((word) => /^[^@\s]+@[^\s:]+:/.test(word))) return true;
-  if (args.some((word) => /^https?:\/\//i.test(word))) return false;
-  return true;
+  return executable === "git" && isGitSshTransportSegment(words);
 }
 
 function clearlySshTargeted(command: string): boolean {

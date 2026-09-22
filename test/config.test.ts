@@ -12,16 +12,22 @@ import {
   loadConfig,
   mergeConfigLayers,
   type SandboxConfig,
+  type SandboxConfigFile,
   validateCredentials,
 } from "../src/config.ts";
 import { updateSandboxConfigFile } from "../src/sandbox-command.ts";
 
-test("omitted settings use their defaults", () => {
+test("omitted settings use their defaults without enabling generic SSH proxying", () => {
   const merged = mergeConfigLayers(DEFAULT_CONFIG, {}, {});
 
   assert.equal(DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS, 600);
   assert.equal(merged.permissionPromptTimeoutSeconds, DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS);
   assert.equal(merged.sandboxUserShell, true);
+  assert.equal("sshProxy" in (merged.network ?? {}), false);
+
+  const legacyConfig = JSON.parse('{"network":{"sshProxy":true}}') as SandboxConfigFile;
+  const migrated = mergeConfigLayers(DEFAULT_CONFIG, legacyConfig, {});
+  assert.equal("sshProxy" in (migrated.network ?? {}), false);
 });
 
 test("mergeConfigLayers combines configured arrays and deduplicates entries", () => {

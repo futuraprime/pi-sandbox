@@ -12,6 +12,7 @@ import { canonicalizePath } from "../src/policy.ts";
 import { getProtectedSandboxConfigPaths } from "../src/sandbox-command.ts";
 import { resolveDerivedFilesystemAllowances } from "../src/sandbox-filesystem.ts";
 import {
+  buildGitSshCommand,
   buildRuntimeConfig,
   createNetworkAskCallback,
   createSandboxedBashOps,
@@ -52,7 +53,7 @@ function createExecTestContext(
 
   return {
     cwd,
-    exec: createSandboxedBashOps(undefined, false).exec,
+    exec: createSandboxedBashOps().exec,
     cleanupCount: () => cleanupCount,
     trackBackgroundProcess: (pidPath: string) => backgroundPidPaths.push(pidPath),
   };
@@ -459,6 +460,50 @@ setInterval(() => {}, 1000);
   assert.ok(elapsed < 2000, `exec returned after ${elapsed}ms; expected idle teardown`);
 });
 
+test("Git SSH transport enforces host keys, uses only the approved agent, and fails closed", () => {
+  const command = buildGitSshCommand(45678);
+  assert.match(command, /StrictHostKeyChecking=yes/);
+  assert.match(command, /UpdateHostKeys=no/);
+  assert.match(command, /UserKnownHostsFile=~\/\.ssh\/known_hosts/);
+  assert.match(command, /IdentityFile=none/);
+  assert.match(command, /IdentityAgent=SSH_AUTH_SOCK/);
+  assert.match(command, /ProxyCommand=\/usr\/bin\/nc -X 5 -x localhost:45678 %h %p/);
+  assert.doesNotMatch(command, /StrictHostKeyChecking=(?:no|accept-new)/);
+
+  const unavailableProxy = buildGitSshCommand(undefined);
+  assert.match(unavailableProxy, /ProxyCommand=\/usr\/bin\/false/);
+  assert.doesNotMatch(unavailableProxy, /ProxyCommand=\/usr\/bin\/nc/);
+});
+
+test("ordinary SSH is not wrapped while recognized Git SSH receives a scoped transport", async (t) => {
+  let wrappedCommand = "";
+  const { cwd, exec } = createExecTestContext(t, (command) => {
+    wrappedCommand = command;
+    return ":";
+  });
+
+  await exec("ssh host", cwd, { onData: () => {} });
+  assert.equal(wrappedCommand, "unset GIT_SSH_COMMAND; ssh host");
+  assert.doesNotMatch(wrappedCommand, /ssh\(\)|ProxyCommand/);
+
+  if (process.platform === "darwin") {
+    mock.method(SandboxManager, "getSocksProxyPort", () => 45678);
+  }
+  await exec("git push git@example.com:org/repo", cwd, { onData: () => {} });
+  assert.match(wrappedCommand, /^export GIT_SSH_COMMAND=/);
+  assert.match(wrappedCommand, /StrictHostKeyChecking=yes/);
+  if (process.platform === "darwin") {
+    assert.match(wrappedCommand, /ProxyCommand=\\?\/usr\/bin\/nc -X 5 -x localhost:45678/);
+  } else if (process.platform === "linux") {
+    assert.match(wrappedCommand, /GIT_SSH_COMMAND:-\/usr\/bin\/false/);
+  } else {
+    assert.equal(
+      wrappedCommand,
+      "export GIT_SSH_COMMAND=/usr/bin/false; git push git@example.com:org/repo",
+    );
+  }
+});
+
 test("exec returns a nonzero exit code", async (t) => {
   const { cwd, exec, cleanupCount } = createExecTestContext(t);
 
@@ -550,7 +595,7 @@ test(
     t.after(() => rmSync(fixtureDir, { recursive: true, force: true }));
     const shellPath = join(fixtureDir, "non-executable-shell");
     writeFileSync(shellPath, "#!/bin/sh\n", { mode: 0o600 });
-    const exec = createSandboxedBashOps(shellPath, false).exec;
+    const exec = createSandboxedBashOps(shellPath).exec;
 
     await assert.rejects(exec("true", cwd, { onData: () => {} }), (error) => {
       assert.equal((error as NodeJS.ErrnoException).code, "EACCES");

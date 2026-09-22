@@ -17,8 +17,6 @@ export type SandboxConfig = Omit<SandboxRuntimeConfig, "network" | "credentials"
   credentials?: CredentialsConfig;
   network?: NonNullable<SandboxRuntimeConfig["network"]> & {
     allowUnauthenticatedSocksProxy?: boolean;
-    /** Route ordinary `ssh` commands through the sandbox SOCKS proxy. */
-    sshProxy?: boolean;
   };
 };
 
@@ -43,7 +41,6 @@ export const DEFAULT_CONFIG: SandboxConfig = {
   permissionPromptTimeoutSeconds: DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS,
   network: {
     allowUnauthenticatedSocksProxy: process.platform === "darwin",
-    sshProxy: true,
     allowedDomains: [
       "npmjs.org",
       "*.npmjs.org",
@@ -95,13 +92,14 @@ function configuredSection(value: unknown): Record<string, unknown> {
 
 function mergeObjects(base: SandboxConfig, overrides: SandboxConfigFile): SandboxConfig {
   const network = configuredSection(overrides.network);
+  const { sshProxy: _ignoredSshProxy, ...safeNetwork } = network;
   const filesystem = configuredSection(overrides.filesystem);
   const { credentials: _ignoredCredentials, ...safeOverrides } = overrides;
 
   return {
     ...base,
     ...safeOverrides,
-    network: { ...base.network, ...network } as NetworkConfig,
+    network: { ...base.network, ...safeNetwork } as NetworkConfig,
     filesystem: { ...base.filesystem, ...filesystem } as FilesystemConfig,
   };
 }

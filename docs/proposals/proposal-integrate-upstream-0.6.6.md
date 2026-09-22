@@ -369,6 +369,8 @@ O-03 is resolved against adopting upstream's generic ordinary-SSH proxy. The dow
 
 **Exit condition:** recognised Git operations can fetch and push over SSH on bare macOS through the scoped transport; arbitrary ordinary SSH is not transparently proxied; domain, host-key, and exact SSH-agent gates remain effective; focused tests and the disposable-remote acceptance record pass.
 
+Implementation regressions and the explicit external gate are recorded in [the Slice 9.5 acceptance checklist](../integration/upstream-0.6.6-slice-9.5-acceptance.md). The bare-macOS disposable-remote push is pending and must not be inferred from nested sandbox or read-only SSH evidence.
+
 **Pre-Slice-10 review:** [upstream 0.6.6 integration review](../reviews/upstream-0.6.6-integration-review.md) confirms upstream and downstream features are correctly combined through Slice 9, records the clean typecheck/lint/format state and 157 pass / 2 environment-only fail / 1 deferred-todo test result, and lists the Slice 10 caveats (sandbox-nested test skips, adapter fragility, mocked platform evidence, stale docs). Slice 9.5 was added after that review to resolve the generic-SSH mismatch before final reconciliation.
 
 ### Slice 10: Parity, cleanup, and update rehearsal

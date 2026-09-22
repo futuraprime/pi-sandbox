@@ -11,6 +11,7 @@ import {
 import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-agent";
 
 import { type SandboxConfig, validateCredentials } from "./config.ts";
+import { usesGitSshTransport } from "./diagnostics.ts";
 import { canonicalizePath, canonicalizePathPattern, decideDomainPolicy } from "./policy.ts";
 import { getProtectedSandboxConfigPaths } from "./sandbox-command.ts";
 import { getEffectiveFilesystemPolicy } from "./sandbox-filesystem.ts";
@@ -364,23 +365,96 @@ function waitForChildProcess(child: ChildProcess): Promise<number | null> {
   });
 }
 
-export function createSandboxedBashOps(shellPath?: string, sshProxy = true): BashOperations {
+const gitSshVerificationOptions = [
+  "-F",
+  "/dev/null",
+  "-o",
+  "BatchMode=yes",
+  "-o",
+  "StrictHostKeyChecking=yes",
+  "-o",
+  "UpdateHostKeys=no",
+  "-o",
+  "VerifyHostKeyDNS=no",
+  "-o",
+  "KnownHostsCommand=none",
+  "-o",
+  "UserKnownHostsFile=~/.ssh/known_hosts",
+  "-o",
+  "GlobalKnownHostsFile=/etc/ssh/ssh_known_hosts",
+  "-o",
+  "IdentityFile=none",
+  "-o",
+  "IdentityAgent=SSH_AUTH_SOCK",
+  "-o",
+  "IdentitiesOnly=no",
+  "-o",
+  "PreferredAuthentications=publickey",
+  "-o",
+  "PasswordAuthentication=no",
+  "-o",
+  "KbdInteractiveAuthentication=no",
+  "-o",
+  "GSSAPIAuthentication=no",
+  "-o",
+  "ControlMaster=no",
+  "-o",
+  "ControlPath=none",
+].map((argument) => `'${argument.replaceAll("'", "'\\''")}'`);
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * Build a Git-only OpenSSH transport. Host keys must already be trusted in the
+ * standard known_hosts file; no user SSH config, key files, or host-key writes
+ * are used. An unavailable proxy fails closed rather than connecting directly.
+ */
+export function buildGitSshCommand(socksProxyPort?: number): string {
+  const validProxyPort =
+    Number.isInteger(socksProxyPort) && socksProxyPort! > 0 && socksProxyPort! <= 65535;
+  const proxyCommand = validProxyPort
+    ? `/usr/bin/nc -X 5 -x localhost:${socksProxyPort} %h %p`
+    : "/usr/bin/false";
+  return [
+    "'/usr/bin/ssh'",
+    ...gitSshVerificationOptions,
+    "'-o'",
+    shellQuote(`ProxyCommand=${proxyCommand}`),
+  ].join(" ");
+}
+
+function gitSshEnvironmentPrefix(
+  command: string,
+  platform: NodeJS.Platform,
+  socksProxyPort: number | undefined,
+): string {
+  if (!usesGitSshTransport(command)) return "unset GIT_SSH_COMMAND; ";
+
+  if (platform === "darwin") {
+    return `export GIT_SSH_COMMAND=${shellQuote(buildGitSshCommand(socksProxyPort))}; `;
+  }
+
+  if (platform === "linux") {
+    const verificationOptions = gitSshVerificationOptions.join(" ");
+    return `GIT_SSH_COMMAND="${"${GIT_SSH_COMMAND:-/usr/bin/false}"} ${verificationOptions}"; export GIT_SSH_COMMAND; `;
+  }
+
+  return "export GIT_SSH_COMMAND=/usr/bin/false; ";
+}
+
+export function createSandboxedBashOps(shellPath?: string): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout, env }) {
       if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
 
       const { shell, args } = getShellConfig(shellPath);
-
-      // OpenSSH does not honor ALL_PROXY, unlike most of the tools that use
-      // the sandbox network proxy. Install a shell function so ordinary
-      // `ssh host` commands use the runtime's local SOCKS proxy too. This is
-      // deliberately opt-in at the config layer, but enabled by default.
-      const socksProxyPort = sshProxy ? SandboxManager.getSocksProxyPort() : undefined;
-      const sshProxyCommand =
-        process.platform === "darwin" && socksProxyPort !== undefined
-          ? `ssh() { /usr/bin/ssh -o 'ProxyCommand=/usr/bin/nc -X 5 -x localhost:${socksProxyPort} %h %p' "$@"; }; `
-          : "";
-      const commandToWrap = `${sshProxyCommand}${command}`;
+      const socksProxyPort =
+        process.platform === "darwin" && usesGitSshTransport(command)
+          ? SandboxManager.getSocksProxyPort()
+          : undefined;
+      const commandToWrap = `${gitSshEnvironmentPrefix(command, process.platform, socksProxyPort)}${command}`;
       let cleanupRequired = false;
       let child: ChildProcess | undefined;
       let timedOut = false;

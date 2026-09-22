@@ -596,10 +596,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     initialIncident?: SandboxIncident,
     expectedGeneration = sessionGeneration,
   ): ReturnType<typeof createSandboxedBashOps> {
-    const baseOperations = createSandboxedBashOps(
-      shellPath,
-      readConfig(ctx.cwd).network?.sshProxy !== false,
-    );
+    const baseOperations = createSandboxedBashOps(shellPath);
     return {
       async exec(command, cwd, execOptions) {
         if (
