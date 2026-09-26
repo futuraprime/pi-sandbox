@@ -1,7 +1,8 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1–5, 6a, 6b, 6c, 6d, 7, 8, 9a, and 9b complete; exact 0.0.72 approved with a bounded consumer-side Chromium adapter, fresh network regressions, a fail-closed credential consumer boundary, and tested permission-prompt/UI/lifecycle contracts; Slice 9.5 Git-specific SSH transport and Slice 10 parity and cleanup remain open
+- **Status:** In progress — slices 1–5, 6a, 6b, 6c, 6d, 7, 8, 9a, 9b, and 9.5 complete; exact 0.0.72 approved with a bounded consumer-side Chromium adapter, fail-closed credential boundary, tested prompt/UI/lifecycle contracts, and bare-macOS Git-over-SSH push acceptance; only Slice 10 reconciliation and update rehearsal remain open
 - **Date:** 2026-09-03
+- **Updated:** 2026-09-26
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
 - **Slice 6c assessment:** [sandbox-runtime 0.0.70/0.0.72 assessment](../integration/upstream-0.6.6-slice-6c-assessment.md)
@@ -354,9 +355,9 @@ Slice 9 is complete and is divided into the prompt/UI contract work and the life
 
 Keep optional `/sandbox-allow`, SSH proxy, `sandboxUserShell`, and toggle decisions outside Slice 9 unless separately approved.
 
-**Exit condition:** met for Slice 9. Prompt, UI, lifecycle, and extension-seam tests pass without weakening configuration protection or policy precedence. Slice 9.5 Git-specific SSH transport and Slice 10 parity, cleanup, and update rehearsal remain open.
+**Exit condition:** met for Slice 9. Prompt, UI, lifecycle, and extension-seam tests pass without weakening configuration protection or policy precedence. Slice 9.5 is complete; Slice 10 parity, cleanup, and update rehearsal remain open.
 
-### Slice 9.5: Git-specific SSH transport
+### Slice 9.5: Git-specific SSH transport (complete)
 
 O-03 is resolved against adopting upstream's generic ordinary-SSH proxy. The downstream use case is Git fetch/pull/push over SSH, not transparent SSH connectivity for arbitrary commands.
 
@@ -369,7 +370,7 @@ O-03 is resolved against adopting upstream's generic ordinary-SSH proxy. The dow
 
 **Exit condition:** recognised Git operations can fetch and push over SSH on bare macOS through the scoped transport; arbitrary ordinary SSH is not transparently proxied; domain, host-key, and exact SSH-agent gates remain effective; focused tests and the disposable-remote acceptance record pass.
 
-Implementation regressions and the explicit external gate are recorded in [the Slice 9.5 acceptance checklist](../integration/upstream-0.6.6-slice-9.5-acceptance.md). The bare-macOS disposable-remote push is pending and must not be inferred from nested sandbox or read-only SSH evidence.
+**Exit condition met:** [the Slice 9.5 acceptance record](../integration/upstream-0.6.6-slice-9.5-acceptance.md) documents the disposable bare-macOS push and matching remote ref, domain and exact session-only agent enforcement, fresh-session reapproval, strict host-key mismatch denial/recovery with unchanged-file checksum, ordinary-SSH isolation, and cleanup. The `HEAD:` refspec false-positive was fixed and retested by a second successful sandboxed push; `git clone -b main` with a denied SCP-style host was blocked before network access. After final global-option parser hardening, the focused 54 tests and full 165-test suite passed (163 passed, 2 skipped); one unrelated output-drain timing test failed once and passed on rerun. No broad Unix-socket access or upstream push was granted.
 
 **Pre-Slice-10 review:** [upstream 0.6.6 integration review](../reviews/upstream-0.6.6-integration-review.md) confirms upstream and downstream features are correctly combined through Slice 9, records the clean typecheck/lint/format state and 157 pass / 2 environment-only fail / 1 deferred-todo test result, and lists the Slice 10 caveats (sandbox-nested test skips, adapter fragility, mocked platform evidence, stale docs). Slice 9.5 was added after that review to resolve the generic-SSH mismatch before final reconciliation.
 
@@ -378,6 +379,8 @@ Implementation regressions and the explicit external gate are recorded in [the S
 Slice 10 is divided into a read-only reconciliation audit and the approved reconciliation work. Do not assume downstream ownership of package identity or publishing metadata between these sub-slices.
 
 #### Slice 10a: Reconciliation audit and ownership decisions
+
+**Next-session handoff (2026-09-26):** Start from `feature/upstream-merge` at or after Slice 9.5 checkpoint `ad9ac73` (working tree clean at handoff). Read this proposal, [feature ledger](../integration/upstream-0.6.6-feature-ledger.md), [pre-Slice-10 review](../reviews/upstream-0.6.6-integration-review.md), and [Slice 9.5 acceptance record](../integration/upstream-0.6.6-slice-9.5-acceptance.md) before the audit. The pre-Slice-10 review predates Slice 9.5 and must be reconciled, not treated as current verification. Begin with the read-only 10a audit and surface package/version, publishing, author, and repository URL ownership decisions; do not implement 10b, remove downstream code, or push to `upstream` before approval. No Slice 9.5 `/tmp` SSH fixture remains; an unrelated port-49273 fixture in another worktree was left untouched. The temporary launch helper under ignored `tmp/` is fixture-specific and is not a source of release evidence. The latest full suite reported 163 passed, 2 skipped, 0 failed out of 165; an unrelated output-drain test failed on one run and passed on rerun.
 
 - Compare the completed branch with the feature ledger, proposal, review, and downstream `main`.
 - Audit README, examples, package metadata, lockfiles, repository URLs, and CI against the accepted behaviour.
@@ -457,7 +460,7 @@ Run formatting, linting, TypeScript checking, and unit tests. Run platform-speci
 - **Resolved for Slice 10b:** adopt the upstream command split: `/sandbox` becomes display-only and `/sandbox-allow domain|read|write <target>` uses the editable session/project/global permission prompt. Remove the six-rule editor only after replacement persistence, refresh, validation, and configuration-protection coverage passes.
 - Should users be able to remove inherited rules through a separate explicit command, while keeping empty-array composition cumulative?
 - **Resolved for Slice 9.5:** reject upstream's generic ordinary-SSH proxy and implement only a narrowly scoped Git-over-SSH transport, retaining domain filtering, secure host verification, exact session-only SSH-agent approval, and no broad Unix-socket access. Require a real disposable-remote push acceptance test on bare macOS.
-- **Resolved in Slices 6d–8:** stock sandbox-runtime 0.0.72 needed the bounded consumer-side Chromium adapter; the exact runtime is now approved with that adapter, while the extension known-hosts limitation remains conservatively unavailable for disposable isolation.
+- **Resolved in Slices 6d–9.5:** stock sandbox-runtime 0.0.72 needed the bounded consumer-side Chromium adapter; the exact runtime is approved with that adapter. Slice 9.5 resolved the extension's isolated-known-hosts limitation with an explicit trust path and strict host-key checking, verified against disposable SSH fixtures.
 - Credential policy composition was resolved in Slice 8 as global-only initially; revisit only through an explicit trust review and composition contract.
 - Should `sandboxUserShell` be accepted, rejected, or exposed only through explicit per-session confirmation?
 - Should the pnpm and Node test-runner migration be adopted as part of this work or handled separately?
