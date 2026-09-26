@@ -47,6 +47,59 @@ test("extracts HTTP(S), SSH URL, and SCP-like Git domains without output false p
   );
 });
 
+test("selects Git remotes after option values without treating destinations or refspecs as hosts", () => {
+  assert.deepEqual(
+    extractDomainsFromCommand(
+      [
+        "git push ssh://ehensleigh@127.0.0.1:49274/tmp/remote.git HEAD:refs/heads/main",
+        "git push git@git.example.com:team/repo.git +refs/heads/*:refs/heads/*",
+        "git push git@git.example.com:team/repo.git :refs/heads/main",
+        "git push git@git.example.com:team/repo.git main:release",
+        "git clone -b main git@denied.example:team/repo.git checkout",
+        "git clone --branch=main --origin upstream git@branch.example:team/repo.git checkout",
+        "git clone -o upstream git@origin.example:team/repo.git checkout",
+        "git clone git@source.example:team/repo.git git@destination.example:checkout",
+        "git push -o ci.skip git@push.example:team/repo.git HEAD:refs/heads/main",
+        "git push --push-option=ci.skip git@push-equals.example:team/repo.git HEAD:refs/heads/main",
+        "git push --repo git@repo-option.example:team/repo.git HEAD:refs/heads/main",
+        "git pull --rebase git@pull.example:team/repo.git",
+        "git ls-remote --sort version:refname git@sort.example:team/repo.git",
+        "git -C push clone git@cwd-separate.example:team/repo.git",
+        "git -C push push git@cwd-push.example:team/repo.git HEAD:main",
+        "git -Cpush clone git@cwd-attached.example:team/repo.git",
+        "git --git-dir push push git@git-dir-separate.example:team/repo.git HEAD:main",
+        "git --git-dir=push push git@git-dir-attached.example:team/repo.git HEAD:main",
+        "git --work-tree push pull git@work-tree.example:team/repo.git",
+        "git -c core.editor=push clone git@config-value.example:team/repo.git",
+        "git --unknown-option push clone git@ambiguous.example:team/repo.git",
+        "git clone --unknown=git@ambiguous-value.example:team/repo.git checkout",
+      ].join("; "),
+    ),
+    [
+      "127.0.0.1",
+      "git.example.com",
+      "denied.example",
+      "branch.example",
+      "origin.example",
+      "source.example",
+      "push.example",
+      "push-equals.example",
+      "repo-option.example",
+      "pull.example",
+      "sort.example",
+      "cwd-separate.example",
+      "cwd-push.example",
+      "cwd-attached.example",
+      "git-dir-separate.example",
+      "git-dir-attached.example",
+      "work-tree.example",
+      "config-value.example",
+      "ambiguous.example",
+      "ambiguous-value.example",
+    ],
+  );
+});
+
 test("uses specificity-aware precedence for domains, including wildcard allows", () => {
   assert.equal(decideDomainPolicy("api.example.com", ["*"], ["api.example.com"]), "deny");
   assert.equal(

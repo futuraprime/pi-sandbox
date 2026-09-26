@@ -1583,7 +1583,55 @@ test("user_bash streams normal output once without diagnostic metadata", async (
   }
 });
 
-test("domain policy blocks a Git SSH command before SSH-agent approval", async () => {
+test("Git push refspec does not prompt model Bash or user shell for a head domain", async () => {
+  const root = makeProjectTempDirectory("git-push-refspec-domain");
+  mkdirSync(join(root, ".pi"), { recursive: true });
+  writeFileSync(
+    join(root, ".pi", "sandbox.json"),
+    JSON.stringify({ network: { allowedDomains: ["127.0.0.1"] } }),
+  );
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+
+  try {
+    const { pi, handlers } = makePi();
+    extension(pi, { platform: "linux" });
+    const ctx = makeContext(root, []);
+    let promptCount = 0;
+    (ctx.ui as any).custom = (factory: any) =>
+      new Promise((resolve) => {
+        const component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          (result: unknown) => resolve(result),
+        );
+        promptCount += 1;
+        component.handleInput("esc");
+      });
+
+    await handlers.get("session_start")?.({}, ctx);
+    const command =
+      "git push ssh://ehensleigh@127.0.0.1:49274/tmp/pi-ssh-accept.UKY3UM/remote.git HEAD:refs/heads/main";
+    const modelBash = await handlers.get("tool_call")?.(
+      { toolName: "bash", input: { command } },
+      ctx,
+    );
+    assert.equal(modelBash, undefined);
+    assert.equal(promptCount, 0);
+
+    const userBash = await handlers.get("user_bash")?.({ command, excludeFromContext: false }, ctx);
+    assert.ok(userBash?.operations);
+    assert.equal(userBash.result, undefined);
+    assert.equal(promptCount, 0);
+  } finally {
+    resetMock.mock.restore();
+    managerMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("denied Git remotes in model Bash and user shell block before SSH-agent approval", async () => {
   const root = makeProjectTempDirectory("ssh-domain-policy");
   mkdirSync(join(root, ".pi"), { recursive: true });
   writeFileSync(
@@ -1618,19 +1666,46 @@ test("domain policy blocks a Git SSH command before SSH-agent approval", async (
     };
 
     await handlers.get("session_start")?.({}, ctx);
-    const response = await handlers.get("user_bash")?.(
-      {
-        command: "git push git@denied.example:repo; printf should-not-run",
-        excludeFromContext: false,
-      },
+    const command = "git clone -b main git@denied.example:repo.git checkout";
+    const modelBash = await handlers.get("tool_call")?.(
+      { toolName: "bash", input: { command } },
       ctx,
     );
+    assert.equal(modelBash?.block, true);
+    assert.match(modelBash?.reason ?? "", /denied\.example/);
+    assert.equal(promptCount, 0);
+
+    const response = await handlers.get("user_bash")?.({ command, excludeFromContext: false }, ctx);
 
     assert.ok(response?.result);
     assert.equal(response.result.exitCode, 1);
     assert.equal(response.operations, undefined);
     assert.match(response.result.output, /denied\.example/);
     assert.match(response.result.output, /deniedDomains/);
+
+    const globalOptionCommand = "git -C push clone git@denied.example:team/repo.git";
+    const globalOptionModelBash = await handlers.get("tool_call")?.(
+      { toolName: "bash", input: { command: globalOptionCommand } },
+      ctx,
+    );
+    assert.equal(globalOptionModelBash?.block, true);
+    assert.match(globalOptionModelBash?.reason ?? "", /denied\.example/);
+    const globalOptionUserBash = await handlers.get("user_bash")?.(
+      { command: globalOptionCommand, excludeFromContext: false },
+      ctx,
+    );
+    assert.equal(globalOptionUserBash?.result?.exitCode, 1);
+    assert.match(globalOptionUserBash?.result?.output ?? "", /denied\.example/);
+
+    const pushResponse = await handlers.get("user_bash")?.(
+      {
+        command: "git push git@denied.example:repo; printf should-not-run",
+        excludeFromContext: false,
+      },
+      ctx,
+    );
+    assert.equal(pushResponse?.result?.exitCode, 1);
+    assert.match(pushResponse?.result?.output ?? "", /denied\.example/);
     assert.equal(promptCount, 0);
     assert.equal(resetMock.mock.callCount(), 0);
     assert.equal(wrapMock.mock.callCount(), 0);
@@ -1642,7 +1717,7 @@ test("domain policy blocks a Git SSH command before SSH-agent approval", async (
       ).includes(socketPath),
       false,
     );
-    assert.equal(sentMessages.length, 1);
+    assert.equal(sentMessages.length, 3);
   } finally {
     wrapMock.mock.restore();
     resetMock.mock.restore();
