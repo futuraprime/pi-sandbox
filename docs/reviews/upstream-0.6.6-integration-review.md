@@ -1,5 +1,7 @@
 # Review: upstream 0.6.6 integration branch (pre-Slice-10)
 
+> Historical review of Slices 1–9. For the later Slice 9.5 SSH acceptance, Slice 10a reconciliation and private-fork ownership decision, see [the acceptance record](../integration/upstream-0.6.6-slice-9.5-acceptance.md) and [the 10a audit](../integration/upstream-0.6.6-slice-10a-audit.md). Its test counts, C-13 TODO, and metadata comments below are not current verification.
+
 - **Branch reviewed:** `feature/upstream-merge`
 - **Proposal:** [Integrate upstream 0.6.6 without losing downstream policy](../proposals/proposal-integrate-upstream-0.6.6.md)
 - **Scope:** Assess whether upstream 0.6.6 and downstream features are correctly combined, and surface combination issues. Slice 10 (parity review, cleanup, doc reconciliation, update rehearsal) had **not** been run at review time, so stale documentation, metadata, and the `0.6.6` version string are expected and out of scope.

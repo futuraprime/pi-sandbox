@@ -12,11 +12,7 @@ prompted to allow it temporarily or permanently rather than silently failing.
 ![demo](./demo/demo.gif)
 
 ## Notes
-There is an example config at [sandbox.json](./sandbox.json). It was quite a few things added to get this extension to work with [agent-browser](https://agent-browser.dev/) and other common tools.
-
-These open significant security loopholes, so shouldn't be used in a sensitive context or when you don't need browser support.
-
-You may need to trial and error to find additional things you need to allow.
+The [sandbox.json](./sandbox.json) in this repository is a **development example**, not a secure default or an automatically loaded config. It contains broad filesystem, localhost, browser, and proxy grants for tools such as [agent-browser](https://agent-browser.dev/). Do not copy it wholesale into a sensitive project or grant those capabilities unless needed; start with the built-in defaults and add narrowly scoped rules.
 
 ## Quickstart
 
@@ -55,67 +51,75 @@ inherit a minimal non-login `PATH`). On macOS, `/opt/homebrew/bin` and
 environment includes whichever one your install uses.
 
 #### Install
-```bash
-pi install npm:pi-sandbox
-```
+This fork is distributed only through the private repository at
+<https://github.com/futuraprime/pi-sandbox>. Clone it with access to that
+repository, install dependencies with `pnpm install --frozen-lockfile`, and load
+`index.ts` as a local Pi extension. It is not available as `npm:pi-sandbox`.
 
 #### Configure
 Add a config like this either to Pi's global agent directory (by default, `~/.pi/agent/sandbox.json`; respects `PI_CODING_AGENT_DIR`) or to `.pi/sandbox.json` (local).
-Scalar settings in the local config take precedence over global settings. The
-path and domain arrays from both files are combined and deduplicated, so a
-project can add permissions without repeating the global configuration. Built-in
-defaults are used for an array only when neither file configures it.
+Scalar settings in the project config take precedence over global settings.
+Policy arrays accumulate and deduplicate across built-in defaults, global, and
+project configuration; `[]` does not remove inherited rules. `ignoreViolations`
+arrays accumulate per key. Credential declarations are an exception: only the
+global file may declare them; project declarations are ignored with a warning.
+Allow and deny rules use the same specificity-aware precedence for read, write,
+and domains (see below). The annotated example below is illustrative; remove
+comments before saving it as JSON. The repository's root example is similarly
+for development, not a recommended security policy.
 
-Note below that the order of precedence for filesystem read and write are opposite.
-
-```json
+```jsonc
 {
   "enabled": true,
-  "sandboxUserShell": false,       // Sandbox commands entered with `!`. Defaults to true
   "permissionPromptTimeoutSeconds": 600, // Defaults to 10 minutes; 0 waits indefinitely
   "allowBrowserProcess": true,     // Chrome setup; macOS adds scoped loopback/temp access
   "network": {
-    "allowUnauthenticatedSocksProxy": true, // Enables Git-over-SSH on macOS
+    "allowUnauthenticatedSocksProxy": true, // macOS Git SSH compatibility; default on macOS
     "allowedDomains": ["github.com", "*.github.com"],
     "deniedDomains": []
   },
   "filesystem": {
-    // For READS:
-    // - ANY read is prompted unless the path is in allowRead or allowWrite
-    // - Granting a prompt adds to allowRead, which overrides denyRead
-    // - denyRead is not a hard-block; it just marks regions as denied by default
+    // Read and write use the same allow/deny specificity rules.
+    // A deny wins a tie; only a strictly more-specific allow overrides it.
     "denyRead": ["/Users", "/home"],
     "allowRead": [".", "~/.config", "~/.local", "Library"],
 
-    // For WRITES:
-    // - allowWrite also grants read access to the same paths
-    // - empty ALLOW means no write access at all
-    // - DENY takes precedence and is never prompted
+    // Current runtime expands allowWrite paths into effective read paths.
+    // An empty array cannot remove built-in write allowances.
     "allowWrite": [".", "/tmp"],
     "denyWrite": [".env", ".env.*", "*.pem", "*.key"]
   }
 }
 ```
 
-#### Usage
+#### Usage (current implementation)
 
 ```
-pi --no-sandbox                  disable sandboxing for the session
-Alt+S                            toggle sandboxing on/off for the session
-/sandbox                         show current configuration and session allowances
-/sandbox-enable                  enable the sandbox for this session
-/sandbox-disable                 disable the sandbox for this session
-/sandbox-allow domain <url>      prompt to add a domain to allowedDomains
-/sandbox-allow read <path>       prompt to add a path to allowRead
-/sandbox-allow write <path>      prompt to add a path to allowWrite
+pi --no-sandbox                     disable sandboxing for the session
+/sandbox                            show effective configuration and session allowances
+/sandbox allowRead <path>           add a project read rule
+/sandbox denyRead <path>            add a project read-deny rule
+/sandbox allowWrite <path>          add a project write rule
+/sandbox denyWrite <path>           add a project write-deny rule
+/sandbox allowedDomains <hostname>  add a project domain rule
+/sandbox deniedDomains <hostname>   add a project domain-deny rule
+/sandbox-enable                     enable the sandbox for this session
+/sandbox-disable                    disable the sandbox for this session
+/sandbox-debug                      show recent sandbox incidents
 ```
+
+`/sandbox` edits the project config through the protected writer; it does not
+edit credentials. `Alt+S` is still registered in this integration branch but is
+rejected for release and must be removed in Slice 10b. The proposed display-only
+`/sandbox` and `/sandbox-allow` commands are **not implemented yet**.
 
 ## What it does
 
 **Bash commands** are wrapped with `sandbox-exec` (macOS) or `bubblewrap`
 (Linux) to enforce network and filesystem restrictions at the OS level. Commands
-entered with `!` are sandboxed by default; set `sandboxUserShell` to `false` to
-leave those commands unsandboxed.
+entered with `!` are sandboxed by default. The current implementation accepts
+`sandboxUserShell: false` to bypass sandboxing for `!` commands, but its trust
+model remains under review; do not use it in untrusted projects.
 
 **Read, write, and edit tool calls** are intercepted before execution and
 checked against the same filesystem policy. The OS-level sandbox cannot cover
@@ -136,46 +140,67 @@ or set it to `0` to wait indefinitely. A timeout never grants permission.
 and the agent has no way to read or modify them. They are reset when the
 extension reloads or pi restarts.
 
-### What is prompted vs. hard-blocked
+### Policy and prompts
 
-| Rule | Behaviour |
-|------|-----------|
-| Domain not in `allowedDomains` | Prompted (bash and `!cmd`, unless `sandboxUserShell` is disabled) |
-| Path not in `allowRead` or `allowWrite` | Prompted (read tool); granting adds to `allowRead` |
-| Path not in `allowWrite` | Prompted (write/edit tools and bash write failures) |
-| Path in `denyWrite` | Hard-blocked, no prompt |
-| Domain in `deniedDomains` | Hard-blocked at OS level, no prompt |
+Read, write, and domain checks compare the most-specific matching allow and deny
+rules. A deny wins on equal specificity; a strictly more-specific allow wins
+over a broader deny. An unmatched target is prompted where the operation supports
+permission prompts. A matching deny blocks without a grant prompt, including
+protected sandbox config paths. Relative project paths are resolved against the
+project directory; project-scoped permissions retain their relative spelling.
+The runtime currently treats write allowances as effective read allowances too;
+formal product approval of that C-13 behavior is still pending.
 
-If a path is added to `allowWrite` via a prompt but is also present in
-`denyWrite`, it remains blocked. A warning is shown explaining which config
-files to check.
+`allowedDomains` supports `*.example.com` and `"*"`; `"*"` removes per-domain
+prompts and triggers a warning. Filesystem allow rules may cover a directory,
+so `allowWrite: ["."]` grants writes throughout the project (subject to
+more-specific denies). Defaults remain in force when an array is configured or
+set to `[]`; an empty project array cannot revoke a global or built-in grant.
 
-`allowedDomains` supports `*.example.com` wildcards. It also supports `"*"` to
-allow all domains; pi-sandbox shows a warning when this is configured because it
-removes per-domain prompts and can be easy to add accidentally. `allowWrite` uses prefix
-matching, so `.` covers the entire current working directory. Write access also
-implies read access; paths do not need to be repeated in `allowRead`.
+### Git over SSH on macOS
 
-`allowUnauthenticatedSocksProxy` is enabled by default on macOS so Git-over-SSH
-works with the built-in `nc`. Domain filtering still applies, but another local process
-that discovers the temporary proxy port can use it while the sandbox is running.
+The macOS unauthenticated SOCKS compatibility mode is enabled by default.
+Only Git `clone`, `fetch`, `pull`, `push`, and `ls-remote` with SSH remotes get
+the scoped transport; ordinary `ssh` is not proxied by this extension. Domain
+policy still applies. Host keys must already be trusted in the user's standard
+`known_hosts`; strict checking rejects mismatches, never auto-accepts keys, and
+may require a narrow read allowance for that file. SSH authentication uses the
+exact `SSH_AUTH_SOCK` approved by a **session-only** prompt, not identity files
+or a broad Unix-socket grant. Fresh sessions require fresh approval. Another
+local process that discovers the temporary SOCKS proxy port can use it while
+this compatibility mode runs; disable it if you do not need Git-over-SSH.
 
-> **⚠️ Read and write have different precedence rules:**
->
-> - **Read:** Every read is prompted unless the path is in `allowRead` or `allowWrite`.
->   `denyRead` is not a hard-block — it marks regions as denied by default, but
->   granting a prompt adds the path to `allowRead`, overriding `denyRead`.
-> - **Write:** `denyWrite` takes precedence over `allowWrite` and is never
->   prompted. A path in `denyWrite` is always blocked, even if it matches
->   `allowWrite`.
+### Credential policy (global config only)
 
-If neither file configures an array, its built-in defaults apply (see above for
-the defaults). Once an array is configured, only its combined global and local
-entries are used, so an explicit empty array disables that default.
+Declare **policy metadata, never secret values**, in the global agent
+`sandbox.json`. For example, if `PI_EXAMPLE_TOKEN` already exists in the
+launch environment, this global declaration masks it in sandboxed processes
+and permits substitution only for the named host:
+
+```json
+{
+  "credentials": {
+    "envVars": [
+      { "name": "PI_EXAMPLE_TOKEN", "mode": "mask", "injectHosts": ["api.example.com"] }
+    ]
+  }
+}
+```
+
+Project credential declarations are ignored. Masking requires an explicit,
+nonempty host list (not `"*"`); unknown or value-bearing fields and plaintext
+injection are rejected. Structured extraction requires fail-closed `deny` or
+`error` mismatch handling; environment JWT decode is not supported by the
+pinned runtime. On macOS, file-mask declarations degrade to read denial, not
+file masking. Do not put tokens in configuration or permission prompts.
 
 The footer shows a lock indicator while the sandbox is active.
 
-## Ackowledgements
+## Acknowledgements
+This private fork integrates work from
+[carderne/pi-sandbox](https://github.com/carderne/pi-sandbox) by Chris Arderne.
+It is maintained independently and is not published to a package registry.
+
 Based on code from
 [badlogic/pi-mono](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/examples/extensions/sandbox/index.ts)
 by Mario Zechner, used under the

@@ -1,8 +1,8 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1–5, 6a, 6b, 6c, 6d, 7, 8, 9a, 9b, and 9.5 complete; exact 0.0.72 approved with a bounded consumer-side Chromium adapter, fail-closed credential boundary, tested prompt/UI/lifecycle contracts, and bare-macOS Git-over-SSH push acceptance; only Slice 10 reconciliation and update rehearsal remain open
+- **Status:** In progress — slices 1–9.5 and the Slice 10a audit are complete; the private-fork ownership/release decision has been applied and current user-facing documentation refreshed. Slice 10b command/cleanup work, the upstream-update rehearsal, full verification, and fresh bare-macOS release acceptance remain open.
 - **Date:** 2026-09-03
-- **Updated:** 2026-09-26
+- **Updated:** 2026-09-28
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
 - **Slice 6c assessment:** [sandbox-runtime 0.0.70/0.0.72 assessment](../integration/upstream-0.6.6-slice-6c-assessment.md)
@@ -376,24 +376,24 @@ O-03 is resolved against adopting upstream's generic ordinary-SSH proxy. The dow
 
 ### Slice 10: Parity, cleanup, and update rehearsal
 
-Slice 10 is divided into a read-only reconciliation audit and the approved reconciliation work. Do not assume downstream ownership of package identity or publishing metadata between these sub-slices.
+Slice 10 is divided into a read-only reconciliation audit and separately approved reconciliation work. Package identity and publishing ownership have since been resolved for this private fork; that narrow decision does not approve the remaining 10b behavior changes.
 
 #### Slice 10a: Reconciliation audit and ownership decisions
 
-**Next-session handoff (2026-09-26):** Start from `feature/upstream-merge` at or after Slice 9.5 checkpoint `ad9ac73` (working tree clean at handoff). Read this proposal, [feature ledger](../integration/upstream-0.6.6-feature-ledger.md), [pre-Slice-10 review](../reviews/upstream-0.6.6-integration-review.md), and [Slice 9.5 acceptance record](../integration/upstream-0.6.6-slice-9.5-acceptance.md) before the audit. The pre-Slice-10 review predates Slice 9.5 and must be reconciled, not treated as current verification. Begin with the read-only 10a audit and surface package/version, publishing, author, and repository URL ownership decisions; do not implement 10b, remove downstream code, or push to `upstream` before approval. No Slice 9.5 `/tmp` SSH fixture remains; an unrelated port-49273 fixture in another worktree was left untouched. The temporary launch helper under ignored `tmp/` is fixture-specific and is not a source of release evidence. The latest full suite reported 163 passed, 2 skipped, 0 failed out of 165; an unrelated output-drain test failed on one run and passed on rerun.
+**Slice 10a audit outcome (2026-09-28):** [Reconciliation findings and proposed 10b scope](../integration/upstream-0.6.6-slice-10a-audit.md). The audit reconciles the feature ledger, this proposal, the archival pre-Slice-10 review, Slice 9.5 acceptance, and current `feature/upstream-merge` against downstream `main`; it records documentation/metadata/CI findings, replacement-test limits, a reversible rehearsal design, and package/publisher/author/URL questions. The 10a audit changed planning documentation only. It is complete; the subsequent approved ownership slice updated package metadata, README install/attribution, and release workflow, while a later documentation-only pass corrected the README's current-behavior guidance. Do not start 10b command/cleanup changes without their separate approval and replacement-test prerequisites. Historical Slice 9.5 macOS acceptance is not a fresh release/platform verification; that gate remains pending. In a separately approved ownership/release slice, the owner chose a private, repository-distributed `pi-sandbox` 0.6.6 fork, Evan Hensleigh as fork author, Futuraprime URLs, and no automatic release or registry publication. The findings record the decision; remaining 10b behavior work still requires approval.
 
-- Compare the completed branch with the feature ledger, proposal, review, and downstream `main`.
-- Audit README, examples, package metadata, lockfiles, repository URLs, and CI against the accepted behaviour.
-- Identify superseded duplication, but propose removal only where replacement coverage proves it safe.
-- Design a small, reversible upstream-aligned update rehearsal with an explicit assertion that unrelated downstream-owned modules remain unchanged.
-- Present a concise reconciliation plan and ask for decisions on package/version identity, npm publication name and ownership, author/publisher metadata, and repository, bugs, and homepage URLs.
-- Make no file changes as part of the audit beyond updating planning documentation that explicitly defines this sub-slice.
+- [x] Compare the completed branch with the feature ledger, proposal, review, Slice 9.5 acceptance, and downstream `main`.
+- [x] Audit README, examples, package metadata, lockfiles, repository URLs, and CI against the accepted behaviour.
+- [x] Identify cleanup candidates, and distinguish them from removals proven safe by replacement coverage; no unproven deletion is approved by 10a.
+- [x] Design a small, reversible upstream-aligned update rehearsal with an explicit assertion that unrelated downstream-owned modules remain unchanged.
+- [x] Present package/version identity, npm publication ownership, author/publisher, repository, bugs, homepage, and release-gate decisions without assumptions.
+- [x] Limit file changes to planning/audit documentation defining this sub-slice.
 
 **Exit condition:** the parity and repository reconciliation findings are documented, proposed deletions have replacement-test evidence, the update rehearsal is bounded, and all metadata ownership questions that block implementation are presented for approval without assumptions.
 
 #### Slice 10b: Approved reconciliation and verification
 
-- Apply the approved README, examples, package metadata, repository URL, lockfile, and CI reconciliation.
+- Preserve the completed private-fork metadata, repository URLs, no-publish workflow, and current README corrections; finish any example/README reconciliation needed after 10b behavior changes and verify the pnpm lockfile and CI.
 - Remove only duplication approved in Slice 10a and proven safe by replacement coverage.
 - Perform and document the upstream-aligned update rehearsal, confirming that unrelated downstream-owned modules remain untouched.
 - Keep O-01–O-11 explicit rather than implementing deferred or rejected capabilities, and update stale ledger or review dispositions such as the resolved C-13 decision.
@@ -463,7 +463,7 @@ Run formatting, linting, TypeScript checking, and unit tests. Run platform-speci
 - **Resolved in Slices 6d–9.5:** stock sandbox-runtime 0.0.72 needed the bounded consumer-side Chromium adapter; the exact runtime is approved with that adapter. Slice 9.5 resolved the extension's isolated-known-hosts limitation with an explicit trust path and strict host-key checking, verified against disposable SSH fixtures.
 - Credential policy composition was resolved in Slice 8 as global-only initially; revisit only through an explicit trust review and composition contract.
 - Should `sandboxUserShell` be accepted, rejected, or exposed only through explicit per-session confirmation?
-- Should the pnpm and Node test-runner migration be adopted as part of this work or handled separately?
+- **Resolved for Slice 10:** retain pnpm and `node:test`/`tsx` (O-07); verify frozen installation and CI with the final private package metadata. No registry or automatic release workflow.
 
 ## Strategy decision: upstream-first, test-led port
 
