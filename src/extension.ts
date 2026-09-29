@@ -41,11 +41,10 @@ import {
 } from "./policy.ts";
 import {
   bashCommandMentionsSandboxConfig,
-  describeSandboxCommandResult,
-  formatSandboxCommandUsage,
+  formatSandboxAllowUsage,
   getProtectedSandboxConfigPaths,
   isSandboxConfigPath,
-  parseSandboxCommand,
+  parseSandboxAllowCommand,
   updateSandboxConfigFile,
 } from "./sandbox-command.ts";
 import { resolveDerivedFilesystemAllowances } from "./sandbox-filesystem.ts";
@@ -122,8 +121,8 @@ function gitUpstreamBlockedResult() {
 function sandboxConfigMutationMessage(cwd: string): string {
   const { projectPath, globalPath } = getProtectedSandboxConfigPaths(cwd);
   return (
-    "Sandbox configuration files are protected. Use /sandbox to add rules; " +
-    `protected paths are:\n  ${projectPath}\n  ${globalPath}`
+    "Sandbox configuration files are protected; /sandbox-allow cannot override this protection. " +
+    `Protected paths are:\n  ${projectPath}\n  ${globalPath}`
   );
 }
 
@@ -356,7 +355,6 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         : choice === "project"
           ? projectRuleValue(value, cwd)
           : canonicalizePathPattern(value, cwd);
-    let changed = false;
     const sessionAllowanceValues =
       kind === "domain"
         ? allowances.domains
@@ -364,21 +362,32 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
           ? allowances.readPaths
           : allowances.writePaths;
     const sessionAllowanceValue = kind === "domain" ? value : canonicalizePathPattern(value, cwd);
-    const addedSessionAllowance = addSessionAllowance(
-      sessionAllowanceValues,
-      sessionAllowanceValue,
-    );
 
-    changed = addedSessionAllowance;
-
+    let persistedChange = false;
     if (choice !== "session") {
       const { globalPath, projectPath } = getConfigPaths(cwd);
       const target = choice === "project" ? projectPath : globalPath;
       const result = updateSandboxConfigFile(target, { key: commandKey, value: storedValue }, cwd);
-      changed ||= result.changed;
+      persistedChange = result.changed;
     }
 
-    const refreshed = !changed || (await refreshSandbox(cwd));
+    const addedSessionAllowance =
+      choice === "session" && addSessionAllowance(sessionAllowanceValues, sessionAllowanceValue);
+    const changed = persistedChange || addedSessionAllowance;
+    const runtimeIsActive =
+      sandboxLifecycle.state === "ready" ||
+      sandboxLifecycle.state === "initializing" ||
+      sandboxLifecycle.state === "unavailable";
+    let refreshed = true;
+    try {
+      if (changed && runtimeIsActive) refreshed = await refreshSandbox(cwd);
+    } catch (error) {
+      if (addedSessionAllowance) {
+        const index = sessionAllowanceValues.indexOf(sessionAllowanceValue);
+        if (index >= 0) sessionAllowanceValues.splice(index, 1);
+      }
+      throw error;
+    }
     if (!refreshed && addedSessionAllowance) {
       const index = sessionAllowanceValues.indexOf(sessionAllowanceValue);
       if (index >= 0) sessionAllowanceValues.splice(index, 1);
@@ -1379,31 +1388,10 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
   });
 
   pi.registerCommand("sandbox", {
-    description: "Show or update sandbox configuration",
+    description: "Show effective sandbox configuration",
     handler: async (args, ctx) => {
-      let command;
-      try {
-        command = parseSandboxCommand(args, ctx.cwd);
-      } catch (error) {
-        ctx.ui.notify(
-          error instanceof Error ? error.message : formatSandboxCommandUsage(),
-          "error",
-        );
-        return;
-      }
-
-      if (command) {
-        const { projectPath } = getConfigPaths(ctx.cwd);
-        const result = updateSandboxConfigFile(projectPath, command, ctx.cwd);
-        const runtimeRefreshed =
-          !result.changed || !sandboxReady() ? true : await refreshSandbox(ctx.cwd);
-        ctx.ui.notify(`${describeSandboxCommandResult(result)}\nUpdated: ${projectPath}`, "info");
-        if (!runtimeRefreshed) {
-          ctx.ui.notify(
-            "Warning: The project configuration was persisted, but the active sandbox runtime was not refreshed.",
-            "warning",
-          );
-        }
+      if (args.trim().length > 0) {
+        ctx.ui.notify("Usage: /sandbox", "error");
         return;
       }
 
@@ -1416,6 +1404,52 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         ),
         "info",
       );
+    },
+  });
+
+  pi.registerCommand("sandbox-allow", {
+    description: "Approve a sandbox domain, read, or write target",
+    handler: async (args, ctx) => {
+      let command;
+      try {
+        command = parseSandboxAllowCommand(args, ctx.cwd);
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : formatSandboxAllowUsage(), "error");
+        return;
+      }
+
+      const config = readConfig(ctx.cwd);
+      const choice =
+        command.kind === "domain"
+          ? await promptDomainBlock(pi, ctx, command.value, config.permissionPromptTimeoutSeconds)
+          : command.kind === "read"
+            ? await promptReadBlock(pi, ctx, command.value, config.permissionPromptTimeoutSeconds)
+            : await promptWriteBlock(pi, ctx, command.value, config.permissionPromptTimeoutSeconds);
+      if (choice.action === "abort") {
+        ctx.ui.notify("Permission request aborted; no rule was added.", "info");
+        return;
+      }
+
+      try {
+        const refreshed = await applyChoice(choice.action, command.kind, choice.value, ctx.cwd);
+        if (!refreshed) {
+          const message =
+            choice.action === "session"
+              ? "Session permission was rolled back because the sandbox could not refresh; execution remains blocked."
+              : "Permission was persisted, but the sandbox could not refresh; execution remains blocked.";
+          ctx.ui.notify(message, "error");
+          return;
+        }
+        ctx.ui.notify(
+          `Approved ${command.kind} target: ${choice.value} (${choice.action})`,
+          "info",
+        );
+      } catch (error) {
+        ctx.ui.notify(
+          `Permission was not applied: ${error instanceof Error ? error.message : String(error)}`,
+          "error",
+        );
+      }
     },
   });
 }

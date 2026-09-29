@@ -4,16 +4,18 @@ import { dirname } from "node:path";
 import { getConfigPaths, readConfigFile } from "./config.ts";
 import { canonicalizePath, canonicalizePathPattern } from "./policy.ts";
 
-export type SandboxCommandKey =
-  | "allowRead"
-  | "denyRead"
-  | "allowWrite"
-  | "denyWrite"
-  | "allowedDomains"
-  | "deniedDomains";
+export type SandboxAllowKind = "domain" | "read" | "write";
+type SandboxAllowRuleKey = "allowedDomains" | "allowRead" | "allowWrite";
+type SandboxPolicyKey = SandboxAllowRuleKey | "denyRead" | "denyWrite" | "deniedDomains";
 
-export interface SandboxCommand {
-  key: SandboxCommandKey;
+export interface SandboxAllowCommand {
+  kind: SandboxAllowKind;
+  key: SandboxAllowRuleKey;
+  value: string;
+}
+
+interface SandboxRuleUpdate {
+  key: SandboxAllowRuleKey;
   value: string;
 }
 
@@ -33,77 +35,79 @@ export interface SandboxConfigForCommand {
   [key: string]: unknown;
 }
 
-export interface SandboxCommandResult {
-  command: SandboxCommand;
+export interface SandboxConfigUpdateResult {
   changed: boolean;
   config: SandboxConfigForCommand;
 }
 
-const COMMANDS: readonly SandboxCommandKey[] = [
-  "allowRead",
-  "denyRead",
-  "allowWrite",
-  "denyWrite",
-  "allowedDomains",
-  "deniedDomains",
-];
+const KIND_TO_KEY = {
+  domain: "allowedDomains",
+  read: "allowRead",
+  write: "allowWrite",
+} as const satisfies Record<SandboxAllowKind, SandboxAllowRuleKey>;
 
 const COMMAND_TO_SECTION = {
   allowRead: ["filesystem", "allowRead"],
-  denyRead: ["filesystem", "denyRead"],
   allowWrite: ["filesystem", "allowWrite"],
-  denyWrite: ["filesystem", "denyWrite"],
   allowedDomains: ["network", "allowedDomains"],
-  deniedDomains: ["network", "deniedDomains"],
-} as const satisfies Record<SandboxCommandKey, readonly ["filesystem" | "network", string]>;
+} as const satisfies Record<SandboxAllowRuleKey, readonly ["filesystem" | "network", string]>;
 
 const DOMAIN_LABEL = /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)$/;
 
-export function formatSandboxCommandUsage(): string {
-  return [
-    "Usage:",
-    "  /sandbox",
-    "  /sandbox allowRead <path>",
-    "  /sandbox denyRead <path>",
-    "  /sandbox allowWrite <path>",
-    "  /sandbox denyWrite <path>",
-    "  /sandbox allowedDomains <domain>",
-    "  /sandbox deniedDomains <domain>",
-  ].join("\n");
+export function formatSandboxAllowUsage(): string {
+  return "Usage: /sandbox-allow domain|read|write <target>";
 }
 
-export function parseSandboxCommand(
-  args: string | readonly string[],
-  cwd = process.cwd(),
-): SandboxCommand | null {
-  const parts: string[] =
-    typeof args === "string"
-      ? args.trim().length === 0
-        ? []
-        : args.trim().split(/\s+/)
-      : [...args];
-  if (parts.length === 0) return null;
-
-  const [key, ...valueParts] = parts;
-  if (!isSandboxCommandKey(key) || valueParts.length === 0) {
-    throw new Error(formatSandboxCommandUsage());
+export function parseSandboxAllowCommand(args: string, cwd = process.cwd()): SandboxAllowCommand {
+  const input = args.trim();
+  const separator = input.search(/\s/);
+  const kind = separator < 0 ? input : input.slice(0, separator);
+  const value = separator < 0 ? "" : input.slice(separator).trim();
+  if (!isSandboxAllowKind(kind) || value.length === 0) {
+    throw new Error(formatSandboxAllowUsage());
   }
 
-  const value = valueParts.join(" ").trim();
-  const validationError = validateSandboxCommandValue(key, value, cwd);
+  const validationError = validateSandboxAllowTarget(kind, value, cwd);
   if (validationError) {
-    throw new Error(`${formatSandboxCommandUsage()}\nError: ${validationError}`);
+    throw new Error(`${formatSandboxAllowUsage()}\nError: ${validationError}`);
   }
-  return { key, value };
+  return { kind, key: KIND_TO_KEY[kind], value };
+}
+
+export function validateSandboxAllowTarget(
+  kind: SandboxAllowKind,
+  value: string,
+  cwd = process.cwd(),
+): string | null {
+  if (value.length === 0 || value.trim().length === 0) return "Target cannot be empty.";
+  if (value.includes("\u0000") || value.includes("\r") || value.includes("\n")) {
+    return "Target cannot contain control characters.";
+  }
+
+  if (kind === "domain") {
+    if (value.includes("*")) return "Domain target must be a single hostname, not a pattern.";
+    return validateSandboxCommandValue("allowedDomains", value, cwd);
+  }
+
+  if (/[*!?]/.test(value)) return "Filesystem target must be a concrete path, not a pattern.";
+  if (kind === "write" && isSandboxConfigPath(value, cwd)) {
+    return "Sandbox configuration files cannot receive write allowances.";
+  }
+  try {
+    canonicalizePath(value, cwd);
+  } catch {
+    return `Invalid path target: ${value}`;
+  }
+  return null;
 }
 
 /**
- * Validate the values accepted by the policy matcher, without applying a rule.
- * The command intentionally accepts filesystem patterns (including globs) but
- * only hostname patterns for network rules.
+ * Validate policy values accepted by the matcher. Prompt editing deliberately
+ * accepts filesystem patterns; the command parser separately requires a
+ * concrete target before opening the editor.
  */
 export function validateSandboxCommandValue(
-  key: SandboxCommandKey,
+  key: SandboxPolicyKey,
   value: string,
   cwd = process.cwd(),
 ): string | null {
@@ -127,62 +131,46 @@ export function validateSandboxCommandValue(
   return null;
 }
 
-export function applySandboxCommand(
-  config: SandboxConfigForCommand,
-  command: SandboxCommand,
+/**
+ * The one sanctioned persistence path for approved positive grants. Deny rules
+ * are intentionally not editable through the approval prompt.
+ */
+export function updateSandboxConfigFile(
+  configPath: string,
+  command: SandboxRuleUpdate,
   cwd = process.cwd(),
-): SandboxCommandResult {
-  if (!isSandboxCommandKey(command.key)) {
-    throw new Error(formatSandboxCommandUsage());
+): SandboxConfigUpdateResult {
+  if (!isSandboxAllowRuleKey(command.key)) {
+    throw new Error(formatSandboxAllowUsage());
   }
   const validationError = validateSandboxCommandValue(command.key, command.value, cwd);
-  if (validationError) throw new Error(`${formatSandboxCommandUsage()}\nError: ${validationError}`);
+  if (validationError) throw new Error(`${formatSandboxAllowUsage()}\nError: ${validationError}`);
 
+  const config = readConfigFile(configPath, false) as SandboxConfigForCommand;
   const [sectionName, arrayName] = COMMAND_TO_SECTION[command.key];
   const section =
     sectionName === "filesystem"
       ? getObjectSection(config.filesystem)
       : getObjectSection(config.network);
-  const existingValue = section?.[arrayName];
-  const existing = getStringArray(existingValue);
+  const existing = getStringArray(section[arrayName]);
   const duplicate = existing.some((value) => valuesEqual(command.key, value, command.value, cwd));
-  if (duplicate) return { command, changed: false, config };
-
-  const nextConfig: SandboxConfigForCommand = { ...config };
-  if (sectionName === "filesystem") {
-    nextConfig.filesystem = {
-      ...getObjectSection(config.filesystem),
-      [arrayName]: [...existing, command.value],
-    };
-  } else {
-    nextConfig.network = {
-      ...getObjectSection(config.network),
-      [arrayName]: [...existing, command.value],
-    };
-  }
-  return { command, changed: true, config: nextConfig };
-}
-
-/** Update exactly one rule array in a JSON config file. */
-export function updateSandboxConfigFile(
-  configPath: string,
-  command: SandboxCommand,
-  cwd = process.cwd(),
-): SandboxCommandResult {
-  const config = readConfigFile(configPath, false) as SandboxConfigForCommand;
-  const result = applySandboxCommand(config, command, cwd);
-  if (result.changed) {
+  const nextConfig: SandboxConfigForCommand = config;
+  if (!duplicate) {
+    if (sectionName === "filesystem") {
+      nextConfig.filesystem = {
+        ...getObjectSection(config.filesystem),
+        [arrayName]: [...existing, command.value],
+      };
+    } else {
+      nextConfig.network = {
+        ...getObjectSection(config.network),
+        [arrayName]: [...existing, command.value],
+      };
+    }
     mkdirSync(dirname(configPath), { recursive: true });
-    writeFileSync(configPath, JSON.stringify(result.config, null, 2) + "\n", "utf-8");
+    writeFileSync(configPath, JSON.stringify(nextConfig, null, 2) + "\n", "utf-8");
   }
-  return result;
-}
-
-export function describeSandboxCommandResult(result: SandboxCommandResult): string {
-  const [sectionName, arrayName] = COMMAND_TO_SECTION[result.command.key];
-  const target = `${sectionName}.${arrayName}`;
-  const state = result.changed ? "Added" : "Already present";
-  return `${state}: ${result.command.value} in ${target}`;
+  return { changed: !duplicate, config: nextConfig };
 }
 
 /** Canonical paths used by both policy checks and the OS-level runtime. */
@@ -234,8 +222,12 @@ function getStringArray(value: unknown): string[] {
     : [];
 }
 
-function isSandboxCommandKey(value: string | undefined): value is SandboxCommandKey {
-  return value !== undefined && COMMANDS.includes(value as SandboxCommandKey);
+function isSandboxAllowKind(value: string): value is SandboxAllowKind {
+  return value === "domain" || value === "read" || value === "write";
+}
+
+function isSandboxAllowRuleKey(value: string): value is SandboxAllowRuleKey {
+  return value === "allowedDomains" || value === "allowRead" || value === "allowWrite";
 }
 
 function isDomainPattern(value: string): boolean {
@@ -248,8 +240,13 @@ function isDomainPattern(value: string): boolean {
   return labels.length > 0 && labels.every((label) => DOMAIN_LABEL.test(label));
 }
 
-function valuesEqual(key: SandboxCommandKey, first: string, second: string, cwd: string): boolean {
-  if (key === "allowedDomains" || key === "deniedDomains") {
+function valuesEqual(
+  key: SandboxAllowRuleKey,
+  first: string,
+  second: string,
+  cwd: string,
+): boolean {
+  if (key === "allowedDomains") {
     return normalizeDomain(first) === normalizeDomain(second);
   }
   try {

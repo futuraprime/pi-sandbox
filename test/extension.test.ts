@@ -655,9 +655,15 @@ test("a stale session_start failure cannot overwrite a replacement runtime", asy
   }
 });
 
-test("/sandbox exercises all six project-only rules and refreshes only after changes", async () => {
-  const root = makeProjectTempDirectory("extension");
+test("/sandbox is display-only and /sandbox-allow persists an edited, confirmed project rule", async () => {
+  const root = makeProjectTempDirectory("sandbox-allow-command");
   const agentDir = join(root, "global-agent");
+  const configPath = join(root, ".pi", "sandbox.json");
+  mkdirSync(dirname(configPath), { recursive: true });
+  writeFileSync(
+    configPath,
+    JSON.stringify({ enabled: false, network: { deniedDomains: ["blocked.example"] } }),
+  );
   const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   const initialised: string[] = [];
@@ -672,47 +678,56 @@ test("/sandbox exercises all six project-only rules and refreshes only after cha
 
   try {
     const { pi, commands, handlers } = makePi();
-    extension(pi);
+    extension(pi, { configLoader: () => makePromptTestConfig() });
     const ctx = makeContext(root, notices);
+    let component: any;
+    (ctx.ui as any).custom = <T>(factory: any): Promise<T> =>
+      new Promise<T>((resolve) => {
+        component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          (value: T) => {
+            component?.dispose?.();
+            resolve(value);
+          },
+        );
+        component.handleInput("\x1b[B");
+        component.handleInput("\x1b[B");
+        component.handleInput("\t");
+        for (let index = 0; index < 200; index += 1) component.handleInput("\x7f");
+        component.handleInput("packages/widget");
+        component.handleInput("\r");
+        component.handleInput("\r");
+      });
 
-    assert.equal(commands.has("sandbox-allow"), false);
+    assert.equal(commands.has("sandbox-allow"), true);
     await handlers.get("session_start")?.({}, ctx);
-    assert.equal(initialised.length, 1);
 
-    const rules = [
-      "allowRead ./allowed-read",
-      "denyRead ./denied-read",
-      "allowWrite ./allowed-write",
-      "denyWrite *.secret",
-      "allowedDomains allowed.example",
-      "deniedDomains denied.example",
-    ];
-    for (const rule of rules) await commands.get("sandbox")?.(rule, ctx);
+    await commands.get("sandbox")?.("allowRead ./must-not-be-written", ctx);
+    assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
+      enabled: false,
+      network: { deniedDomains: ["blocked.example"] },
+    });
+    assert.equal(resets.length, 0);
+    assert.match(notices.at(-1) ?? "", /Usage: \/sandbox$/);
 
-    assert.equal(resets.length, rules.length);
-    assert.equal(initialised.length, rules.length + 1);
-    const projectConfig = JSON.parse(readFileSync(join(root, ".pi", "sandbox.json"), "utf8"));
-    assert.deepEqual(projectConfig, {
-      filesystem: {
-        allowRead: ["./allowed-read"],
-        denyRead: ["./denied-read"],
-        allowWrite: ["./allowed-write"],
-        denyWrite: ["*.secret"],
-      },
-      network: { allowedDomains: ["allowed.example"], deniedDomains: ["denied.example"] },
+    const target = join(root, "packages", "widget", "src", "index.ts");
+    await commands.get("sandbox-allow")?.(`read ${target}`, ctx);
+
+    assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
+      enabled: false,
+      network: { deniedDomains: ["blocked.example"] },
+      filesystem: { allowRead: ["packages/widget"] },
     });
     assert.equal(existsSync(join(agentDir, "sandbox.json")), false);
-    assert.equal(requireNotice(notices, "Updated: " + join(root, ".pi", "sandbox.json")), true);
-
-    const resetCount = resets.length;
-    await commands.get("sandbox")?.(`allowRead ${join(root, "allowed-read")}`, ctx);
-    assert.equal(resets.length, resetCount);
-    assert.match(notices.at(-1) ?? "", /^Already present:/);
+    assert.equal(resets.length, 1);
+    assert.equal(initialised.length, 2);
+    assert.ok(component);
 
     await commands.get("sandbox")?.("", ctx);
     assert.match(notices.at(-1) ?? "", /Sandbox Configuration/);
-    assert.equal(initialised.length, rules.length + 1);
-    assert.equal(resets.length, rules.length);
+    assert.equal(resets.length, 1);
   } finally {
     managerMock.mock.restore();
     resetMock.mock.restore();
@@ -722,64 +737,230 @@ test("/sandbox exercises all six project-only rules and refreshes only after cha
   }
 });
 
-test("/sandbox warns when persistence succeeds but active runtime refresh fails", async () => {
-  const root = makeProjectTempDirectory("extension-refresh-failure");
+test("/sandbox-allow uses session, project-relative, and canonical global persistence", async () => {
+  const root = makeProjectTempDirectory("sandbox-allow-scopes");
+  const globalTargetRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-allow-global-"));
+  const agentDir = join(root, "global-agent");
+  const projectPath = join(root, ".pi", "sandbox.json");
+  const globalPath = join(agentDir, "sandbox.json");
+  mkdirSync(dirname(projectPath), { recursive: true });
+  mkdirSync(dirname(globalPath), { recursive: true });
+  writeFileSync(
+    projectPath,
+    JSON.stringify({ enabled: false, network: { allowedDomains: ["existing.example"] } }),
+  );
+  writeFileSync(
+    globalPath,
+    JSON.stringify({ network: { deniedDomains: ["blocked.example"], allowLocalBinding: true } }),
+  );
   const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
-  process.env.PI_CODING_AGENT_DIR = join(root, "global-agent");
+  process.env.PI_CODING_AGENT_DIR = agentDir;
   const initialised: string[] = [];
   const resets: string[] = [];
   const notices: string[] = [];
-  const managerMock = mock.method(SandboxManager, "initialize", async () => {
+  const initializeMock = mock.method(SandboxManager, "initialize", async () => {
     initialised.push("initialize");
-    if (initialised.length > 1) throw new Error("test refresh failure");
   });
   const resetMock = mock.method(SandboxManager, "reset", async () => {
     resets.push("reset");
   });
 
   try {
-    const { pi, commands, handlers, tools } = makePi();
-    extension(pi);
+    const { pi, commands, handlers } = makePi();
+    extension(pi, { configLoader: () => makePromptTestConfig() });
     const ctx = makeContext(root, notices);
+    let nextScope: "session" | "project" | "global" = "session";
+    (ctx.ui as any).custom = <T>(factory: any): Promise<T> =>
+      new Promise<T>((resolve) => {
+        let component: any;
+        component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          (value: T) => {
+            component?.dispose?.();
+            resolve(value);
+          },
+        );
+        if (nextScope === "session") {
+          component.handleInput("s");
+          return;
+        }
+        if (nextScope === "project") {
+          component.handleInput("\x1b[B");
+          component.handleInput("\x1b[B");
+          component.handleInput("\t");
+          for (let index = 0; index < 200; index += 1) component.handleInput("\x7f");
+          component.handleInput("packages/widget");
+          component.handleInput("\r");
+          component.handleInput("\r");
+          return;
+        }
+        component.handleInput("A");
+        component.handleInput("\r");
+      });
 
     await handlers.get("session_start")?.({}, ctx);
-    await commands.get("sandbox")?.("allowRead ./refresh-read", ctx);
-
-    // The desired replacement failed and the prior runtime could not be
-    // restored by this fixture. Persisted policy must not unlock local Bash.
-    assert.equal(initialised.length, 3);
-    assert.equal(resets.length, 1);
-    assert.deepEqual(JSON.parse(readFileSync(join(root, ".pi", "sandbox.json"), "utf8")), {
-      filesystem: { allowRead: ["./refresh-read"] },
+    await commands.get("sandbox-allow")?.("domain api.example.test", ctx);
+    assert.equal(existsSync(join(root, ".pi", "sandbox.json")), true);
+    assert.deepEqual(JSON.parse(readFileSync(projectPath, "utf8")), {
+      enabled: false,
+      network: { allowedDomains: ["existing.example"] },
     });
-    assert.match(notices.at(-1) ?? "", /active sandbox runtime was not refreshed/i);
+    assert.deepEqual(JSON.parse(readFileSync(globalPath, "utf8")), {
+      network: { deniedDomains: ["blocked.example"], allowLocalBinding: true },
+    });
+    await commands.get("sandbox")?.("", ctx);
+    assert.match(notices.at(-1) ?? "", /Session allowed: api.example.test/);
 
-    const bashTool = tools.get("bash");
-    assert.ok(bashTool);
-    await assert.rejects(
-      bashTool.execute("test", { command: "printf local" }, undefined, undefined, ctx),
-      /command execution remains blocked/,
+    nextScope = "project";
+    await commands.get("sandbox-allow")?.(
+      `read ${join(root, "packages", "widget", "src", "index.ts")}`,
+      ctx,
     );
-    const blockedReason = "Sandbox is not ready; command execution remains blocked.";
-    assert.deepEqual(
-      await handlers.get("tool_call")?.(
-        { toolName: "read", input: { path: join(root, "blocked-read") } },
-        ctx,
-      ),
-      { block: true, reason: blockedReason },
-    );
-    assert.deepEqual(
-      await handlers.get("tool_call")?.(
-        { toolName: "write", input: { path: join(`${root}-outside`, "blocked-write") } },
-        ctx,
-      ),
-      { block: true, reason: blockedReason },
-    );
-    const userBash = await handlers.get("user_bash")?.({ command: "printf local" }, ctx);
-    assert.equal(userBash?.result?.exitCode, 1);
-    assert.equal(userBash?.operations, undefined);
+    assert.deepEqual(JSON.parse(readFileSync(projectPath, "utf8")), {
+      enabled: false,
+      network: { allowedDomains: ["existing.example"] },
+      filesystem: { allowRead: ["packages/widget"] },
+    });
+    assert.deepEqual(JSON.parse(readFileSync(globalPath, "utf8")), {
+      network: { deniedDomains: ["blocked.example"], allowLocalBinding: true },
+    });
+
+    nextScope = "global";
+    const globalTarget = join(globalTargetRoot, "output.txt");
+    await commands.get("sandbox-allow")?.(`write ${globalTarget}`, ctx);
+    assert.deepEqual(JSON.parse(readFileSync(globalPath, "utf8")), {
+      network: { deniedDomains: ["blocked.example"], allowLocalBinding: true },
+      filesystem: { allowWrite: [join(realpathSync(globalTargetRoot), "output.txt")] },
+    });
+    assert.equal(resets.length, 3);
+    assert.equal(initialised.length, 4);
   } finally {
-    managerMock.mock.restore();
+    initializeMock.mock.restore();
+    resetMock.mock.restore();
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(root, { recursive: true, force: true });
+    rmSync(globalTargetRoot, { recursive: true, force: true });
+  }
+});
+
+test("/sandbox-allow reports when a failed refresh rolls back a session grant", async () => {
+  const root = makeProjectTempDirectory("sandbox-allow-session-refresh-failure");
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(root, "global-agent");
+  const notices: string[] = [];
+  let initializeCount = 0;
+  const initializeMock = mock.method(SandboxManager, "initialize", async () => {
+    initializeCount += 1;
+    if (initializeCount === 2) throw new Error("test refresh failure");
+  });
+  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+
+  try {
+    const { pi, commands, handlers } = makePi();
+    extension(pi, { configLoader: () => makePromptTestConfig() });
+    const ctx = makeContext(root, notices);
+    (ctx.ui as any).custom = <T>(factory: any): Promise<T> =>
+      new Promise<T>((resolve) => {
+        const component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          resolve,
+        );
+        component.handleInput("s");
+      });
+
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("sandbox-allow")?.("read /tmp/rolled-back", ctx);
+
+    assert.equal(initializeCount, 3);
+    assert.equal(resetMock.mock.callCount(), 1);
+    assert.match(notices.at(-1) ?? "", /Session permission was rolled back/i);
+    assert.doesNotMatch(notices.at(-1) ?? "", /permission was persisted/i);
+    assert.equal(existsSync(join(root, ".pi", "sandbox.json")), false);
+
+    await commands.get("sandbox")?.("", ctx);
+    assert.doesNotMatch(notices.at(-1) ?? "", /rolled-back/);
+  } finally {
+    initializeMock.mock.restore();
+    resetMock.mock.restore();
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("/sandbox-allow validates kinds and targets and safely aborts without UI or on timeout", async () => {
+  const root = makeProjectTempDirectory("sandbox-allow-abort");
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(root, "global-agent");
+  const notices: string[] = [];
+  let initializeCount = 0;
+  let resetCount = 0;
+  let customCount = 0;
+  let promptBehavior: "abort" | "timeout" = "timeout";
+  const initializeMock = mock.method(SandboxManager, "initialize", async () => {
+    initializeCount += 1;
+  });
+  const resetMock = mock.method(SandboxManager, "reset", async () => {
+    resetCount += 1;
+  });
+
+  try {
+    const { pi, commands, handlers } = makePi();
+    const config = { ...makePromptTestConfig(), permissionPromptTimeoutSeconds: 0.01 };
+    extension(pi, { configLoader: () => config });
+    const ctx = makeContext(root, notices);
+    (ctx.ui as any).custom = <T>(factory: any): Promise<T> =>
+      new Promise<T>((resolve) => {
+        customCount += 1;
+        let component: any;
+        component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          (value: T) => {
+            component?.dispose?.();
+            resolve(value);
+          },
+        );
+        if (promptBehavior === "abort") component.handleInput("\x1b");
+      });
+    await handlers.get("session_start")?.({}, ctx);
+    const beforePrompt = { initializeCount, resetCount };
+
+    await commands.get("sandbox-allow")?.("denyRead /tmp/blocked", ctx);
+    await commands.get("sandbox-allow")?.("domain https://example.com/path", ctx);
+    await commands.get("sandbox-allow")?.("read /tmp/*", ctx);
+    assert.equal(customCount, 0);
+    assert.equal(existsSync(join(root, ".pi", "sandbox.json")), false);
+
+    promptBehavior = "abort";
+    await commands.get("sandbox-allow")?.("read /tmp/abort", ctx);
+    assert.equal(customCount, 1);
+    assert.equal(existsSync(join(root, ".pi", "sandbox.json")), false);
+
+    (ctx as any).hasUI = false;
+    await commands.get("sandbox-allow")?.("read /tmp/no-ui", ctx);
+    assert.equal(customCount, 1);
+    assert.equal(existsSync(join(root, ".pi", "sandbox.json")), false);
+    (ctx as any).hasUI = true;
+
+    promptBehavior = "timeout";
+    await commands.get("sandbox-allow")?.("read /tmp/timeout", ctx);
+    assert.equal(customCount, 2);
+    assert.equal(existsSync(join(root, ".pi", "sandbox.json")), false);
+    assert.equal(existsSync(join(root, "global-agent", "sandbox.json")), false);
+    assert.deepEqual({ initializeCount, resetCount }, beforePrompt);
+    assert.equal(
+      notices.some((message) => /Usage: \/sandbox-allow/.test(message)),
+      true,
+    );
+  } finally {
+    initializeMock.mock.restore();
     resetMock.mock.restore();
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
@@ -802,11 +983,22 @@ test("equivalent prior runtime restoration remains executable", async () => {
     const { pi, commands, handlers, tools } = makePi();
     extension(pi, { configLoader: () => config });
     const ctx = makeContext(root, []);
+    (ctx.ui as any).custom = <T>(factory: any): Promise<T> =>
+      new Promise<T>((resolve) => {
+        const component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          resolve,
+        );
+        component.handleInput("P");
+        component.handleInput("\r");
+      });
     await handlers.get("session_start")?.({}, ctx);
 
     // The loader keeps the effective policy equivalent while the sanctioned
-    // persistence command still exercises the replacement lifecycle.
-    await commands.get("sandbox")?.("allowRead ./equivalent", ctx);
+    // approval writer still exercises the replacement lifecycle.
+    await commands.get("sandbox-allow")?.(`read ${join(root, "equivalent")}`, ctx);
     assert.equal(initializeCount, 3);
     assert.equal(resetMock.mock.callCount(), 1);
 
@@ -845,8 +1037,19 @@ test("policy-different restoration stays unavailable until explicit recovery", a
     const { pi, commands, handlers, tools } = makePi();
     extension(pi);
     const ctx = makeContext(root, notices, statusUpdates);
+    (ctx.ui as any).custom = <T>(factory: any): Promise<T> =>
+      new Promise<T>((resolve) => {
+        const component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          resolve,
+        );
+        component.handleInput("P");
+        component.handleInput("\r");
+      });
     await handlers.get("session_start")?.({}, ctx);
-    await commands.get("sandbox")?.("allowRead ./new-policy", ctx);
+    await commands.get("sandbox-allow")?.(`read ${join(root, "new-policy")}`, ctx);
 
     assert.equal(initializeCount, 3); // desired failure, then prior restoration
     assert.equal(resetMock.mock.callCount(), 1);
@@ -855,6 +1058,10 @@ test("policy-different restoration stays unavailable until explicit recovery", a
       true,
     );
     assert.match(notices.join("\\n"), /unavailable.*blocked/i);
+    assert.match(
+      notices.join("\\n"),
+      /Permission was persisted, but the sandbox could not refresh/i,
+    );
     const bash = tools.get("bash");
     assert.ok(bash);
     await assert.rejects(
@@ -879,7 +1086,7 @@ test("policy-different restoration stays unavailable until explicit recovery", a
     assert.equal(wrapMock.mock.callCount(), 1);
     assert.match((ready.content[0] as { text: string }).text, /recovered/);
     assert.deepEqual(JSON.parse(readFileSync(join(root, ".pi", "sandbox.json"), "utf8")), {
-      filesystem: { allowRead: ["./new-policy"] },
+      filesystem: { allowRead: ["new-policy"] },
     });
   } finally {
     wrapMock.mock.restore();
@@ -1306,6 +1513,88 @@ test("replaces linked-worktree runtime allowances from the active cwd", async ()
   }
 });
 
+test("/sandbox-allow cannot disable protected config checks with a broad edited write allowance", async () => {
+  const root = makeProjectTempDirectory("broad-write-config-protection");
+  const agentDir = join(root, "custom-agent");
+  const projectPath = join(root, ".pi", "sandbox.json");
+  const globalPath = join(agentDir, "sandbox.json");
+  mkdirSync(dirname(projectPath), { recursive: true });
+  mkdirSync(agentDir, { recursive: true });
+  const originalProject = JSON.stringify({ enabled: true, filesystem: { allowWrite: [] } });
+  const originalGlobal = JSON.stringify({ network: { deniedDomains: ["blocked.example"] } });
+  writeFileSync(projectPath, originalProject);
+  writeFileSync(globalPath, originalGlobal);
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const notices: string[] = [];
+  const initializeMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+
+  try {
+    const { pi, commands, handlers } = makePi();
+    extension(pi);
+    const ctx = makeContext(root, notices);
+    (ctx.ui as any).custom = <T>(factory: any): Promise<T> =>
+      new Promise<T>((resolve) => {
+        let component: any;
+        component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          (value: T) => {
+            component?.dispose?.();
+            resolve(value);
+          },
+        );
+        // Select global scope, edit the concrete proposal to the broad root,
+        // then explicitly confirm the persistent grant.
+        component.handleInput("\x1b[B");
+        component.handleInput("\x1b[B");
+        component.handleInput("\x1b[B");
+        component.handleInput("\t");
+        for (let index = 0; index < 200; index += 1) component.handleInput("\x7f");
+        component.handleInput("/");
+        component.handleInput("\r");
+        component.handleInput("\r");
+      });
+
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("sandbox-allow")?.("write /tmp/ordinary-output.txt", ctx);
+    assert.deepEqual(JSON.parse(readFileSync(globalPath, "utf8")), {
+      network: { deniedDomains: ["blocked.example"] },
+      filesystem: { allowWrite: ["/"] },
+    });
+
+    for (const path of [projectPath, globalPath]) {
+      for (const toolName of ["write", "edit"]) {
+        const blocked = await handlers.get("tool_call")?.({ toolName, input: { path } }, ctx);
+        assert.equal(blocked?.block, true);
+        assert.match(blocked?.reason ?? "", /sandbox configuration files are protected/i);
+      }
+      const bash = await handlers.get("tool_call")?.(
+        { toolName: "bash", input: { command: `echo changed > ${path}` } },
+        ctx,
+      );
+      const userBash = await handlers.get("user_bash")?.(
+        { command: `echo changed > ${path}` },
+        ctx,
+      );
+      assert.equal(bash?.block, true);
+      assert.equal(userBash?.result?.exitCode, 1);
+      assert.match(bash?.reason ?? "", /\/sandbox-allow cannot override/i);
+      assert.match(userBash?.result?.output ?? "", /\/sandbox-allow cannot override/i);
+    }
+    assert.equal(readFileSync(projectPath, "utf8"), originalProject);
+    assert.notEqual(readFileSync(globalPath, "utf8"), originalGlobal);
+  } finally {
+    initializeMock.mock.restore();
+    resetMock.mock.restore();
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("protected write, edit, Bash, and user Bash mutations are blocked before sandbox state checks", async () => {
   const root = makeProjectTempDirectory("extension-protection");
   const agentDir = join(root, "custom-agent");
@@ -1337,8 +1626,8 @@ test("protected write, edit, Bash, and user Bash mutations are blocked before sa
     assert.equal(userBash?.result?.exitCode, 1);
     assert.match(directWrite?.reason ?? "", /protected/);
     assert.match(directEdit?.reason ?? "", /protected/);
-    assert.match(bash?.reason ?? "", /use \/sandbox/i);
-    assert.match(userBash?.result?.output ?? "", /use \/sandbox/i);
+    assert.match(bash?.reason ?? "", /\/sandbox-allow/i);
+    assert.match(userBash?.result?.output ?? "", /\/sandbox-allow/i);
   } finally {
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
@@ -2783,7 +3072,3 @@ test("diagnostic retries do not prompt twice for the same violation", async () =
     rmSync(root, { recursive: true, force: true });
   }
 });
-
-function requireNotice(notices: string[], expected: string): boolean {
-  return notices.some((notice) => notice.includes(expected));
-}

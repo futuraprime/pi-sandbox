@@ -1,6 +1,6 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1–9.5 and the Slice 10a audit are complete; the private-fork ownership/release decision has been applied and current user-facing documentation refreshed. Slice 10b command/cleanup work, the upstream-update rehearsal, full verification, and fresh bare-macOS release acceptance remain open.
+- **Status:** In progress — slices 1–9.5 and the Slice 10a audit are complete; the private-fork ownership/release decision has been applied. The O-01 command unit is implemented with focused contracts in the current checkout; remaining Slice 10b cleanup/review, upstream-update rehearsal, complete verification, and fresh bare-macOS release acceptance remain pending.
 - **Date:** 2026-09-03
 - **Updated:** 2026-09-28
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
@@ -106,27 +106,16 @@ Canonicalisation should expand `~`, resolve `.` and `..`, and resolve existing s
 
 ## Configuration commands
 
-Retain the fork's sanctioned `/sandbox` project-policy editor and its support for all six rule types:
+The accepted O-01 interface splits display from approval:
 
 ```text
-/sandbox allowRead <path>
-/sandbox denyRead <path>
-/sandbox allowWrite <path>
-/sandbox denyWrite <path>
-/sandbox allowedDomains <domain>
-/sandbox deniedDomains <domain>
+/sandbox                                  show effective configuration and session allowances
+/sandbox-allow domain|read|write <target> open the editable permission prompt
 ```
 
-The command must continue to preserve unrelated configuration, avoid duplicate rules, reinitialise the active sandbox, and bypass the prohibition on direct agent edits only through its explicit user-command path.
+`/sandbox` is display-only. `/sandbox-allow` accepts only a concrete hostname or filesystem target, validates the chosen editable rule against that target, and retains session, project, and global grant choices. Project grants preserve project-relative paths; global and session path grants use canonical absolute paths. Persistent approval preserves unrelated config, avoids canonical duplicates, and refreshes the active runtime before execution continues.
 
-Do not replace this with upstream's positive-only `/sandbox-allow` command. The useful parts of upstream `28124dd` and later prompt work should instead be adapted:
-
-- validate rule syntax and ensure an edited rule matches the operation being approved;
-- use canonical comparison to detect equivalent path spellings;
-- retain session, project, and global choices for interactive grants; and
-- preserve project-relative storage for project choices.
-
-Whether to retain `/sandbox-allow` as an interactive convenience command or fold that workflow into `/sandbox` remains an open interface question. Avoid two commands with overlapping behaviour unless each has a clear purpose.
+The previous six-rule `/sandbox` parser/editor is removed. Deny rules and credential declarations remain outside this command and require trusted manual configuration changes. Direct tool and Bash checks keep project/global sandbox configuration files protected even if the user edits an approved write rule broadly; prompt persistence continues through the single sanctioned `updateSandboxConfigFile` helper.
 
 ## Editable permission prompts
 

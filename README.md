@@ -95,23 +95,23 @@ for development, not a recommended security policy.
 #### Usage (current implementation)
 
 ```
-pi --no-sandbox                     disable sandboxing for the session
-/sandbox                            show effective configuration and session allowances
-/sandbox allowRead <path>           add a project read rule
-/sandbox denyRead <path>            add a project read-deny rule
-/sandbox allowWrite <path>          add a project write rule
-/sandbox denyWrite <path>           add a project write-deny rule
-/sandbox allowedDomains <hostname>  add a project domain rule
-/sandbox deniedDomains <hostname>   add a project domain-deny rule
-/sandbox-enable                     enable the sandbox for this session
-/sandbox-disable                    disable the sandbox for this session
-/sandbox-debug                      show recent sandbox incidents
+pi --no-sandbox                           disable sandboxing for the session
+/sandbox                                  show effective configuration and session allowances
+/sandbox-allow domain|read|write <target> open an editable permission prompt
+/sandbox-enable                           enable the sandbox for this session
+/sandbox-disable                          disable the sandbox for this session
+/sandbox-debug                            show recent sandbox incidents
 ```
 
-`/sandbox` edits the project config through the protected writer; it does not
-edit credentials. `Alt+S` is still registered in this integration branch but is
-rejected for release and must be removed in Slice 10b. The proposed display-only
-`/sandbox` and `/sandbox-allow` commands are **not implemented yet**.
+`/sandbox` is display-only. `/sandbox-allow` accepts one concrete hostname or
+filesystem target and opens the existing editable permission prompt, including
+session, project, and global grant choices. Editing the proposed rule remains
+subject to validation and the prompt's confirmation for persistent grants.
+Deny rules and credentials are not command-editable. Project and global sandbox
+configuration files remain protected from direct tool and Bash mutation even
+when an approved write rule is broad. `Alt+S` is still registered in this
+integration branch but is rejected for release and remains pending removal in
+Slice 10b.
 
 ## What it does
 
