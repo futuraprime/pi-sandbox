@@ -45,6 +45,7 @@ function makePi(options: { noSandbox?: boolean } = {}) {
   const commands = new Map<string, (args: string, ctx: ExtensionContext) => Promise<void>>();
   const handlers = new Map<string, (event: any, ctx: ExtensionContext) => Promise<any>>();
   const tools = new Map<string, any>();
+  const shortcuts: unknown[] = [];
   const sentMessages: Array<{ customType: string; content: string; display: boolean }> = [];
   const pi = {
     registerFlag: () => undefined,
@@ -52,7 +53,9 @@ function makePi(options: { noSandbox?: boolean } = {}) {
     registerTool: (definition: { name: string }) => {
       tools.set(definition.name, definition);
     },
-    registerShortcut: () => undefined,
+    registerShortcut: (shortcut: unknown) => {
+      shortcuts.push(shortcut);
+    },
     registerCommand: (
       name: string,
       definition: { handler: (args: string, ctx: ExtensionContext) => Promise<void> },
@@ -67,7 +70,7 @@ function makePi(options: { noSandbox?: boolean } = {}) {
     },
     events: { emit: () => undefined },
   } as unknown as ExtensionAPI;
-  return { pi, commands, handlers, tools, sentMessages };
+  return { pi, commands, handlers, tools, shortcuts, sentMessages };
 }
 
 function makeProjectTempDirectory(prefix: string): string {
@@ -193,6 +196,15 @@ function blockedWriteCommand(path: string, nested = false): string {
   const failure = `printf 'bash: line 1: ${path}: Operation not permitted\\n' >&2; exit 1`;
   return nested ? `bash -c ${shellQuote(failure)}` : failure;
 }
+
+test("extension retains explicit sandbox commands without registering a toggle shortcut", () => {
+  const { pi, commands, shortcuts } = makePi();
+  extension(pi);
+
+  assert.deepEqual(shortcuts, []);
+  assert.equal(commands.has("sandbox-enable"), true);
+  assert.equal(commands.has("sandbox-disable"), true);
+});
 
 test("extension wires pending, enabled, disabled, and shutdown statuses", async () => {
   const root = makeProjectTempDirectory("extension-status");

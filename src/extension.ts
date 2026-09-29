@@ -8,7 +8,7 @@ import {
   isToolCallEventType,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { Key, Text } from "@earendil-works/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
 
 import { getConfigPaths, loadConfig, type SandboxConfig } from "./config.ts";
 import {
@@ -954,14 +954,6 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     return true;
   }
 
-  async function toggleSandbox(ctx: SandboxContext): Promise<void> {
-    if (sandboxRequested()) {
-      if (await disableSandbox(ctx)) ctx.ui.notify("Sandbox disabled", "info");
-      return;
-    }
-    if (await enableSandbox(ctx, false)) ctx.ui.notify("Sandbox enabled", "info");
-  }
-
   pi.registerTool({
     name: "set_git_upstream",
     label: "Set Git upstream",
@@ -1359,11 +1351,6 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     sandboxLifecycle = { state: "shutdown" };
     resetSessionMemory();
     if (ctx) updateStatus(ctx, "shutdown");
-  });
-
-  pi.registerShortcut(Key.alt("s"), {
-    description: "Toggle sandbox on/off for this session",
-    handler: toggleSandbox,
   });
 
   pi.registerCommand("sandbox-enable", {

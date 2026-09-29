@@ -84,7 +84,7 @@ for development, not a recommended security policy.
     "denyRead": ["/Users", "/home"],
     "allowRead": [".", "~/.config", "~/.local", "Library"],
 
-    // Current runtime expands allowWrite paths into effective read paths.
+    // allowWrite paths also grant effective read access to those same paths.
     // An empty array cannot remove built-in write allowances.
     "allowWrite": [".", "/tmp"],
     "denyWrite": [".env", ".env.*", "*.pem", "*.key"]
@@ -109,9 +109,9 @@ session, project, and global grant choices. Editing the proposed rule remains
 subject to validation and the prompt's confirmation for persistent grants.
 Deny rules and credentials are not command-editable. Project and global sandbox
 configuration files remain protected from direct tool and Bash mutation even
-when an approved write rule is broad. `Alt+S` is still registered in this
-integration branch but is rejected for release and remains pending removal in
-Slice 10b.
+when an approved write rule is broad. The rejected `Alt+S` toggle is not
+registered; use `/sandbox-enable` or `/sandbox-disable` to change sandbox state
+explicitly for the session.
 
 ## What it does
 
@@ -148,8 +148,10 @@ over a broader deny. An unmatched target is prompted where the operation support
 permission prompts. A matching deny blocks without a grant prompt, including
 protected sandbox config paths. Relative project paths are resolved against the
 project directory; project-scoped permissions retain their relative spelling.
-The runtime currently treats write allowances as effective read allowances too;
-formal product approval of that C-13 behavior is still pending.
+Configured and session `allowWrite` grants also grant effective read access to
+the same paths. This is the accepted C-13 contract shared by direct tools and
+Bash runtime policy; read and write denies and their existing specificity
+precedence remain unchanged.
 
 `allowedDomains` supports `*.example.com` and `"*"`; `"*"` removes per-domain
 prompts and triggers a warning. Filesystem allow rules may cover a directory,

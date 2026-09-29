@@ -314,7 +314,7 @@ test("buildRuntimeConfig exposes the bundled seccomp helper on Linux", () => {
   assert.equal(runtime.filesystem?.allowRead?.includes(seccompPath), true);
 });
 
-test("characterizes upstream runtime read expansion for write allowances", () => {
+test("write allowances also grant effective read access to the same paths", () => {
   const config = {
     ...DEFAULT_CONFIG,
     filesystem: {
@@ -334,7 +334,7 @@ test("characterizes upstream runtime read expansion for write allowances", () =>
     "/",
   );
 
-  // allowWrite also grants read access to match the direct-tool contract.
+  // Configured and session write grants share this effective-read contract.
   assert.deepEqual(effective.readPaths, ["/configured-write", "/session-write"]);
   assert.deepEqual(effective.writePaths, ["/configured-write", "/session-write"]);
 });

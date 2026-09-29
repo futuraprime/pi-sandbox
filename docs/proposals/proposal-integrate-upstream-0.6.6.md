@@ -1,8 +1,8 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1–9.5 and the Slice 10a audit are complete; the private-fork ownership/release decision has been applied. The O-01 command unit is implemented with focused contracts in the current checkout; remaining Slice 10b cleanup/review, upstream-update rehearsal, complete verification, and fresh bare-macOS release acceptance remain pending.
+- **Status:** In progress — slices 1–9.5 and the Slice 10a audit are complete; the private-fork ownership/release decision has been applied. O-01 is implemented. The approved Slice 10b cleanup unit retains C-13 write-implies-effective-read behavior and removes the rejected O-06 shortcut while retaining explicit sandbox commands. Local verification passed on rerun (full suite 165 passed, 0 failed/skipped/todo; check, lint, format, and diff check passed). Remaining work includes the upstream-update rehearsal, frozen-install/CI verification, and fresh bare-macOS release acceptance.
 - **Date:** 2026-09-03
-- **Updated:** 2026-09-28
+- **Updated:** 2026-09-30
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
 - **Slice 6c assessment:** [sandbox-runtime 0.0.70/0.0.72 assessment](../integration/upstream-0.6.6-slice-6c-assessment.md)
@@ -382,10 +382,12 @@ Slice 10 is divided into a read-only reconciliation audit and separately approve
 
 #### Slice 10b: Approved reconciliation and verification
 
+**Progress (2026-09-30):** the approved cleanup unit records C-13 as retained existing policy and removes O-06's `Alt+S` registration with a regression test that preserves explicit `/sandbox-enable` and `/sandbox-disable` commands. README and ledger current-state notes are aligned; full Slice 10b work remains pending.
+
 - Preserve the completed private-fork metadata, repository URLs, no-publish workflow, and current README corrections; finish any example/README reconciliation needed after 10b behavior changes and verify the pnpm lockfile and CI.
 - Remove only duplication approved in Slice 10a and proven safe by replacement coverage.
 - Perform and document the upstream-aligned update rehearsal, confirming that unrelated downstream-owned modules remain untouched.
-- Keep O-01–O-11 explicit rather than implementing deferred or rejected capabilities, and update stale ledger or review dispositions such as the resolved C-13 decision.
+- Keep O-01–O-11 explicit rather than implementing deferred or rejected capabilities; record C-13 as retained and O-06 as rejected/removed in current disposition documentation.
 - Run formatting, linting, type checking, the full test suite, and diff checks.
 - Run the required macOS platform checks on a bare macOS host. When the current environment prevents nested `sandbox-exec`, record the exact external acceptance steps, distinguish prior evidence from current results, and leave the release gate explicitly pending rather than weakening or bypassing it.
 - Update the Slice 10 checkpoint, proposal, feature ledger, and review documentation.
@@ -447,6 +449,7 @@ Run formatting, linting, TypeScript checking, and unit tests. Run platform-speci
 ## Open questions
 
 - **Resolved for Slice 10b:** adopt the upstream command split: `/sandbox` becomes display-only and `/sandbox-allow domain|read|write <target>` uses the editable session/project/global permission prompt. Remove the six-rule editor only after replacement persistence, refresh, validation, and configuration-protection coverage passes.
+- **Resolved in the approved Slice 10b cleanup unit (2026-09-30):** retain C-13: configured and session write allowances also grant effective read access on those same paths; this formalizes existing behavior without adding policy/runtime behavior or changing read/write deny specificity. Reject O-06 and remove the `Alt+S` toggle; explicit `/sandbox-enable` and `/sandbox-disable` commands remain.
 - Should users be able to remove inherited rules through a separate explicit command, while keeping empty-array composition cumulative?
 - **Resolved for Slice 9.5:** reject upstream's generic ordinary-SSH proxy and implement only a narrowly scoped Git-over-SSH transport, retaining domain filtering, secure host verification, exact session-only SSH-agent approval, and no broad Unix-socket access. Require a real disposable-remote push acceptance test on bare macOS.
 - **Resolved in Slices 6d–9.5:** stock sandbox-runtime 0.0.72 needed the bounded consumer-side Chromium adapter; the exact runtime is approved with that adapter. Slice 9.5 resolved the extension's isolated-known-hosts limitation with an explicit trust path and strict host-key checking, verified against disposable SSH fixtures.
