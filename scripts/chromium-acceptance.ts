@@ -48,6 +48,12 @@ type WorkerResult = {
   lifecycle: { initialize: string; reset: string };
   failure?: string;
 };
+type HostBaseline = {
+  version: ExecResult;
+  result: ExecResult;
+  gate: Gate;
+  method: string;
+};
 type AcceptanceReport = {
   schema: 1;
   startedAt: string;
@@ -57,6 +63,7 @@ type AcceptanceReport = {
   host: Record<string, unknown>;
   commands: Record<string, string>;
   modes: WorkerResult[];
+  hostBaseline: HostBaseline;
   cleanup: Record<string, unknown>;
   warnings: string[];
 };
@@ -106,6 +113,36 @@ export function classifyResourceProbe(
     passed,
     verdict: passed ? "denied with EPERM/EACCES" : "expected recognizable sandbox/resource denial",
   };
+}
+
+export function classifyHostBaseline(result: ExecResult): Gate {
+  const classified = classifyBrowser("enabled", result);
+  return {
+    name: "host-baseline-launch",
+    passed: classified.passed,
+    verdict: classified.passed
+      ? "diagnostic direct-host Chromium launch observed DevTools and DOM"
+      : "diagnostic direct-host Chromium launch did not produce DevTools and DOM",
+  };
+}
+
+export function acceptanceVerdict(
+  modes: WorkerResult[],
+  _hostBaseline: HostBaseline,
+  cleanupFailed: boolean,
+  fixtureRemoved: boolean,
+  fatalFailure: boolean,
+): "PASS" | "FAIL" {
+  // The host baseline is diagnostic only; it cannot override sandbox worker gates.
+  const gates = modes.flatMap((mode) => mode.gates);
+  return !fatalFailure &&
+    !cleanupFailed &&
+    modes.length === 2 &&
+    fixtureRemoved &&
+    gates.length > 0 &&
+    gates.every((gate) => gate.passed)
+    ? "PASS"
+    : "FAIL";
 }
 
 export function classifyBrowser(mode: Mode, result: ExecResult): Gate {
@@ -181,6 +218,9 @@ export function reportAsMarkdown(report: AcceptanceReport): string {
     "| Mode | Gates |",
     "| --- | --- |",
     ...rows,
+    `| host baseline (diagnostic only) | ${state(report.hostBaseline.gate.passed)} (${report.hostBaseline.gate.verdict}) |`,
+    "",
+    "Host baseline does not affect the enabled/disabled sandbox gate verdict.",
     "",
     "```json",
     JSON.stringify(report, null, 2),
@@ -286,6 +326,87 @@ function buildResourceCommand(name: string, path: string): string {
   return `${quoteShell(process.execPath)} -e ${quoteShell(buildResourceProbeSource(name, path))}`;
 }
 
+function chromiumLaunchArgs(profile: string): string[] {
+  return [
+    "--headless=new",
+    "--disable-gpu",
+    "--no-first-run",
+    "--no-default-browser-check",
+    `--user-data-dir=${profile}`,
+    "--remote-debugging-port=0",
+    "--dump-dom",
+    "about:blank",
+  ];
+}
+
+function chromiumLaunchCommand(chromium: string, profile: string): string {
+  return [chromium, ...chromiumLaunchArgs(profile)].map(quoteShell).join(" ");
+}
+
+function runHostCommand(
+  command: string,
+  args: string[],
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  timeoutMs: number,
+): Promise<ExecResult> {
+  const child = spawn(command, args, {
+    cwd,
+    env,
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  activeWorker = child;
+  const output = capture();
+  child.stdout?.on("data", (chunk) => output.append("stdout", chunk));
+  child.stderr?.on("data", (chunk) => output.append("stderr", chunk));
+  const commandText = [command, ...args].map(quoteShell).join(" ");
+  return new Promise((resolvePromise) => {
+    let timedOut = false;
+    let spawnError: string | undefined;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      terminateOwnedGroup(child);
+    }, timeoutMs);
+    child.once("error", (error) => {
+      spawnError = error.message;
+    });
+    child.once("close", (exitCode) => {
+      clearTimeout(timer);
+      if (!timedOut) cancelGroupTermination(child);
+      if (activeWorker === child) activeWorker = undefined;
+      resolvePromise({
+        command: commandText,
+        exitCode,
+        stdout: output.stdout(),
+        stderr: output.stderr(),
+        outputTruncated: output.truncated(),
+        outputStream: "direct host child stdout/stderr",
+        ...(timedOut ? { timedOut: true } : {}),
+        ...(spawnError ? { error: spawnError } : {}),
+      });
+    });
+  });
+}
+
+async function runHostBaseline(
+  chromium: string,
+  dir: string,
+  profile: string,
+  env: NodeJS.ProcessEnv,
+): Promise<HostBaseline> {
+  assertSafeHost(process.platform, process.env.SANDBOX_RUNTIME);
+  const version = await runHostCommand(chromium, ["--version"], dir, env, 10_000);
+  const result = await runHostCommand(chromium, chromiumLaunchArgs(profile), dir, env, 30_000);
+  return {
+    version,
+    result,
+    gate: classifyHostBaseline(result),
+    method:
+      "diagnostic direct host spawn without the outer sandbox runtime; Chromium's own sandbox remains enabled",
+  };
+}
+
 async function runSandboxCommand(
   ops: BashOperations,
   command: string,
@@ -382,17 +503,7 @@ async function runWorker(
           : "version command failed in sandbox",
     });
 
-    const launchCommand = [
-      quoteShell(chromium),
-      "--headless=new",
-      "--disable-gpu",
-      "--no-first-run",
-      "--no-default-browser-check",
-      `--user-data-dir=${quoteShell(profile)}`,
-      "--remote-debugging-port=0",
-      "--dump-dom",
-      "about:blank",
-    ].join(" ");
+    const launchCommand = chromiumLaunchCommand(chromium, profile);
     result.browser = await runSandboxCommand(ops, launchCommand, dir, env, 30, controller.signal);
     result.gates.push(classifyBrowser(mode, result.browser));
 
@@ -638,7 +749,6 @@ function terminateOwnedGroup(child: ChildProcess): void {
   if (groupTerminationTimers.has(child)) return;
   const force = setTimeout(() => {
     groupTerminationTimers.delete(child);
-    if (child.exitCode !== null || child.signalCode !== null) return;
     try {
       process.kill(-child.pid!, "SIGKILL");
     } catch {
@@ -870,8 +980,7 @@ async function acceptanceMain(): Promise<number> {
   let hostReport: Record<string, unknown> = { platform: process.platform, node: process.version };
   const reportCommands: Record<string, string> = {
     invocation: "pnpm exec tsx scripts/chromium-acceptance.ts",
-    chromium:
-      "--headless=new --disable-gpu --no-first-run --no-default-browser-check --user-data-dir=<disposable> --remote-debugging-port=0 --dump-dom about:blank",
+    chromium: chromiumLaunchArgs("<disposable>").join(" "),
     resourceProbes:
       "Darwin user-temp file; ephemeral loopback bind; scoped Darwin user-temp AF_UNIX bind",
     hostTempLookup: "/usr/bin/getconf DARWIN_USER_TEMP_DIR",
@@ -879,6 +988,30 @@ async function acceptanceMain(): Promise<number> {
   let env: NodeJS.ProcessEnv = {};
   let userTemp = "";
   let fatalFailure = false;
+  const baselineDir = join(fixture, "host-baseline");
+  const baselineProfile = join(baselineDir, "profile");
+  let baselineEnv: NodeJS.ProcessEnv = {};
+  let hostBaseline: HostBaseline = {
+    version: {
+      command: chromium.executable,
+      exitCode: null,
+      stdout: "",
+      stderr: "not run",
+      outputTruncated: false,
+      error: "host baseline was not run",
+    },
+    result: {
+      command: chromium.executable,
+      exitCode: null,
+      stdout: "",
+      stderr: "not run",
+      outputTruncated: false,
+      error: "host baseline was not run",
+    },
+    gate: { name: "host-baseline-launch", passed: false, verdict: "host baseline was not run" },
+    method:
+      "diagnostic direct host spawn without the outer sandbox runtime; Chromium's own sandbox remains enabled",
+  };
   const modeDirs: Record<Mode, string> = {
     enabled: join(fixture, "enabled"),
     disabled: join(fixture, "disabled"),
@@ -888,6 +1021,8 @@ async function acceptanceMain(): Promise<number> {
       mkdirSync(join(modeDirs[mode], "home"), { recursive: true, mode: 0o700 });
       mkdirSync(join(modeDirs[mode], "pi-agent"), { recursive: true, mode: 0o700 });
     }
+    mkdirSync(join(baselineDir, "home"), { recursive: true, mode: 0o700 });
+    mkdirSync(join(baselineDir, "pi-agent"), { recursive: true, mode: 0o700 });
     const bootstrapEnv = {
       PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
       HOME: join(modeDirs.enabled, "home"),
@@ -900,6 +1035,12 @@ async function acceptanceMain(): Promise<number> {
       userTemp,
     );
     hostReport = hostMetadata(root, env, chromium.executable, userTemp);
+    baselineEnv = sanitizedEnvironment(
+      process.env,
+      join(baselineDir, "home"),
+      join(baselineDir, "pi-agent"),
+      userTemp,
+    );
     for (const mode of ["enabled", "disabled"] as const) {
       if (requestedSignal) throw new Error(`Interrupted by ${requestedSignal}.`);
       const modeEnv = sanitizedEnvironment(
@@ -981,12 +1122,56 @@ async function acceptanceMain(): Promise<number> {
         });
       modes.push(modeResult);
     }
+    hostBaseline = await runHostBaseline(
+      chromium.executable,
+      baselineDir,
+      baselineProfile,
+      baselineEnv,
+    );
+    const baselineCleanup = await cleanEscapedChromium(
+      baselineProfile,
+      chromium.executable,
+      baselineEnv,
+    );
+    cleanup.hostBaselineBrowserProcesses = baselineCleanup;
+    if (baselineCleanup.pidsDetected.length)
+      recordCleanupFailure(
+        `Escaped Chromium process(es) detected for host baseline: ${baselineCleanup.pidsDetected.join(",")}`,
+      );
+    if (baselineCleanup.remaining.length)
+      recordCleanupFailure(
+        `Host baseline Chromium PIDs remain: ${baselineCleanup.remaining.join(",")}`,
+      );
+    if (baselineCleanup.inspectionError)
+      recordCleanupFailure(
+        `Host baseline Chromium cleanup inspection failed: ${baselineCleanup.inspectionError}`,
+      );
   } catch (error) {
     fatalFailure = true;
     warnings.push(error instanceof Error ? error.message : String(error));
   } finally {
     try {
       if (userTemp) {
+        if (baselineEnv.PATH) {
+          const processes = await cleanEscapedChromium(
+            baselineProfile,
+            chromium.executable,
+            baselineEnv,
+          );
+          cleanup.hostBaselineFinalBrowserProcesses = processes;
+          if (processes.pidsDetected.length)
+            recordCleanupFailure(
+              `Host baseline Chromium processes remained to final cleanup: ${processes.pidsDetected.join(",")}`,
+            );
+          if (processes.remaining.length)
+            recordCleanupFailure(
+              `Host baseline Chromium processes remain after final cleanup: ${processes.remaining.join(",")}`,
+            );
+          if (processes.inspectionError)
+            recordCleanupFailure(
+              `Final host baseline Chromium cleanup inspection failed: ${processes.inspectionError}`,
+            );
+        }
         for (const mode of ["enabled", "disabled"] as const) {
           const artifactCleanup = Object.entries(makeProbePaths(userTemp, token, mode))
             .filter(([name]) => name !== "loopback-bind")
@@ -1039,32 +1224,32 @@ async function acceptanceMain(): Promise<number> {
     }
   }
 
-  const allGates = modes.flatMap((mode) => mode.gates);
   const report: AcceptanceReport = {
     schema: 1,
     startedAt,
     finishedAt: new Date().toISOString(),
-    verdict:
-      !fatalFailure &&
-      !cleanupFailed &&
-      modes.length === 2 &&
-      Boolean(cleanup.fixtureRemoved) &&
-      allGates.length > 0 &&
-      allGates.every((gate) => gate.passed)
-        ? "PASS"
-        : "FAIL",
+    verdict: acceptanceVerdict(
+      modes,
+      hostBaseline,
+      cleanupFailed,
+      Boolean(cleanup.fixtureRemoved),
+      fatalFailure,
+    ),
     scope:
       "Model-free, real sandbox-runtime initialize/reset and BashOperations Chromium/resource acceptance only; not full extension UI, interactive prompt, or model acceptance.",
     host: hostReport,
     commands: reportCommands,
     modes,
+    hostBaseline,
     cleanup,
     warnings,
   };
   if (
     report.modes.some((mode) =>
       [mode.chromiumVersion, mode.browser, ...mode.probes].some((item) => item?.outputTruncated),
-    )
+    ) ||
+    report.hostBaseline.version.outputTruncated ||
+    report.hostBaseline.result.outputTruncated
   )
     report.warnings.push(
       "One or more subprocess outputs were truncated; inspect outputTruncated flags.",

@@ -4,9 +4,11 @@ import { runInNewContext } from "node:vm";
 import assert from "node:assert/strict";
 
 import {
+  acceptanceVerdict,
   assertSafeHost,
   buildResourceProbeSource,
   classifyBrowser,
+  classifyHostBaseline,
   classifyResourceProbe,
   ownedChromiumPids,
   reportAsMarkdown,
@@ -156,6 +158,63 @@ test("browser verdict requires live enabled markers and attributed disabled deni
   );
 });
 
+test("host baseline is diagnostic and cannot mask sandbox acceptance failures", () => {
+  const baselineResult = {
+    command: "Chromium",
+    exitCode: 0,
+    stdout: "<html></html>",
+    stderr: "DevTools listening on ws://127.0.0.1:1234/devtools/browser/id",
+    outputTruncated: false,
+  };
+  const baseline = {
+    version: { ...baselineResult, stdout: "Chromium 152.0.0.0" },
+    result: baselineResult,
+    gate: classifyHostBaseline(baselineResult),
+    method: "direct host diagnostic",
+  };
+  assert.equal(baseline.gate.passed, true);
+  const failedResult = {
+    ...baselineResult,
+    exitCode: 133,
+    stdout: "",
+    stderr: "child sandbox_initEPERM",
+  };
+  assert.equal(classifyHostBaseline(failedResult).passed, false);
+  const passedMode = (mode: "enabled" | "disabled") => ({
+    mode,
+    probes: [],
+    gates: [{ name: "sandbox", passed: true, verdict: "passed" }],
+    lifecycle: { initialize: "passed", reset: "passed" },
+  });
+  const failedMode = {
+    ...passedMode("enabled"),
+    gates: [{ name: "sandbox", passed: false, verdict: "failed" }],
+  };
+  assert.equal(
+    acceptanceVerdict([failedMode, passedMode("disabled")], baseline, false, true, false),
+    "FAIL",
+  );
+  const failedBaseline = {
+    ...baseline,
+    result: failedResult,
+    gate: classifyHostBaseline(failedResult),
+  };
+  assert.equal(
+    acceptanceVerdict(
+      [passedMode("enabled"), passedMode("disabled")],
+      failedBaseline,
+      false,
+      true,
+      false,
+    ),
+    "PASS",
+  );
+  assert.equal(
+    acceptanceVerdict([passedMode("enabled"), passedMode("disabled")], baseline, true, true, false),
+    "FAIL",
+  );
+});
+
 test("output truncation is explicit and bounded", () => {
   assert.deepEqual(truncateOutput("short", 5), { text: "short", truncated: false });
   const truncated = truncateOutput("0123456789", 4);
@@ -183,6 +242,24 @@ test("Markdown report is explicit about model-free scope and verdict", () => {
     scope: "model-free only",
     host: { platform: "darwin" },
     commands: {},
+    hostBaseline: {
+      version: {
+        command: "Chromium --version",
+        exitCode: 0,
+        stdout: "Chromium 152",
+        stderr: "",
+        outputTruncated: false,
+      },
+      result: {
+        command: "Chromium",
+        exitCode: 0,
+        stdout: "<html></html>",
+        stderr: "",
+        outputTruncated: false,
+      },
+      gate: { name: "host-baseline-launch", passed: true, verdict: "diagnostic only" },
+      method: "direct host launch",
+    },
     modes: [
       {
         mode: "enabled",
@@ -197,4 +274,6 @@ test("Markdown report is explicit about model-free scope and verdict", () => {
   assert.match(markdown, /Verdict: \*\*PASS\*\*/);
   assert.match(markdown, /model-free only/);
   assert.match(markdown, /launch: PASS/);
+  assert.match(markdown, /host baseline \(diagnostic only\)/);
+  assert.match(markdown, /does not affect the enabled\/disabled sandbox gate verdict/);
 });
