@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 
@@ -10,6 +11,10 @@ import {
   classifyBrowser,
   classifyHostBaseline,
   classifyResourceProbe,
+  captureGeneratedProfile,
+  isChromiumLaunchCommand,
+  chromiumLaunchArgs,
+  extractInlineSandboxProfile,
   ownedChromiumPids,
   reportAsMarkdown,
   truncateOutput,
@@ -20,6 +25,20 @@ test("acceptance host guard requires bare Darwin", () => {
   assert.throws(() => assertSafeHost("linux", undefined), /requires macOS/);
   assert.throws(() => assertSafeHost("darwin", "1"), /SANDBOX_RUNTIME must be unset/);
   assert.throws(() => assertSafeHost("darwin", ""), /SANDBOX_RUNTIME must be unset/);
+});
+
+test("Chromium observer matches only the raw or runtime-prefixed launch command", () => {
+  const launch = "'/Applications/Chromium.app/Contents/MacOS/Chromium' --headless";
+  const runtimePrefix = "unset GIT_SSH_COMMAND; ";
+
+  assert.equal(isChromiumLaunchCommand(launch, launch), true);
+  assert.equal(isChromiumLaunchCommand(`${runtimePrefix}${launch}`, launch), true);
+  assert.equal(
+    isChromiumLaunchCommand(`${runtimePrefix}'/Applications/Chromium' --version`, launch),
+    false,
+  );
+  assert.equal(isChromiumLaunchCommand(`${runtimePrefix}node -e 'resource probe'`, launch), false);
+  assert.equal(isChromiumLaunchCommand(`${runtimePrefix}echo unrelated`, launch), false);
 });
 
 test("resource verdicts accept enabled operations and only explicit disabled denials", () => {
@@ -158,6 +177,89 @@ test("browser verdict requires live enabled markers and attributed disabled deni
   );
 });
 
+test("host baseline attributes timeouts and errors while preserving observed markers", () => {
+  const timedOut = classifyHostBaseline({
+    command: "Chromium",
+    exitCode: null,
+    stdout: "<html><body></body></html>",
+    stderr: "DevTools listening on ws://127.0.0.1:1234/devtools/browser/id",
+    outputTruncated: false,
+    timedOut: true,
+  });
+  assert.equal(timedOut.passed, false);
+  assert.match(timedOut.verdict, /timed out/);
+  assert.match(timedOut.verdict, /DevTools observed; DOM observed/);
+
+  const error = classifyHostBaseline({
+    command: "Chromium",
+    exitCode: null,
+    stdout: "",
+    stderr: "spawn failed",
+    outputTruncated: false,
+    error: "spawn failed",
+  });
+  assert.equal(error.passed, false);
+  assert.match(error.verdict, /execution error/);
+  assert.match(error.verdict, /DevTools missing; DOM missing/);
+});
+
+test("generated SBPL capture handles shell apostrophe quoting and omits wrapper secrets", () => {
+  const profile = `(version 1)\n(deny default)\n; fixture user's path\n`;
+  const quoted = profile.replaceAll("'", "'\"'\"'");
+  const wrapper = `HTTP_PROXY=http://srt:proxy-secret@127.0.0.1:9000 /usr/bin/sandbox-exec -p '${quoted}' /bin/bash -c 'private-wrapper'`;
+  assert.equal(extractInlineSandboxProfile(wrapper), profile);
+  const capture = captureGeneratedProfile(wrapper, "enabled", (command) => command);
+  assert.equal(capture.content, profile);
+  assert.equal(capture.sha256, createHash("sha256").update(profile).digest("hex"));
+  assert.doesNotMatch(JSON.stringify(capture), /proxy-secret|private-wrapper|HTTP_PROXY/);
+});
+
+test("generated SBPL capture fails closed on truncated or malformed shell tokens", () => {
+  assert.throws(
+    () => extractInlineSandboxProfile("/usr/bin/sandbox-exec -p '(version 1)\n(deny default)"),
+    /truncated or malformed/,
+  );
+  assert.throws(
+    () => extractInlineSandboxProfile("/usr/bin/sandbox-exec -p (version 1)"),
+    /single-quoted shell token/,
+  );
+  assert.throws(
+    () =>
+      extractInlineSandboxProfile(
+        "/usr/bin/sandbox-exec -p '(version 1)\n(deny default)' /usr/bin/sandbox-exec -p '(version 1)\n(deny default)'",
+      ),
+    /exactly one/,
+  );
+});
+
+test("profile derivation applies adapter augmentation only for enabled Chromium", () => {
+  const base = "/usr/bin/sandbox-exec -p '(version 1)\n(deny default)' /bin/bash";
+  const calls: boolean[] = [];
+  const augment = (wrapper: string, allow: boolean) => {
+    calls.push(allow);
+    return allow
+      ? wrapper.replace("(deny default)", "(deny default)\n; adapter Chromium grants")
+      : wrapper;
+  };
+  const enabled = captureGeneratedProfile(base, "enabled", augment);
+  const disabled = captureGeneratedProfile(base, "disabled", augment);
+  assert.deepEqual(calls, [true, false]);
+  assert.match(enabled.content, /adapter Chromium grants/);
+  assert.doesNotMatch(disabled.content, /adapter Chromium grants/);
+  assert.notEqual(enabled.sha256, disabled.sha256);
+});
+
+test("all Chromium launch modes include test-only mock keychain isolation", () => {
+  for (const modeArgs of [
+    chromiumLaunchArgs("/fixture/enabled"),
+    chromiumLaunchArgs("/fixture/disabled"),
+    chromiumLaunchArgs("/fixture/host"),
+  ]) {
+    assert.ok(modeArgs.includes("--use-mock-keychain"));
+    assert.ok(!modeArgs.includes("--no-sandbox"));
+  }
+});
+
 test("host baseline is diagnostic and cannot mask sandbox acceptance failures", () => {
   const baselineResult = {
     command: "Chromium",
@@ -183,13 +285,29 @@ test("host baseline is diagnostic and cannot mask sandbox acceptance failures", 
   const passedMode = (mode: "enabled" | "disabled") => ({
     mode,
     probes: [],
-    gates: [{ name: "sandbox", passed: true, verdict: "passed" }],
+    gates: [
+      { name: "sandbox", passed: true, verdict: "passed" },
+      { name: "generated-profile-capture", passed: true, verdict: "captured" },
+    ],
+    generatedSeatbeltProfile: {
+      content: "(version 1)\n",
+      sha256: createHash("sha256").update("(version 1)\n").digest("hex"),
+      captureMethod: "unit test",
+    },
     lifecycle: { initialize: "passed", reset: "passed" },
   });
   const failedMode = {
     ...passedMode("enabled"),
     gates: [{ name: "sandbox", passed: false, verdict: "failed" }],
   };
+  const missingProfileMode = {
+    ...passedMode("enabled"),
+    generatedSeatbeltProfile: undefined,
+  };
+  assert.equal(
+    acceptanceVerdict([missingProfileMode, passedMode("disabled")], baseline, false, true, false),
+    "FAIL",
+  );
   assert.equal(
     acceptanceVerdict([failedMode, passedMode("disabled")], baseline, false, true, false),
     "FAIL",

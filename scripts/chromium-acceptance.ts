@@ -7,7 +7,7 @@ import type { BashOperations } from "@earendil-works/pi-coding-agent";
  * Optional: --chromium /path/to/Chromium --report tmp/<new-report>.json
  */
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   accessSync,
   constants as fsConstants,
@@ -46,6 +46,7 @@ type WorkerResult = {
   probes: ExecResult[];
   gates: Gate[];
   lifecycle: { initialize: string; reset: string };
+  generatedSeatbeltProfile?: { content: string; sha256: string; captureMethod: string };
   failure?: string;
 };
 type HostBaseline = {
@@ -71,6 +72,10 @@ type AcceptanceReport = {
 const CAPTURE_LIMIT = 12_000;
 const WORKER_TIMEOUT_MS = 90_000;
 const RESULT_PREFIX = "PI_CHROMIUM_ACCEPTANCE_RESULT:";
+
+export function isChromiumLaunchCommand(command: string, launchCommand: string): boolean {
+  return command === launchCommand || command === `unset GIT_SSH_COMMAND; ${launchCommand}`;
+}
 
 export function assertSafeHost(
   platform: NodeJS.Platform,
@@ -116,13 +121,22 @@ export function classifyResourceProbe(
 }
 
 export function classifyHostBaseline(result: ExecResult): Gate {
-  const classified = classifyBrowser("enabled", result);
+  const output = `${result.stdout}\n${result.stderr}`;
+  const devtools = /DevTools listening on ws:\/\/127\.0\.0\.1:/i.test(output);
+  const dom = /<html[\s>]/i.test(result.stdout) && /<\/html>/i.test(result.stdout);
+  const markers = `DevTools ${devtools ? "observed" : "missing"}; DOM ${dom ? "observed" : "missing"}`;
+  const passed = !result.timedOut && !result.error && result.exitCode === 0 && devtools && dom;
+  const outcome = result.timedOut
+    ? "timed out"
+    : result.error
+      ? "execution error"
+      : `exit ${String(result.exitCode)}`;
   return {
     name: "host-baseline-launch",
-    passed: classified.passed,
-    verdict: classified.passed
-      ? "diagnostic direct-host Chromium launch observed DevTools and DOM"
-      : "diagnostic direct-host Chromium launch did not produce DevTools and DOM",
+    passed,
+    verdict: passed
+      ? "diagnostic direct-host Chromium launch exited successfully; DevTools and DOM observed"
+      : `diagnostic direct-host Chromium launch ${outcome}; ${markers}`,
   };
 }
 
@@ -135,9 +149,19 @@ export function acceptanceVerdict(
 ): "PASS" | "FAIL" {
   // The host baseline is diagnostic only; it cannot override sandbox worker gates.
   const gates = modes.flatMap((mode) => mode.gates);
+  const profilesValid = modes.every((mode) => {
+    const profile = mode.generatedSeatbeltProfile;
+    return (
+      Boolean(profile) &&
+      /^[a-f0-9]{64}$/.test(profile!.sha256) &&
+      createHash("sha256").update(profile!.content).digest("hex") === profile!.sha256 &&
+      mode.gates.some((gate) => gate.name === "generated-profile-capture" && gate.passed)
+    );
+  });
   return !fatalFailure &&
     !cleanupFailed &&
     modes.length === 2 &&
+    profilesValid &&
     fixtureRemoved &&
     gates.length > 0 &&
     gates.every((gate) => gate.passed)
@@ -221,6 +245,7 @@ export function reportAsMarkdown(report: AcceptanceReport): string {
     `| host baseline (diagnostic only) | ${state(report.hostBaseline.gate.passed)} (${report.hostBaseline.gate.verdict}) |`,
     "",
     "Host baseline does not affect the enabled/disabled sandbox gate verdict.",
+    "Generated profiles below are inline SBPL only; the enabled/disabled profiles are derived from the actual SandboxManager wrapper using the adapter's profile augmentation, not intercepted at the sandbox-exec process boundary.",
     "",
     "```json",
     JSON.stringify(report, null, 2),
@@ -326,10 +351,58 @@ function buildResourceCommand(name: string, path: string): string {
   return `${quoteShell(process.execPath)} -e ${quoteShell(buildResourceProbeSource(name, path))}`;
 }
 
-function chromiumLaunchArgs(profile: string): string[] {
+export function extractInlineSandboxProfile(wrappedCommand: string): string {
+  const marker = "/usr/bin/sandbox-exec -p ";
+  const markerIndex = wrappedCommand.indexOf(marker);
+  if (markerIndex < 0 || wrappedCommand.indexOf(marker, markerIndex + marker.length) >= 0)
+    throw new Error("Expected exactly one inline sandbox-exec profile token.");
+  const start = markerIndex + marker.length;
+  if (wrappedCommand[start] !== "'")
+    throw new Error("Sandbox profile is not a single-quoted shell token.");
+
+  let content = "";
+  for (let index = start + 1; index < wrappedCommand.length; index += 1) {
+    if (wrappedCommand.startsWith("'\"'\"'", index)) {
+      content += "'";
+      index += 4;
+    } else if (wrappedCommand.startsWith("'\\''", index)) {
+      content += "'";
+      index += 3;
+    } else if (wrappedCommand[index] === "'") {
+      if (!/^\(version [0-9]+\)\n/.test(content))
+        throw new Error("Inline sandbox profile has an invalid SBPL header.");
+      if (content.length > 1_000_000)
+        throw new Error("Inline sandbox profile token exceeds the capture limit.");
+      return content;
+    } else {
+      content += wrappedCommand[index];
+      if (content.length > 1_000_000)
+        throw new Error("Inline sandbox profile token exceeds the capture limit.");
+    }
+  }
+  throw new Error("Inline sandbox profile shell token is truncated or malformed.");
+}
+
+export function captureGeneratedProfile(
+  wrappedCommand: string,
+  mode: Mode,
+  augment: (command: string, allowBrowserProcess: boolean) => string,
+): { content: string; sha256: string; captureMethod: string } {
+  const effectiveWrapper = augment(wrappedCommand, mode === "enabled");
+  const content = extractInlineSandboxProfile(effectiveWrapper);
+  return {
+    content,
+    sha256: createHash("sha256").update(content).digest("hex"),
+    captureMethod:
+      "inline SBPL from real SandboxManager.wrapWithSandbox return; derived through adapter augmentMacosBrowserProfile before command execution",
+  };
+}
+
+export function chromiumLaunchArgs(profile: string): string[] {
   return [
     "--headless=new",
     "--disable-gpu",
+    "--use-mock-keychain",
     "--no-first-run",
     "--no-default-browser-check",
     `--user-data-dir=${profile}`,
@@ -453,7 +526,8 @@ async function runWorker(
   tempPaths: Record<string, string>,
 ): Promise<WorkerResult> {
   const { SandboxManager } = await import("@carderne/sandbox-runtime");
-  const { initializeSandbox, createSandboxedBashOps } = await import("../src/sandbox-runtime.ts");
+  const { augmentMacosBrowserProfile, initializeSandbox, createSandboxedBashOps } =
+    await import("../src/sandbox-runtime.ts");
   const dir = join(fixture, mode);
   const profile = join(dir, "profile");
   const controller = new AbortController();
@@ -481,6 +555,7 @@ async function runWorker(
     gates: [],
     lifecycle: { initialize: "not started", reset: "not run" },
   };
+  let profileCaptureError: string | undefined;
   try {
     await initializeSandbox(config, allowances, dir);
     result.lifecycle.initialize = "passed";
@@ -504,9 +579,30 @@ async function runWorker(
     });
 
     const launchCommand = chromiumLaunchCommand(chromium, profile);
-    result.browser = await runSandboxCommand(ops, launchCommand, dir, env, 30, controller.signal);
+    const originalWrap = SandboxManager.wrapWithSandbox;
+    let profileCaptureSeen = false;
+    SandboxManager.wrapWithSandbox = async function (command, ...args) {
+      const wrapped = await originalWrap.call(SandboxManager, command, ...args);
+      if (!profileCaptureSeen && isChromiumLaunchCommand(command, launchCommand)) {
+        profileCaptureSeen = true;
+        try {
+          result.generatedSeatbeltProfile = captureGeneratedProfile(
+            wrapped,
+            mode,
+            augmentMacosBrowserProfile,
+          );
+        } catch {
+          profileCaptureError = "inline generated SBPL capture or parsing failed";
+        }
+      }
+      return wrapped;
+    };
+    try {
+      result.browser = await runSandboxCommand(ops, launchCommand, dir, env, 30, controller.signal);
+    } finally {
+      SandboxManager.wrapWithSandbox = originalWrap;
+    }
     result.gates.push(classifyBrowser(mode, result.browser));
-
     for (const [name, path] of Object.entries(tempPaths)) {
       const command = buildResourceCommand(name, path);
       const probe = await runSandboxCommand(ops, command, dir, env, 10, controller.signal);
@@ -521,6 +617,16 @@ async function runWorker(
       verdict: "actual sandbox runtime initialization or execution failed",
     });
   } finally {
+    if (!result.gates.some((gate) => gate.name === "generated-profile-capture")) {
+      const captured = result.generatedSeatbeltProfile;
+      result.gates.push({
+        name: "generated-profile-capture",
+        passed: Boolean(captured),
+        verdict: captured
+          ? `captured inline SBPL (${captured.sha256})`
+          : (profileCaptureError ?? "actual Chromium wrapper profile was not observed"),
+      });
+    }
     try {
       await SandboxManager.reset();
       result.lifecycle.reset = "passed";
@@ -588,6 +694,12 @@ function isWorkerResult(value: unknown): value is WorkerResult {
         typeof gate.passed === "boolean" &&
         typeof gate.verdict === "string",
     ) &&
+    (!result.generatedSeatbeltProfile ||
+      (typeof result.generatedSeatbeltProfile.content === "string" &&
+        typeof result.generatedSeatbeltProfile.sha256 === "string" &&
+        typeof result.generatedSeatbeltProfile.captureMethod === "string" &&
+        createHash("sha256").update(result.generatedSeatbeltProfile.content).digest("hex") ===
+          result.generatedSeatbeltProfile.sha256)) &&
     Boolean(result.lifecycle) &&
     typeof result.lifecycle?.initialize === "string" &&
     typeof result.lifecycle?.reset === "string"
