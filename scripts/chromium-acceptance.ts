@@ -39,10 +39,19 @@ type ExecResult = {
   error?: string;
 };
 type Gate = { name: string; passed: boolean; verdict: string };
+type NestedProbeClassification =
+  | "init-succeeded"
+  | "init-refused-EPERM"
+  | "init-failed"
+  | "execution-failed"
+  | "timeout"
+  | "diagnostic-unavailable"
+  | "not-run";
 type WorkerResult = {
   mode: Mode;
   chromiumVersion?: ExecResult;
   browser?: ExecResult;
+  nestedSandboxProbe?: { result: ExecResult; classification: NestedProbeClassification };
   probes: ExecResult[];
   gates: Gate[];
   lifecycle: { initialize: string; reset: string };
@@ -55,6 +64,17 @@ type HostBaseline = {
   gate: Gate;
   method: string;
 };
+type NestedSandboxDiagnostic = {
+  compiler: string;
+  compileCommand: string;
+  profile: string;
+  api: string;
+  compilation: ExecResult;
+  compilationClassification: "compiled" | "diagnostic-unavailable" | "timeout";
+  host: { result?: ExecResult; classification: NestedProbeClassification };
+  modes: Partial<Record<Mode, { result?: ExecResult; classification: NestedProbeClassification }>>;
+  interpretation: string;
+};
 type AcceptanceReport = {
   schema: 1;
   startedAt: string;
@@ -63,6 +83,7 @@ type AcceptanceReport = {
   scope: string;
   host: Record<string, unknown>;
   commands: Record<string, string>;
+  nestedSandboxDiagnostic: NestedSandboxDiagnostic;
   modes: WorkerResult[];
   hostBaseline: HostBaseline;
   cleanup: Record<string, unknown>;
@@ -138,6 +159,47 @@ export function classifyHostBaseline(result: ExecResult): Gate {
       ? "diagnostic direct-host Chromium launch exited successfully; DevTools and DOM observed"
       : `diagnostic direct-host Chromium launch ${outcome}; ${markers}`,
   };
+}
+
+export function classifyProbeCompilation(
+  result: Pick<ExecResult, "exitCode" | "timedOut" | "error">,
+): NestedSandboxDiagnostic["compilationClassification"] {
+  if (result.timedOut) return "timeout";
+  if (result.error || result.exitCode !== 0) return "diagnostic-unavailable";
+  return "compiled";
+}
+
+export function validateNestedSandboxProbeExecutable(
+  fixture: string,
+  executable: string,
+): string | undefined {
+  try {
+    const expectedPath = join(realpathSync(fixture), "sandbox_init_probe");
+    if (executable !== expectedPath)
+      return `compiled probe path ${executable} is not the owned fixture path ${expectedPath}`;
+    const metadata = lstatSync(executable);
+    if (metadata.isSymbolicLink()) return `compiled probe ${executable} is a symbolic link`;
+    if (!metadata.isFile()) return `compiled probe ${executable} is not a regular file`;
+    const resolvedPath = realpathSync(executable);
+    if (resolvedPath !== expectedPath)
+      return `compiled probe resolves to ${resolvedPath}, not the owned fixture path ${expectedPath}`;
+    accessSync(executable, fsConstants.X_OK);
+    return undefined;
+  } catch (error) {
+    return `compiled probe validation failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+export function classifyNestedSandboxProbe(
+  result: Pick<ExecResult, "exitCode" | "stdout" | "stderr" | "timedOut" | "error">,
+): NestedProbeClassification {
+  if (result.timedOut) return "timeout";
+  if (result.error) return "execution-failed";
+  const output = `${result.stdout}\n${result.stderr}`;
+  const marker = output.match(/sandbox-init-result:return=(-?\d+);errno=(\d+);error=/);
+  if (result.exitCode === 0 && !output.trim()) return "init-succeeded";
+  if (!marker || result.exitCode !== 86 || marker[1] !== "-1") return "execution-failed";
+  return marker[2] === "1" ? "init-refused-EPERM" : "init-failed";
 }
 
 export function acceptanceVerdict(
@@ -244,7 +306,8 @@ export function reportAsMarkdown(report: AcceptanceReport): string {
     ...rows,
     `| host baseline (diagnostic only) | ${state(report.hostBaseline.gate.passed)} (${report.hostBaseline.gate.verdict}) |`,
     "",
-    "Host baseline does not affect the enabled/disabled sandbox gate verdict.",
+    "Host baseline and the nested sandbox_init diagnostic do not affect the enabled/disabled sandbox gate verdict.",
+    "The fixture-only nested sandbox_init probe is compiled on the guarded normal host with the system SDK/compiler, run directly once and through each real sandbox worker, and reported separately. Host success plus worker EPERM is a possible explanation for Chromium sandbox_init failures, not proof of Chromium's cause; unavailable, execution-failed, and timeout results remain inconclusive.",
     "Generated profiles below are inline SBPL only; the enabled/disabled profiles are derived from the actual SandboxManager wrapper using the adapter's profile augmentation, not intercepted at the sandbox-exec process boundary.",
     "",
     "```json",
@@ -416,6 +479,23 @@ function chromiumLaunchCommand(chromium: string, profile: string): string {
   return [chromium, ...chromiumLaunchArgs(profile)].map(quoteShell).join(" ");
 }
 
+const SANDBOX_INIT_PROBE_SOURCE = `#include <errno.h>
+#include <sandbox.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+  char *errorbuf = NULL;
+  int result = sandbox_init(kSBXProfilePureComputation, SANDBOX_NAMED, &errorbuf);
+  if (result == 0) _exit(0);
+  int saved_errno = errno;
+  (void)dprintf(STDERR_FILENO, "sandbox-init-result:return=%d;errno=%d;error=%s\\n",
+                result, saved_errno, errorbuf ? errorbuf : "(null)");
+  sandbox_free_error(errorbuf);
+  _exit(86);
+}
+`;
+
 function runHostCommand(
   command: string,
   args: string[],
@@ -460,6 +540,67 @@ function runHostCommand(
       });
     });
   });
+}
+
+async function compileNestedSandboxProbe(
+  fixture: string,
+  env: NodeJS.ProcessEnv,
+): Promise<{ diagnostic: NestedSandboxDiagnostic; executable?: string }> {
+  const sourcePath = join(fixture, "sandbox_init_probe.c");
+  const executable = join(realpathSync(fixture), "sandbox_init_probe");
+  const compiler = "/usr/bin/clang";
+  const args = ["-Wno-deprecated-declarations", sourcePath, "-o", executable, "-lsandbox"];
+  const compileCommand = [compiler, ...args].map(quoteShell).join(" ");
+  let compilation: ExecResult;
+  try {
+    writeFileSync(sourcePath, SANDBOX_INIT_PROBE_SOURCE, { encoding: "utf8", mode: 0o600 });
+    compilation = await runHostCommand(compiler, args, fixture, env, 15_000);
+  } catch (error) {
+    compilation = {
+      command: compileCommand,
+      exitCode: null,
+      stdout: "",
+      stderr: "",
+      outputTruncated: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+  let compilationClassification = classifyProbeCompilation(compilation);
+  if (compilationClassification === "compiled") {
+    const validationError = validateNestedSandboxProbeExecutable(fixture, executable);
+    if (validationError) {
+      compilation = { ...compilation, error: validationError };
+      compilationClassification = "diagnostic-unavailable";
+    }
+  }
+  const diagnostic: NestedSandboxDiagnostic = {
+    compiler,
+    compileCommand,
+    profile: "kSBXProfilePureComputation (SANDBOX_NAMED)",
+    api: "sandbox_init(kSBXProfilePureComputation, SANDBOX_NAMED, &errorbuf)",
+    compilation,
+    compilationClassification,
+    host: {
+      classification:
+        compilationClassification === "compiled" ? "not-run" : "diagnostic-unavailable",
+    },
+    modes: {
+      enabled: {
+        classification:
+          compilationClassification === "compiled" ? "not-run" : "diagnostic-unavailable",
+      },
+      disabled: {
+        classification:
+          compilationClassification === "compiled" ? "not-run" : "diagnostic-unavailable",
+      },
+    },
+    interpretation:
+      "Diagnostic only: host initialization followed by worker EPERM is evidence that this worker context refuses nested sandbox_init and a possible explanation for a Chromium sandbox_init failure, not proof of Chromium's cause. Compile, execution, and timeout failures are inconclusive.",
+  };
+  if (compilationClassification !== "compiled") return { diagnostic };
+  const result = await runHostCommand(executable, [], fixture, env, 10_000);
+  diagnostic.host = { result, classification: classifyNestedSandboxProbe(result) };
+  return { diagnostic, executable };
 }
 
 async function runHostBaseline(
@@ -524,6 +665,7 @@ async function runWorker(
   chromium: string,
   chromiumReadPath: string,
   tempPaths: Record<string, string>,
+  nestedProbePath?: string,
 ): Promise<WorkerResult> {
   const { SandboxManager } = await import("@carderne/sandbox-runtime");
   const { augmentMacosBrowserProfile, initializeSandbox, createSandboxedBashOps } =
@@ -542,7 +684,11 @@ async function runWorker(
     allowPty: false,
     network: { allowedDomains: [], deniedDomains: [], allowUnauthenticatedSocksProxy: false },
     filesystem: {
-      allowRead: [chromiumReadPath, dirname(process.execPath)],
+      allowRead: [
+        chromiumReadPath,
+        dirname(process.execPath),
+        ...(nestedProbePath ? [nestedProbePath] : []),
+      ],
       allowWrite: [dir],
       denyRead: ["/Users", "/home"],
       denyWrite: [],
@@ -609,6 +755,20 @@ async function runWorker(
       result.probes.push(probe);
       result.gates.push(classifyResourceProbe(mode, name, probe));
     }
+    if (nestedProbePath) {
+      const probe = await runSandboxCommand(
+        ops,
+        quoteShell(nestedProbePath),
+        dir,
+        env,
+        10,
+        controller.signal,
+      );
+      result.nestedSandboxProbe = {
+        result: probe,
+        classification: classifyNestedSandboxProbe(probe),
+      };
+    }
   } catch (error) {
     result.failure = error instanceof Error ? error.message : String(error);
     result.gates.push({
@@ -645,7 +805,8 @@ async function runWorker(
 }
 
 function workerMain(argv: string[]): void {
-  const [, , , modeValue, fixture, chromium, chromiumReadPath, userTemp, token] = argv;
+  const [, , , modeValue, fixture, chromium, chromiumReadPath, userTemp, token, nestedProbeArg] =
+    argv;
   if (
     (modeValue !== "enabled" && modeValue !== "disabled") ||
     !fixture ||
@@ -657,6 +818,17 @@ function workerMain(argv: string[]): void {
     throw new Error("Invalid internal worker invocation.");
   }
   const mode = modeValue as Mode;
+  const nestedProbePath = nestedProbeArg || undefined;
+  if (
+    nestedProbePath &&
+    (nestedProbePath !== join(realpathSync(fixture), "sandbox_init_probe") ||
+      realpathSync(nestedProbePath) !== nestedProbePath ||
+      !lstatSync(nestedProbePath).isFile() ||
+      lstatSync(nestedProbePath).isSymbolicLink())
+  ) {
+    throw new Error("Nested sandbox probe path is not the owned fixture executable.");
+  }
+  if (nestedProbePath) accessSync(nestedProbePath, fsConstants.X_OK);
   const tempPaths = {
     "darwin-temp-file": join(userTemp, `pichr-${token}-${mode}-file`),
     "loopback-bind": "unused",
@@ -664,7 +836,7 @@ function workerMain(argv: string[]): void {
   };
   if (Buffer.byteLength(tempPaths["darwin-temp-unix-socket"]) >= 100)
     throw new Error("Canonical Darwin temp path is too long for AF_UNIX acceptance probe.");
-  void runWorker(mode, fixture, chromium, chromiumReadPath, tempPaths).then(
+  void runWorker(mode, fixture, chromium, chromiumReadPath, tempPaths, nestedProbePath).then(
     (result) => console.log(`${RESULT_PREFIX}${JSON.stringify(result)}`),
     (error) =>
       console.log(
@@ -686,6 +858,21 @@ function isWorkerResult(value: unknown): value is WorkerResult {
         typeof probe.outputTruncated === "boolean" &&
         (probe.exitCode === null || typeof probe.exitCode === "number"),
     ) &&
+    (!result.nestedSandboxProbe ||
+      (typeof result.nestedSandboxProbe.classification === "string" &&
+        [
+          "init-succeeded",
+          "init-refused-EPERM",
+          "init-failed",
+          "execution-failed",
+          "timeout",
+          "diagnostic-unavailable",
+          "not-run",
+        ].includes(result.nestedSandboxProbe.classification) &&
+        typeof result.nestedSandboxProbe.result.command === "string" &&
+        typeof result.nestedSandboxProbe.result.outputTruncated === "boolean" &&
+        (result.nestedSandboxProbe.result.exitCode === null ||
+          typeof result.nestedSandboxProbe.result.exitCode === "number"))) &&
     Array.isArray(result.gates) &&
     result.gates.every(
       (gate) =>
@@ -714,6 +901,7 @@ function runWorkerProcess(
   userTemp: string,
   token: string,
   env: NodeJS.ProcessEnv,
+  nestedProbePath?: string,
 ): Promise<{ result: WorkerResult; timedOut: boolean; processOutput: string }> {
   const scriptPath = fileURLToPath(import.meta.url);
   const child = spawn(
@@ -729,6 +917,7 @@ function runWorkerProcess(
       chromiumReadPath,
       userTemp,
       token,
+      nestedProbePath ?? "",
     ],
     {
       cwd: resolve(dirname(fileURLToPath(import.meta.url)), ".."),
@@ -1096,6 +1285,8 @@ async function acceptanceMain(): Promise<number> {
     resourceProbes:
       "Darwin user-temp file; ephemeral loopback bind; scoped Darwin user-temp AF_UNIX bind",
     hostTempLookup: "/usr/bin/getconf DARWIN_USER_TEMP_DIR",
+    nestedSandboxProbe:
+      "/usr/bin/clang fixed fixture-only C probe linked with -lsandbox; calls sandbox_init(kSBXProfilePureComputation, SANDBOX_NAMED, &errorbuf)",
   };
   let env: NodeJS.ProcessEnv = {};
   let userTemp = "";
@@ -1128,6 +1319,38 @@ async function acceptanceMain(): Promise<number> {
     enabled: join(fixture, "enabled"),
     disabled: join(fixture, "disabled"),
   };
+  const nestedProbeSource = join(fixture, "sandbox_init_probe.c");
+  const nestedProbeExecutable = join(fixture, "sandbox_init_probe");
+  const initialCompileCommand = [
+    "/usr/bin/clang",
+    "-Wno-deprecated-declarations",
+    nestedProbeSource,
+    "-o",
+    nestedProbeExecutable,
+    "-lsandbox",
+  ]
+    .map(quoteShell)
+    .join(" ");
+  let nestedSandboxDiagnostic: NestedSandboxDiagnostic = {
+    compiler: "/usr/bin/clang",
+    compileCommand: initialCompileCommand,
+    profile: "kSBXProfilePureComputation (SANDBOX_NAMED)",
+    api: "sandbox_init(kSBXProfilePureComputation, SANDBOX_NAMED, &errorbuf)",
+    compilation: {
+      command: initialCompileCommand,
+      exitCode: null,
+      stdout: "",
+      stderr: "not run",
+      outputTruncated: false,
+      error: "diagnostic compilation was not run",
+    },
+    compilationClassification: "diagnostic-unavailable",
+    host: { classification: "not-run" },
+    modes: { enabled: { classification: "not-run" }, disabled: { classification: "not-run" } },
+    interpretation:
+      "Diagnostic only: host initialization followed by worker EPERM is evidence that this worker context refuses nested sandbox_init and a possible explanation for a Chromium sandbox_init failure, not proof of Chromium's cause. Compile, execution, and timeout failures are inconclusive.",
+  };
+  let compiledNestedProbePath: string | undefined;
   try {
     for (const mode of ["enabled", "disabled"] as const) {
       mkdirSync(join(modeDirs[mode], "home"), { recursive: true, mode: 0o700 });
@@ -1153,6 +1376,13 @@ async function acceptanceMain(): Promise<number> {
       join(baselineDir, "pi-agent"),
       userTemp,
     );
+    const compiledProbe = await compileNestedSandboxProbe(fixture, baselineEnv);
+    nestedSandboxDiagnostic = compiledProbe.diagnostic;
+    compiledNestedProbePath = compiledProbe.executable;
+    if (nestedSandboxDiagnostic.compilationClassification !== "compiled")
+      warnings.push(
+        `Nested sandbox_init diagnostic unavailable: ${nestedSandboxDiagnostic.compilationClassification}; ${nestedSandboxDiagnostic.compilation.error ?? nestedSandboxDiagnostic.compilation.stderr}`,
+      );
     for (const mode of ["enabled", "disabled"] as const) {
       if (requestedSignal) throw new Error(`Interrupted by ${requestedSignal}.`);
       const modeEnv = sanitizedEnvironment(
@@ -1169,8 +1399,20 @@ async function acceptanceMain(): Promise<number> {
         userTemp,
         token,
         modeEnv,
+        compiledNestedProbePath,
       );
       const modeResult = workerRun.result;
+      nestedSandboxDiagnostic.modes[mode] = modeResult.nestedSandboxProbe
+        ? {
+            result: modeResult.nestedSandboxProbe.result,
+            classification: modeResult.nestedSandboxProbe.classification,
+          }
+        : {
+            classification:
+              nestedSandboxDiagnostic.compilationClassification === "compiled"
+                ? "not-run"
+                : "diagnostic-unavailable",
+          };
       if (workerRun.timedOut)
         warnings.push(
           `${mode} worker exceeded ${WORKER_TIMEOUT_MS}ms; lifecycle cleanup is unverified.`,
@@ -1351,6 +1593,7 @@ async function acceptanceMain(): Promise<number> {
       "Model-free, real sandbox-runtime initialize/reset and BashOperations Chromium/resource acceptance only; not full extension UI, interactive prompt, or model acceptance.",
     host: hostReport,
     commands: reportCommands,
+    nestedSandboxDiagnostic,
     modes,
     hostBaseline,
     cleanup,

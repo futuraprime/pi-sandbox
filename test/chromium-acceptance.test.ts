@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 
@@ -10,7 +13,10 @@ import {
   buildResourceProbeSource,
   classifyBrowser,
   classifyHostBaseline,
+  classifyNestedSandboxProbe,
+  classifyProbeCompilation,
   classifyResourceProbe,
+  validateNestedSandboxProbeExecutable,
   captureGeneratedProfile,
   isChromiumLaunchCommand,
   chromiumLaunchArgs,
@@ -174,6 +180,118 @@ test("browser verdict requires live enabled markers and attributed disabled deni
       timedOut: true,
     }).passed,
     false,
+  );
+});
+
+test("nested probe executable validation requires the owned regular executable file", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "pi-nested-probe-test-"));
+  const canonicalFixture = realpathSync(fixture);
+  const executable = join(canonicalFixture, "sandbox_init_probe");
+  try {
+    writeFileSync(executable, "probe", { mode: 0o700 });
+    assert.equal(validateNestedSandboxProbeExecutable(fixture, executable), undefined);
+
+    const target = join(fixture, "other-probe");
+    writeFileSync(target, "probe", { mode: 0o700 });
+    rmSync(executable);
+    symlinkSync(target, executable);
+    assert.match(validateNestedSandboxProbeExecutable(fixture, executable)!, /symbolic link/);
+
+    rmSync(executable);
+    writeFileSync(executable, "probe", { mode: 0o600 });
+    assert.match(validateNestedSandboxProbeExecutable(fixture, executable)!, /validation failed/);
+    assert.match(
+      validateNestedSandboxProbeExecutable(fixture, target)!,
+      /not the owned fixture path/,
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("nested sandbox_init diagnostic separates initialization refusal from unavailable execution", () => {
+  assert.equal(
+    classifyNestedSandboxProbe({ exitCode: 0, stdout: "", stderr: "" }),
+    "init-succeeded",
+  );
+  assert.equal(
+    classifyNestedSandboxProbe({
+      exitCode: 86,
+      stdout: "",
+      stderr: "sandbox-init-result:return=-1;errno=1;error=Operation not permitted",
+    }),
+    "init-refused-EPERM",
+  );
+  assert.equal(
+    classifyNestedSandboxProbe({
+      exitCode: 126,
+      stdout: "",
+      stderr: "Operation not permitted",
+    }),
+    "execution-failed",
+  );
+  assert.equal(
+    classifyNestedSandboxProbe({
+      exitCode: null,
+      stdout: "",
+      stderr: "timeout",
+      timedOut: true,
+    }),
+    "timeout",
+  );
+  assert.equal(
+    classifyProbeCompilation({ exitCode: null, error: "spawn /usr/bin/clang ENOENT" }),
+    "diagnostic-unavailable",
+  );
+  assert.equal(classifyProbeCompilation({ exitCode: null, timedOut: true }), "timeout");
+
+  const content = "(version 1)\\n";
+  const mode = {
+    mode: "enabled" as const,
+    probes: [],
+    nestedSandboxProbe: {
+      result: {
+        command: "sandbox-init-probe",
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        outputTruncated: false,
+      },
+      classification: "init-succeeded" as const,
+    },
+    gates: [
+      { name: "chromium-launch", passed: false, verdict: "browser failed" },
+      { name: "generated-profile-capture", passed: true, verdict: "captured" },
+    ],
+    generatedSeatbeltProfile: {
+      content,
+      sha256: createHash("sha256").update(content).digest("hex"),
+      captureMethod: "unit test",
+    },
+    lifecycle: { initialize: "passed", reset: "passed" },
+  };
+  const disabled = { ...mode, mode: "disabled" as const };
+  const failedHost = classifyHostBaseline({
+    command: "Chromium",
+    exitCode: 1,
+    stdout: "",
+    stderr: "failed",
+    outputTruncated: false,
+  });
+  assert.equal(
+    acceptanceVerdict(
+      [mode, disabled],
+      {
+        version: mode.nestedSandboxProbe.result,
+        result: mode.nestedSandboxProbe.result,
+        gate: failedHost,
+        method: "test",
+      },
+      false,
+      true,
+      false,
+    ),
+    "FAIL",
   );
 });
 
@@ -360,6 +478,23 @@ test("Markdown report is explicit about model-free scope and verdict", () => {
     scope: "model-free only",
     host: { platform: "darwin" },
     commands: {},
+    nestedSandboxDiagnostic: {
+      compiler: "/usr/bin/clang",
+      compileCommand: "clang probe.c -lsandbox",
+      profile: "kSBXProfilePureComputation (SANDBOX_NAMED)",
+      api: "sandbox_init(...) ",
+      compilation: {
+        command: "clang probe.c -lsandbox",
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        outputTruncated: false,
+      },
+      compilationClassification: "compiled",
+      host: { classification: "init-succeeded" },
+      modes: {},
+      interpretation: "diagnostic only",
+    },
     hostBaseline: {
       version: {
         command: "Chromium --version",
@@ -393,5 +528,5 @@ test("Markdown report is explicit about model-free scope and verdict", () => {
   assert.match(markdown, /model-free only/);
   assert.match(markdown, /launch: PASS/);
   assert.match(markdown, /host baseline \(diagnostic only\)/);
-  assert.match(markdown, /does not affect the enabled\/disabled sandbox gate verdict/);
+  assert.match(markdown, /do not affect the enabled\/disabled sandbox gate verdict/);
 });
