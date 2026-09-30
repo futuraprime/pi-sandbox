@@ -1,6 +1,6 @@
 # Proposal: Integrate upstream 0.6.6 without losing downstream policy
 
-- **Status:** In progress — slices 1–9.5 and the Slice 10a audit are complete; the private-fork ownership/release decision has been applied. O-01 is implemented. The approved Slice 10b cleanup unit retains C-13 write-implies-effective-read behavior and removes the rejected O-06 shortcut while retaining explicit sandbox commands. Local verification passed on rerun (full suite 165 passed, 0 failed/skipped/todo; check, lint, format, and diff check passed). Remaining work includes the upstream-update rehearsal, frozen-install/CI verification, and fresh bare-macOS release acceptance.
+- **Status:** In progress — slices 1–9.5 and the Slice 10a audit are complete; the private-fork ownership/release decision has been applied. O-01 is implemented. The approved Slice 10b cleanup unit retains C-13 write-implies-effective-read behavior and removes the rejected O-06 shortcut while retaining explicit sandbox commands. Local verification passed on rerun (full suite 165 passed, 0 failed/skipped/todo; check, lint, format, and diff check passed). The upstream-update rehearsal is complete ([record](../integration/upstream-0.6.6-update-rehearsal.md)); frozen-install/CI verification and fresh bare-macOS release acceptance remain open.
 - **Date:** 2026-09-03
 - **Updated:** 2026-09-30
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)

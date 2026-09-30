@@ -1,7 +1,7 @@
 # Upstream 0.6.6 integration feature ledger and test map
 
 - **Proposal:** [`proposal-integrate-upstream-0.6.6.md`](../proposals/proposal-integrate-upstream-0.6.6.md)
-- **Slice:** 1 — feature ledger and test map (updated through Slice 9.5)
+- **Slice:** 1 — feature ledger and test map (updated through the Slice 10 upstream-update rehearsal)
 - **Slice 8 checkpoint:** [credential masking](upstream-0.6.6-slice-8-checkpoint.md)
 - **Slice 9a checkpoint:** [permission-prompt/UI contracts](upstream-0.6.6-slice-9a-checkpoint.md)
 - **Slice 9b checkpoint:** [lifecycle recovery](upstream-0.6.6-slice-9b-checkpoint.md)
@@ -10,7 +10,7 @@
 - **Slice 6c assessment:** [sandbox-runtime 0.0.70/0.0.72 assessment](upstream-0.6.6-slice-6c-assessment.md)
 - **Slice 6d acceptance:** [macOS runtime acceptance](upstream-0.6.6-slice-6d-acceptance.md)
 - **Current runtime verdict:** Slice 8 closure complete; exact 0.0.72 approved with the bounded Chromium adapter and a validated global-only credential seam that rejects environment JWT decode; Slices 9a/9b prompt/lifecycle and 9.5 Git-specific SSH acceptance are complete
-- **Status (updated 2026-09-30):** parity map updated through Slice 9.5; the Slice 10a audit is complete ([findings](upstream-0.6.6-slice-10a-audit.md)). The private-fork package/author/URL/no-publish decisions and current-behavior README corrections are applied; the root `sandbox.json` remains an intentionally broad development fixture, not a recommended policy. O-01 is implemented with focused contracts. This Slice 10b cleanup unit formally retains C-13's write-implies-effective-read behavior and removes the rejected O-06 shortcut while preserving explicit enable/disable commands. Local verification passed on rerun: full suite 165 passed, 0 failed/skipped/todo; check, lint, formatting, and diff checks passed. The upstream-update rehearsal, frozen-install/CI verification, and fresh bare-macOS release acceptance remain pending. O-03 is complete; project credential composition and Linux file masking remain explicitly deferred/rejected.
+- **Status (updated 2026-09-30):** parity map updated through Slice 9.5; the Slice 10a audit is complete ([findings](upstream-0.6.6-slice-10a-audit.md)). The private-fork package/author/URL/no-publish decisions and current-behavior README corrections are applied; the root `sandbox.json` remains an intentionally broad development fixture, not a recommended policy. O-01 is implemented with focused contracts. This Slice 10b cleanup unit formally retains C-13's write-implies-effective-read behavior and removes the rejected O-06 shortcut while preserving explicit enable/disable commands. Local verification passed on rerun: full suite 165 passed, 0 failed/skipped/todo; check, lint, formatting, and diff checks passed. The upstream-update rehearsal is complete ([record](upstream-0.6.6-update-rehearsal.md)); frozen-install/CI verification and fresh bare-macOS release acceptance remain pending. O-03 is complete; project credential composition and Linux file masking remain explicitly deferred/rejected.
 
 This ledger is the parity checklist for the later upstream-first migration. It records the intended behaviour at the integration boundary, rather than treating an entire file or upstream commit as authoritative. Existing coverage is marked separately from required coverage so that passing upstream tests cannot be mistaken for downstream parity.
 
