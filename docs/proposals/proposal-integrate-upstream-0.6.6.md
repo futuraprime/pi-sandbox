@@ -363,6 +363,8 @@ O-03 is resolved against adopting upstream's generic ordinary-SSH proxy. The dow
 
 **Pre-Slice-10 review:** [upstream 0.6.6 integration review](../reviews/upstream-0.6.6-integration-review.md) confirms upstream and downstream features are correctly combined through Slice 9, records the clean typecheck/lint/format state and 157 pass / 2 environment-only fail / 1 deferred-todo test result, and lists the Slice 10 caveats (sandbox-nested test skips, adapter fragility, mocked platform evidence, stale docs). Slice 9.5 was added after that review to resolve the generic-SSH mismatch before final reconciliation.
 
+**Conformance and security review (2026-09-30):** [conformance and sandbox security review](../reviews/upstream-0.6.6-conformance-security-review.md) finds the branch substantially conforms, but records preflight/runtime glob mismatches and three critical sandbox holes (writable Git hooks/config and `.pi` extensions, a case-variant config-protection bypass, and unchecked non-core tools) that should be resolved before release.
+
 ### Slice 10: Parity, cleanup, and update rehearsal
 
 Slice 10 is divided into a read-only reconciliation audit and separately approved reconciliation work. Package identity and publishing ownership have since been resolved for this private fork; that narrow decision does not approve the remaining 10b behavior changes.
