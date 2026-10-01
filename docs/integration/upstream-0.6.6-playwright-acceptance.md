@@ -26,6 +26,26 @@ At 22:14 local (21:14:53 UTC) on 2026-09-30, this passed **1 file / 5 tests in 2
 
 Storybook's attempt to create `/Users/ehensleigh/.storybook` for its global settings failed with `EPERM`, but the tests passed. No home-directory write grant was added; this nonfatal denial is retained rather than treated as a reason to expand access. The completion marker does not by itself establish which network requests were made or that an external-domain denial gate was tested.
 
+## Additional user-run full-suite and downstream comparison
+
+- **Integration full suite:** At 22:52:39 local on 2026-09-30, the user ran `!pnpm exec vitest run` in Pi. Vitest reported **81 files / 281 tests passed** in **11.29s**, but also **17 unhandled `Failed to fetch` errors** and exit 1. The affected stories call `cp.fetchSection`; the default `RelatedArticles` request is `https://cp-bridge.api.economistdatateam.com/v1/section/graphic-detail/6`. This is not a clean full-suite pass. The user separately reported that the full suite passes in a normal terminal, but did not provide its full output.
+- **Integration network check:** After requesting a session grant for that exact hostname, the selected `RelatedArticles` run at 22:55:39 local on 2026-09-30 reported **3 assertions passed**, **3 fetch errors**, exit 1, in **2.16s**. The grant notice itself was not pasted. Pi subsequently ran the following exact-endpoint check and received HTTP 200:
+
+  ```sh
+  !curl --max-time 15 --silent --show-error --output /dev/null --write-out 'HTTP %{http_code}\n' https://cp-bridge.api.economistdatateam.com/v1/section/graphic-detail/6
+  ```
+
+  This supports authorized runtime-proxy transport reachability to the endpoint; it does **not** show that Chromium used that proxy or explain all fetch errors.
+- **Downstream comparison:** The user then switched Pi to the explicit extension `/Users/Shared/projects/pi-sandbox/index.ts`. The initial downstream attempt at 21:02:31 local on 2026-10-01 was blocked reading `icudtl.dat` and ran no tests; the earlier integration session grant had expired. The legacy `/sandbox` read allowance for `/Users/ehensleigh/Library/Caches/ms-playwright/chromium_headless_shell-1217` persisted in the project directly (it was not an offered scope); the user confirmed keeping this path read-only for the workflow and confirmed the API hostname was allowed downstream. The matched downstream `RelatedArticles` run at 21:06:27 took **2.10s**, with **3 assertions passed**, the same **3 fetch errors**, and exit 1.
+
+  This matched result does not demonstrate an integration-specific network regression; it indicates the same fetch limitation was present downstream in this comparison. The assistant observed the downstream main checkout ref `757f0586fc7d9877a37901e6976830672bc93ed8` via `git worktree list` before testing, but it was not pinned as per-run provenance. Complete effective configurations were not captured, so this is contextual same-user evidence, not exact reproducibility across all versions or configurations.
+
+Earlier Playwright debug output showed default Chromium arguments including `--no-sandbox` and no explicit proxy flag. Together with curl's HTTP 200, this is consistent with—but does not prove—the hypothesis that the browser is not using the runtime HTTP proxy. It does not establish the cause of every fetch failure. Storybook's `~/.storybook` settings write still failed nonfatally with `EPERM`; no home-directory write grant was added.
+
+## Separate follow-up: browser-proxy support — not implemented
+
+Automatic browser-proxy support is a separate security-reviewed follow-up, not part of this acceptance evidence or an approved production change. Any review must retain hostname allow/deny and authentication policy at the runtime, avoid weakening outer filesystem or network controls, avoid automatic `--no-sandbox` injection or running browsers outside the wrapper, and preserve existing project test configuration. It must examine coverage of Vitest/Playwright launches versus arbitrary browser execution, opt-in and fail-closed behavior, and keeping credentials in memory without leaking them to stdout or artifacts. Proposed evidence should include successful requests to a granted API domain, denials for unapproved and explicitly denied hosts, and working local test servers, plus the unchanged full-suite command passing inside Pi. No implementation approach or transparent-browser behavior is established here; production changes require separate approval.
+
 ## Remaining scope
 
-The focused unit/browser and Storybook results establish that these selected real Playwright tests run successfully inside the integration's outer sandbox with the narrow session read grant and Playwright's existing browser flags. They do not establish full-suite compatibility, snapshot testing, general Chromium isolation acceptance, or closure of the separate failed nested-sandbox gate.
+The focused unit/browser and Storybook tests passed, but the Pi integration full suite exited 1 with unhandled fetch errors, and the separate Chromium harness still fails. The matched downstream fetch errors do not waive either failure or automatically satisfy formal merge-gate criteria. These results do not establish full-suite compatibility in Pi, general Chromium isolation acceptance, or closure of the nested-sandbox gate.
