@@ -20,6 +20,7 @@ import assert from "node:assert/strict";
 import { DEFAULT_CONFIG, type SandboxConfig } from "../src/config.ts";
 import { renderDiagnosticBlockData, type SandboxDiagnosticBlockData } from "../src/diagnostics.ts";
 import extension from "../src/extension.ts";
+import { getVolumeCaseSensitivity } from "../src/path-security.ts";
 import {
   gitUpstreamMutationCommands,
   nonGitUpstreamMutationCommands,
@@ -1610,6 +1611,77 @@ test("mandatory Git and project paths cannot be explicitly allowed for direct wr
     rmSync(fixture.secondRepository, { recursive: true, force: true });
   }
 });
+
+test(
+  "case-variant missing project/global config and .pi writes block before approval on macOS",
+  {
+    skip:
+      process.platform !== "darwin"
+        ? "requires macOS"
+        : getVolumeCaseSensitivity(process.cwd()) === "sensitive"
+          ? "workspace volume is detected as case-sensitive"
+          : false,
+  },
+  async () => {
+    const root = makeProjectTempDirectory("case-variant-protected-write");
+    const agentDir = join(root, "global-agent");
+    mkdirSync(agentDir);
+    const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    let initializeCount = 0;
+    let resetCount = 0;
+    let promptCount = 0;
+    const initializeMock = mock.method(SandboxManager, "initialize", async () => {
+      initializeCount += 1;
+    });
+    const resetMock = mock.method(SandboxManager, "reset", async () => {
+      resetCount += 1;
+    });
+
+    try {
+      const { pi, handlers } = makePi();
+      const config = {
+        ...makePromptTestConfig(),
+        enabled: true,
+        filesystem: { ...makePromptTestConfig().filesystem!, allowWrite: [root] },
+      };
+      extension(pi, { configLoader: () => config });
+      const ctx = makeContext(root, []);
+      (ctx.ui as any).custom = async () => {
+        promptCount += 1;
+        throw new Error("protected writes must not prompt");
+      };
+      await handlers.get("session_start")?.({}, ctx);
+      const beforeAttempts = { initializeCount, resetCount };
+      const protectedTargets = [
+        join(root, ".PI", "Sandbox.json"),
+        join(root, ".PI", "extensions", "unsafe.ts"),
+        join(root, "GLOBAL-AGENT", "Sandbox.json"),
+        join(root, "nested", ".PI", "extensions", "unsafe.ts"),
+      ];
+
+      for (const path of protectedTargets) {
+        for (const toolName of ["write", "edit"]) {
+          const blocked = await handlers.get("tool_call")?.({ toolName, input: { path } }, ctx);
+          assert.equal(blocked?.block, true, `${toolName}: ${path}`);
+          assert.match(blocked?.reason ?? "", /protected|mandatory protection/i);
+        }
+      }
+
+      assert.equal(promptCount, 0);
+      assert.deepEqual({ initializeCount, resetCount }, beforeAttempts);
+      assert.equal(existsSync(join(root, ".pi")), false);
+      assert.equal(existsSync(join(root, "nested", ".pi")), false);
+      assert.equal(existsSync(join(agentDir, "sandbox.json")), false);
+    } finally {
+      initializeMock.mock.restore();
+      resetMock.mock.restore();
+      if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("/sandbox-allow cannot disable protected config checks with a broad edited write allowance", async () => {
   const root = makeProjectTempDirectory("broad-write-config-protection");

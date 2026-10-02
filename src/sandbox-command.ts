@@ -2,6 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { getConfigPaths, readConfigFile } from "./config.ts";
+import { pathsEqualConsideringVolumeCase } from "./path-security.ts";
 import { canonicalizePath, canonicalizePathPattern } from "./policy.ts";
 
 export type SandboxAllowKind = "domain" | "read" | "write";
@@ -187,8 +188,10 @@ export function getProtectedSandboxConfigPaths(cwd: string): {
 
 export function isSandboxConfigPath(filePath: string, cwd: string): boolean {
   const protectedPaths = getProtectedSandboxConfigPaths(cwd);
-  const canonical = canonicalizePath(filePath, cwd);
-  return canonical === protectedPaths.projectPath || canonical === protectedPaths.globalPath;
+  return (
+    pathsEqualConsideringVolumeCase(filePath, protectedPaths.projectPath, cwd) ||
+    pathsEqualConsideringVolumeCase(filePath, protectedPaths.globalPath, cwd)
+  );
 }
 
 /**

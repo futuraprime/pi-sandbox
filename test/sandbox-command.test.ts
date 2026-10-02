@@ -1,11 +1,19 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
 import assert from "node:assert/strict";
 
 import {
+  getVolumeCaseSensitivity,
+  traversesProtectedProjectPiDirectory,
+  traversesProtectedProjectPiDirectoryWithProbe,
+  pathsEqualConsideringVolumeCaseWithProbe,
+} from "../src/path-security.ts";
+import {
   formatSandboxAllowUsage,
+  isSandboxConfigPath,
   parseSandboxAllowCommand,
   updateSandboxConfigFile,
 } from "../src/sandbox-command.ts";
@@ -49,6 +57,113 @@ test("parseSandboxAllowCommand accepts only concrete domain, read, and write tar
     );
     assert.throws(() => parseSandboxAllowCommand("read", root), /Usage:/);
     assert.ok(formatSandboxAllowUsage().includes("domain|read|write <target>"));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("sandbox config protection follows volume case behavior for missing and aliased paths", () => {
+  const root = makeProjectTempDirectory("case-aware-config");
+  const agentDir = join(root, "global-agent");
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  mkdirSync(agentDir);
+  const sensitivity = getVolumeCaseSensitivity(root);
+  const expectedVariantMatch = sensitivity !== "sensitive";
+  const linkedProject = join(root, "linked-project");
+  const externalDirectory = join(root, "external-project-files");
+  mkdirSync(linkedProject);
+  mkdirSync(externalDirectory);
+  symlinkSync(externalDirectory, join(linkedProject, ".pi"));
+
+  try {
+    assert.equal(
+      traversesProtectedProjectPiDirectory(
+        join(linkedProject, ".pi", "extensions", "unsafe.ts"),
+        linkedProject,
+      ),
+      true,
+    );
+    assert.equal(
+      traversesProtectedProjectPiDirectory(join(root, ".PI", "extensions", "unsafe.ts"), root),
+      expectedVariantMatch,
+      `volume sensitivity: ${sensitivity}`,
+    );
+    assert.equal(
+      isSandboxConfigPath(join(root, ".PI", "Sandbox.json"), root),
+      expectedVariantMatch,
+      `volume sensitivity: ${sensitivity}`,
+    );
+    assert.equal(
+      isSandboxConfigPath(join(agentDir, "Sandbox.json"), root),
+      expectedVariantMatch,
+      `volume sensitivity: ${sensitivity}`,
+    );
+
+    mkdirSync(join(root, ".pi", "nested"), { recursive: true });
+    symlinkSync(join(root, ".pi"), join(root, "project-config-link"));
+    symlinkSync(join(root, ".pi", "nested"), join(root, "project-dot-link"));
+    assert.equal(
+      isSandboxConfigPath(join(root, "project-config-link", "SANDBOX.JSON"), root),
+      expectedVariantMatch,
+      `volume sensitivity: ${sensitivity}`,
+    );
+    assert.equal(
+      isSandboxConfigPath(`${join(root, "project-dot-link")}/../Sandbox.json`, root),
+      expectedVariantMatch,
+      `volume sensitivity: ${sensitivity}`,
+    );
+    assert.equal(
+      isSandboxConfigPath(join(root, "missing", "..", ".PI", "Sandbox.json"), root),
+      expectedVariantMatch,
+      `volume sensitivity: ${sensitivity}`,
+    );
+
+    const homeAgentDir = join(homedir(), ".pi", "agent");
+    process.env.PI_CODING_AGENT_DIR = homeAgentDir;
+    const homeSensitivity = getVolumeCaseSensitivity(homeAgentDir);
+    const expectedHomeVariantMatch = homeSensitivity !== "sensitive";
+    assert.equal(isSandboxConfigPath("~/.pi/agent/Sandbox.json", root), expectedHomeVariantMatch);
+    assert.equal(
+      isSandboxConfigPath(join(homeAgentDir, "Sandbox.json"), root),
+      expectedHomeVariantMatch,
+    );
+  } finally {
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("unknown volume case behavior fails closed for case-equivalent protected paths", () => {
+  const root = makeProjectTempDirectory("unknown-case-config");
+  const unknownFileSystem = {
+    readdir: () => {
+      throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+    },
+    realpath: (path: string) => path,
+    stat: () => {
+      throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+    },
+  };
+  try {
+    assert.equal(getVolumeCaseSensitivity(root, unknownFileSystem), "unknown");
+    assert.equal(
+      pathsEqualConsideringVolumeCaseWithProbe(
+        join(root, ".PI", "Sandbox.json"),
+        join(root, ".pi", "sandbox.json"),
+        unknownFileSystem,
+      ),
+      true,
+    );
+    assert.equal(
+      traversesProtectedProjectPiDirectoryWithProbe(
+        join(root, ".PI", "extensions", "unsafe.ts"),
+        root,
+        unknownFileSystem,
+      ),
+      true,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

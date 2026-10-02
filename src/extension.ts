@@ -1262,7 +1262,14 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     }
 
     if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
-      const path = canonicalizePath((event.input as { path: string }).path, ctx.cwd);
+      const inputPath = (event.input as { path: string }).path;
+      const path = canonicalizePath(inputPath, ctx.cwd);
+      if (isMandatoryWritePath(inputPath, ctx.cwd)) {
+        return {
+          block: true,
+          reason: `Sandbox: write access denied for "${path}" (mandatory protection; cannot be granted).`,
+        };
+      }
       const writePermission = await resolveWritePermission({
         path,
         allowWrite: effectiveWritePaths(ctx.cwd),
@@ -1273,13 +1280,11 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         saveWritePermission: (choice, value) => applyChoice(choice, "write", value, ctx.cwd),
       });
       if (writePermission.action === "deny") {
-        const mandatory = isMandatoryWritePath(path, ctx.cwd);
         return {
           block: true,
-          reason: mandatory
-            ? `Sandbox: write access denied for "${path}" (mandatory protection; cannot be granted).`
-            : `Sandbox: write access denied for "${path}" (in denyWrite). ` +
-              `To change this, edit denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
+          reason:
+            `Sandbox: write access denied for "${path}" (in denyWrite). ` +
+            `To change this, edit denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
         };
       }
       if (writePermission.action === "blocked") {

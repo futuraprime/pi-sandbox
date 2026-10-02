@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 import { resolveLinkedGitWorktree } from "./git-worktree.ts";
+import { traversesProtectedProjectPiDirectory } from "./path-security.ts";
 import { matchesPattern } from "./policy.ts";
 
 /** Keep derived access separate from configured and session-approved access. */
@@ -158,7 +159,10 @@ export function getMandatoryWriteDenyPaths(cwd: string): string[] {
 }
 
 export function isMandatoryWritePath(path: string, cwd = process.cwd()): boolean {
-  return matchesPattern(path, getMandatoryWriteDenyPaths(cwd), cwd);
+  return (
+    matchesPattern(path, getMandatoryWriteDenyPaths(cwd), cwd) ||
+    traversesProtectedProjectPiDirectory(path, cwd, cwd)
+  );
 }
 
 /**
