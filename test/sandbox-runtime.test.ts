@@ -282,18 +282,56 @@ test("buildRuntimeConfig resolves relative glob rules against the project cwd", 
     cwd,
   );
 
-  const derived = resolveDerivedFilesystemAllowances(cwd).linkedGitMetadata;
+  const derived = resolveDerivedFilesystemAllowances(cwd);
   assert.deepEqual(runtime.filesystem?.allowRead, [
     join(cwd, "packages", "*"),
-    ...derived,
+    ...derived.linkedGitMetadataRead,
+    ...derived.linkedGitMetadataWrite,
     join(cwd, "output", "*"),
   ]);
   assert.deepEqual(runtime.filesystem?.denyRead, [join(cwd, "private", "*")]);
-  assert.deepEqual(runtime.filesystem?.allowWrite, [join(cwd, "output", "*"), ...derived]);
+  assert.deepEqual(runtime.filesystem?.allowWrite, [
+    join(cwd, "output", "*"),
+    ...derived.linkedGitMetadataWrite,
+  ]);
   assert.deepEqual(runtime.filesystem?.denyWrite?.slice(0, 1), [join(cwd, "output", "*.key")]);
   const protectedPaths = getProtectedSandboxConfigPaths(cwd);
   assert.equal(runtime.filesystem?.denyWrite?.includes(protectedPaths.projectPath), true);
   assert.equal(runtime.filesystem?.denyWrite?.includes(protectedPaths.globalPath), true);
+});
+
+test("buildRuntimeConfig emits mandatory write denies ahead of configured write grants", (t) => {
+  const cwd = mkdtempSync(join(process.cwd(), ".pi-sandbox-mandatory-write-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  execFileSync("git", ["-C", cwd, "init", "-q"]);
+  const protectedPaths = [
+    join(cwd, ".git", "config"),
+    join(cwd, ".git", "hooks"),
+    join(cwd, ".gitmodules"),
+    join(cwd, ".pi"),
+    join(cwd, ".envrc"),
+    join(cwd, ".vscode"),
+    join(cwd, ".idea"),
+  ];
+  const runtime = buildRuntimeConfig(
+    {
+      ...DEFAULT_CONFIG,
+      filesystem: {
+        ...DEFAULT_CONFIG.filesystem!,
+        allowWrite: [cwd, ...protectedPaths],
+        denyWrite: [],
+      },
+    },
+    undefined,
+    process.platform,
+    cwd,
+  );
+
+  for (const path of protectedPaths) {
+    assert.equal(runtime.filesystem?.denyWrite?.includes(path), true, path);
+  }
+  assert.equal(runtime.filesystem?.allowWrite?.includes(cwd), true);
+  assert.equal(runtime.filesystem?.allowWrite?.includes(join(cwd, ".pi")), true);
 });
 
 test("runtime network callback applies shared specificity without deny-first short-circuiting", async () => {

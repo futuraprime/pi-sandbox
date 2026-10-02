@@ -10,7 +10,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test, { mock } from "node:test";
 
@@ -1423,28 +1423,42 @@ test("replaces linked-worktree runtime allowances from the active cwd", async ()
     await handlers.get("session_start")?.({}, ctx);
     const firstConfig = initialised[0] as any;
     assert.equal(firstConfig.filesystem.allowRead.includes(fixture.firstCommonDir), true);
-    assert.equal(firstConfig.filesystem.allowWrite.includes(fixture.firstCommonDir), true);
-    assert.equal(firstConfig.filesystem.allowRead.includes(fixture.secondCommonDir), false);
+    assert.equal(firstConfig.filesystem.allowWrite.includes(fixture.firstCommonDir), false);
+    assert.equal(
+      firstConfig.filesystem.allowWrite.includes(join(fixture.firstCommonDir, "objects")),
+      true,
+    );
+    assert.equal(
+      firstConfig.filesystem.allowWrite.includes(join(fixture.firstCommonDir, "hooks")),
+      false,
+    );
     assert.equal(firstConfig.filesystem.allowWrite.includes(fixture.secondCommonDir), false);
+    assert.equal(firstConfig.filesystem.allowRead.includes(fixture.secondCommonDir), false);
 
     ctx.cwd = fixture.second;
     await handlers.get("session_start")?.({}, ctx);
     const secondConfig = initialised[1] as any;
     assert.equal(secondConfig.filesystem.allowRead.includes(fixture.secondCommonDir), true);
-    assert.equal(secondConfig.filesystem.allowWrite.includes(fixture.secondCommonDir), true);
+    assert.equal(secondConfig.filesystem.allowWrite.includes(fixture.secondCommonDir), false);
+    assert.equal(
+      secondConfig.filesystem.allowWrite.includes(join(fixture.secondCommonDir, "refs")),
+      true,
+    );
+    assert.equal(
+      secondConfig.filesystem.allowWrite.includes(join(fixture.secondCommonDir, "config")),
+      false,
+    );
     assert.equal(secondConfig.filesystem.allowRead.includes(fixture.firstCommonDir), false);
     assert.equal(secondConfig.filesystem.allowWrite.includes(fixture.firstCommonDir), false);
     assert.equal(resets.length, 1);
 
     await commands.get("sandbox")?.("", ctx);
-    assert.match(
-      notices.at(-1) ?? "",
-      new RegExp(`Linked Git metadata: ${fixture.secondCommonDir}`),
-    );
+    assert.match(notices.at(-1) ?? "", /Linked Git metadata writes:/);
+    assert.ok((notices.at(-1) ?? "").includes(join(fixture.secondCommonDir, "objects")));
 
-    // A broader deny still permits the more-specific derived common Git path,
-    // while checked-out files in the original and sibling worktrees remain
-    // outside the derived allowance.
+    // A broader deny still permits the more-specific derived metadata write
+    // paths, while common metadata outside those paths and checked-out files
+    // remain outside the derived write allowance.
     mkdirSync(join(fixture.second, ".pi"));
     writeFileSync(
       join(fixture.second, ".pi", "sandbox.json"),
@@ -1472,6 +1486,7 @@ test("replaces linked-worktree runtime allowances from the active cwd", async ()
     }
 
     const commonMetadataPath = join(fixture.secondCommonDir, "HEAD");
+    const allowedMetadataWritePath = join(fixture.secondCommonDir, "objects", "policy-test-object");
     const commonRead = await handlers.get("tool_call")?.(
       { toolName: "read", input: { path: commonMetadataPath } },
       ctx,
@@ -1485,8 +1500,24 @@ test("replaces linked-worktree runtime allowances from the active cwd", async ()
       ctx,
     );
     assert.equal(commonRead, undefined);
-    assert.equal(commonWrite, undefined);
-    assert.equal(commonEdit, undefined);
+    assert.equal(commonWrite?.block, true);
+    assert.equal(commonEdit?.block, true);
+    assert.match(commonWrite?.reason ?? "", /denyWrite/);
+    assert.match(commonEdit?.reason ?? "", /denyWrite/);
+    assert.equal(
+      await handlers.get("tool_call")?.(
+        { toolName: "write", input: { path: allowedMetadataWritePath } },
+        ctx,
+      ),
+      undefined,
+    );
+    assert.equal(
+      await handlers.get("tool_call")?.(
+        { toolName: "edit", input: { path: allowedMetadataWritePath } },
+        ctx,
+      ),
+      undefined,
+    );
 
     // Equal-specificity explicit denies retain precedence over the derived
     // allowance for both direct read and write/edit hooks.
@@ -1519,6 +1550,61 @@ test("replaces linked-worktree runtime allowances from the active cwd", async ()
     assert.match(deniedCommonEdit?.reason ?? "", /denyWrite/);
   } finally {
     managerMock.mock.restore();
+    resetMock.mock.restore();
+    rmSync(fixture.firstRepository, { recursive: true, force: true });
+    rmSync(fixture.secondRepository, { recursive: true, force: true });
+  }
+});
+
+test("mandatory Git and project paths cannot be explicitly allowed for direct write or edit", async () => {
+  const fixture = makeLinkedWorktreeFixture();
+  const worktreeGitDir = realpathSync(
+    join(fixture.secondCommonDir, "worktrees", basename(fixture.second)),
+  );
+  const protectedTargets = [
+    join(fixture.second, ".git"),
+    join(fixture.secondCommonDir, "config"),
+    join(fixture.secondCommonDir, "hooks", "pre-commit"),
+    join(worktreeGitDir, "config.worktree"),
+    join(worktreeGitDir, "gitdir"),
+    join(fixture.second, ".gitmodules"),
+    join(fixture.second, ".pi", "extensions", "unsafe.ts"),
+    join(fixture.second, ".pi", "cache", "unsafe"),
+    join(fixture.second, ".envrc"),
+    join(fixture.second, ".vscode", "settings.json"),
+    join(fixture.second, ".idea", "workspace.xml"),
+    join(fixture.second, "nested", "repo", ".git", "config"),
+    join(fixture.second, "nested", "repo", ".git", "hooks", "pre-commit"),
+    join(fixture.second, "nested", "repo", ".gitmodules"),
+    join(fixture.second, "nested", ".pi", "extensions", "unsafe.ts"),
+    join(homedir(), ".gitconfig"),
+    join(homedir(), ".config", "git", "config"),
+  ];
+  const config = {
+    ...makePromptTestConfig(),
+    filesystem: {
+      ...makePromptTestConfig().filesystem!,
+      allowWrite: [fixture.second, ...protectedTargets],
+    },
+  };
+  const initializeMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+
+  try {
+    const { pi, handlers } = makePi();
+    extension(pi, { configLoader: () => config });
+    const ctx = makeContext(fixture.second, []);
+    await handlers.get("session_start")?.({}, ctx);
+
+    for (const path of protectedTargets) {
+      for (const toolName of ["write", "edit"]) {
+        const blocked = await handlers.get("tool_call")?.({ toolName, input: { path } }, ctx);
+        assert.equal(blocked?.block, true, `${toolName}: ${path}`);
+        assert.match(blocked?.reason ?? "", /mandatory protection; cannot be granted/i);
+      }
+    }
+  } finally {
+    initializeMock.mock.restore();
     resetMock.mock.restore();
     rmSync(fixture.firstRepository, { recursive: true, force: true });
     rmSync(fixture.secondRepository, { recursive: true, force: true });

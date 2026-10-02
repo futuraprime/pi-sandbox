@@ -478,7 +478,7 @@ export function formatSandboxConfiguration(
     `  Allow Read:  ${config.filesystem?.allowRead?.join(", ") || "(none)"}`,
     `  Allow Write: ${config.filesystem?.allowWrite?.join(", ") || "(none)"}`,
     `  Deny Write:  ${config.filesystem?.denyWrite?.join(", ") || "(none)"}`,
-    `  Linked Git metadata: ${linkedGitMetadata.join(", ") || "(none)"}`,
+    `  Linked Git metadata writes: ${linkedGitMetadata.join(", ") || "(none)"}`,
     ...(allowances.readPaths.length ? [`  Session read:  ${allowances.readPaths.join(", ")}`] : []),
     ...(allowances.writePaths.length
       ? [`  Session write: ${allowances.writePaths.join(", ")}`]
@@ -488,5 +488,6 @@ export function formatSandboxConfiguration(
     "Note: allowWrite also grants read access to the same path.",
     "Note: denyRead is a hard-block unless a more-specific allowRead rule matches.",
     "Note: denyWrite is a hard-block unless a more-specific allowWrite rule matches.",
+    "Note: mandatory Git/config and project integration-path protections cannot be granted.",
   ].join("\n");
 }

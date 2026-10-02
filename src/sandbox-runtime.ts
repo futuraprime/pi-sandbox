@@ -15,7 +15,7 @@ import { type SandboxConfig, validateCredentials } from "./config.ts";
 import { usesGitSshTransport } from "./diagnostics.ts";
 import { canonicalizePath, canonicalizePathPattern, decideDomainPolicy } from "./policy.ts";
 import { getProtectedSandboxConfigPaths } from "./sandbox-command.ts";
-import { getEffectiveFilesystemPolicy } from "./sandbox-filesystem.ts";
+import { getEffectiveFilesystemPolicy, getMandatoryWriteDenyPaths } from "./sandbox-filesystem.ts";
 
 export interface SessionAllowances {
   domains: string[];
@@ -225,6 +225,7 @@ export function buildRuntimeConfig(
       denyWrite: canonicalizeFilesystemPatterns(
         [
           ...(config.filesystem?.denyWrite ?? []),
+          ...getMandatoryWriteDenyPaths(cwd),
           protectedConfigPaths.projectPath,
           protectedConfigPaths.globalPath,
         ],

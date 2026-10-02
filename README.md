@@ -153,6 +153,17 @@ the same paths. This is the accepted C-13 contract shared by direct tools and
 Bash runtime policy; read and write denies and their existing specificity
 precedence remain unchanged.
 
+Mandatory writes are denied before allow-rule precedence for direct `write`/
+`edit` calls and in the OS runtime. This protects Git configuration and standard
+hooks (including linked-worktree pointer/config files), `.gitmodules`, `.pi/**`
+(with no cache exception), `.envrc`, `.vscode/**`, and `.idea/**`. Linked
+worktrees receive derived write access only to shared Git objects, refs, logs,
+packed-refs locks, and the active worktree's operational metadata; their common
+Git directory remains readable. Arbitrary `core.hooksPath` destinations are not
+automatically protected. The pinned Linux runtime ignores `denyWrite` globs, so
+nested protected paths that are not represented by a concrete runtime path are
+not covered there; macOS Seatbelt enforces the nested-path patterns.
+
 `allowedDomains` supports `*.example.com` and `"*"`; `"*"` removes per-domain
 prompts and triggers a warning. Filesystem allow rules may cover a directory,
 so `allowWrite: ["."]` grants writes throughout the project (subject to

@@ -12,6 +12,13 @@ Live observations were made in a session running the *installed* pi-sandbox (its
 
 The branch substantially implements the proposal, but it should not be treated as release-ready. Three findings (S-1 to S-3) allow code execution outside the sandbox, or bypass of the policy, without any user prompt.
 
+### Remediation status
+
+- **S-1 — addressed for the agreed macOS scope.** Shared mandatory write protections now block direct `write`/`edit` and sandboxed Bash writes to standard Git hooks/configuration, linked-worktree pointer/configuration files, `.gitmodules`, `.pi/**` (no cache exceptions), `.envrc`, `.vscode/**`, and `.idea/**`, even with explicit write grants. Derived linked-worktree writes are narrowed to shared objects, refs, logs, packed-refs/locks, and the active worktree's operational metadata; the common Git directory remains readable.
+- **Verification:** user-run `pnpm run all` passed formatting, lint, TypeScript, and all **186 tests**. Real macOS Seatbelt regression tests verified protected-write denials, including nested paths and explicit grants, and successful linked-worktree Git status/add/commit/branch operations. The initial OS test exposed a trailing-glob normalization gap; the mandatory patterns were corrected and the rerun passed.
+- **Remaining S-1 limits:** the pinned Linux runtime ignores write-deny globs, so nested paths without concrete runtime denies remain unprotected there. Arbitrary `core.hooksPath` destinations are not automatically protected. This is not a cross-platform or all-configurations closeout of S-1.
+- **S-2 and S-3 remain open.** The original findings below describe the reviewed baseline; the S-1 remediation changes are currently uncommitted.
+
 ## 1. Proposal conformance
 
 ### Conforming

@@ -12,6 +12,7 @@ import {
   canonicalizePath,
   decideDomainPolicy,
   decidePathPolicy,
+  decideWritePolicy,
   matchesPattern,
   type PolicyDecision,
 } from "./policy.ts";
@@ -615,6 +616,7 @@ export interface DiagnosticPolicyContext {
   denyRead: string[];
   allowWrite: string[];
   denyWrite: string[];
+  mandatoryDenyWrite?: string[];
   allowedDomains: string[];
   deniedDomains: string[];
 }
@@ -663,7 +665,13 @@ export function finalizeDiagnostic(
   }
   if (diagnostic.type === "write" && diagnostic.rawTarget) {
     const target = canonicalizePath(diagnostic.rawTarget, policy.cwd);
-    const decision = decidePathPolicy(target, policy.allowWrite, policy.denyWrite, policy.cwd);
+    const decision = decideWritePolicy(
+      target,
+      policy.allowWrite,
+      policy.denyWrite,
+      policy.cwd,
+      policy.mandatoryDenyWrite,
+    );
     return {
       ...diagnostic,
       target,

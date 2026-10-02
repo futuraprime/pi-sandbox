@@ -47,7 +47,11 @@ import {
   parseSandboxAllowCommand,
   updateSandboxConfigFile,
 } from "./sandbox-command.ts";
-import { resolveDerivedFilesystemAllowances } from "./sandbox-filesystem.ts";
+import {
+  getMandatoryWriteDenyPaths,
+  isMandatoryWritePath,
+  resolveDerivedFilesystemAllowances,
+} from "./sandbox-filesystem.ts";
 import {
   createSandboxedBashOps,
   initializeSandbox,
@@ -424,6 +428,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       denyRead: config.filesystem?.denyRead ?? [],
       allowWrite: effective.writePaths,
       denyWrite: config.filesystem?.denyWrite ?? [],
+      mandatoryDenyWrite: getMandatoryWriteDenyPaths(cwd),
       allowedDomains: effective.domains,
       deniedDomains: config.network?.deniedDomains ?? [],
     };
@@ -1262,16 +1267,19 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         path,
         allowWrite: effectiveWritePaths(ctx.cwd),
         denyWrite: config.filesystem?.denyWrite ?? [],
+        mandatoryDenyWrite: getMandatoryWriteDenyPaths(ctx.cwd),
         cwd: ctx.cwd,
         prompt: (path) => promptWriteBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds),
         saveWritePermission: (choice, value) => applyChoice(choice, "write", value, ctx.cwd),
       });
       if (writePermission.action === "deny") {
+        const mandatory = isMandatoryWritePath(path, ctx.cwd);
         return {
           block: true,
-          reason:
-            `Sandbox: write access denied for "${path}" (in denyWrite). ` +
-            `To change this, edit denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
+          reason: mandatory
+            ? `Sandbox: write access denied for "${path}" (mandatory protection; cannot be granted).`
+            : `Sandbox: write access denied for "${path}" (in denyWrite). ` +
+              `To change this, edit denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
         };
       }
       if (writePermission.action === "blocked") {
@@ -1387,7 +1395,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
           readConfig(ctx.cwd),
           getConfigPaths(ctx.cwd),
           allowances,
-          resolveDerivedFilesystemAllowances(ctx.cwd).linkedGitMetadata,
+          resolveDerivedFilesystemAllowances(ctx.cwd).linkedGitMetadataWrite,
         ),
         "info",
       );

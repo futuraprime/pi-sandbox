@@ -161,7 +161,9 @@ export function decideWritePolicy(
   allowWrite: string[],
   denyWrite: string[],
   cwd = process.cwd(),
+  mandatoryDenyWrite: string[] = [],
 ): PolicyDecision {
+  if (matchesPattern(path, mandatoryDenyWrite, cwd)) return "deny";
   return decidePathPolicy(path, allowWrite, denyWrite, cwd);
 }
 
@@ -169,6 +171,7 @@ export async function resolveWritePermission({
   path,
   allowWrite,
   denyWrite,
+  mandatoryDenyWrite = [],
   cwd = process.cwd(),
   prompt,
   saveWritePermission,
@@ -176,6 +179,7 @@ export async function resolveWritePermission({
   path: string;
   allowWrite: string[];
   denyWrite: string[];
+  mandatoryDenyWrite?: string[];
   cwd?: string;
   prompt: (path: string) => Promise<{
     action: "abort" | "session" | "project" | "global";
@@ -186,7 +190,7 @@ export async function resolveWritePermission({
     value: string,
   ) => Promise<void | boolean>;
 }) {
-  const policy = decideWritePolicy(path, allowWrite, denyWrite, cwd);
+  const policy = decideWritePolicy(path, allowWrite, denyWrite, cwd, mandatoryDenyWrite);
   if (policy !== "prompt") return { action: policy };
 
   const choice = await prompt(path);
