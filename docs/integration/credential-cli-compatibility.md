@@ -16,7 +16,7 @@ Normal test runs skip these probes. The full repository checks are `pnpm run all
 
 User-run opt-in acceptance passed both probes: real `gh`/npm and Wrangler **4.147.0**, with **2 passed, 0 failed, and 0 skipped**. The subsequent `pnpm run all` passed formatting, lint, and TypeScript, with **189 tests passed, 0 failed, and 2 opt-in skips** (191 total). The normal-suite skips are deliberate; the separate opt-in run exercised all three CLIs.
 
-Wrangler remains optional and skips only when no executable is available; a configured but unsupported or failing executable fails with its CLI diagnostics. No live credential policy was changed. Conditional approvals, production credential-source isolation, AWS CLI, and Terraform remain unimplemented or unverified.
+Wrangler remains optional and skips only when no executable is available; a configured but unsupported or failing executable fails with its CLI diagnostics. User-run AWS acceptance also passed: **2 passed, 0 failed, and 0 skipped**, covering the published signing example and real CLI control, masked-secret rejection, and unapproved-destination denial. Subsequent `pnpm run all` passed formatting, lint, and TypeScript, with **190 passed, 0 failed, and 3 deliberate opt-in skips** (193 total). No live credential policy was changed. Conditional approvals and production credential-source isolation remain unimplemented or unverified.
 
 ## What it checks
 
@@ -33,3 +33,17 @@ This is evidence only for the installed CLI versions, their local API/auth-heade
 - Wrangler uses a localhost-only fixture filter with no wildcard host/port grants. TLS verification remains enabled: the CLI trusts the ephemeral CA, and the proxy verifies its upstream TLS connection against that CA. The fixture never echoes credentials. The test inspects no real credential values and constructs child environments explicitly rather than inheriting Cloudflare credential variables.
 
 The passing Wrangler result establishes the exercised local `whoami --json` token-authentication flow, including proxy substitution, captured-output non-disclosure, and unapproved-host denial. It does not validate deployment commands, other Cloudflare integrations, production Cloudflare authentication, or general credential-store isolation.
+
+## AWS CLI SigV4 proof
+
+`test/credential-aws-compatibility.test.ts` is separately opt-in and runs only an already-installed `aws` executable. An absent CLI skips; an installed CLI that fails the local proof fails the test. Run it explicitly with:
+
+```sh
+PI_SANDBOX_CREDENTIAL_CLI_ACCEPTANCE=1 pnpm exec tsx --test test/credential-aws-compatibility.test.ts
+```
+
+The test invokes `aws sts get-caller-identity --endpoint-url https://localhost:<port> --region us-east-1 --output json` against an exact localhost/port TLS fixture. The AWS CLI trusts the fixture CA through `AWS_CA_BUNDLE`; the proxy separately verifies its upstream TLS connection against that CA. The child receives an isolated HOME/XDG tree, empty explicit AWS config and shared-credentials files, only synthetic AWS credential values, disabled EC2 metadata, one bounded attempt, an empty pager, and auto-prompt off. Its environment does not inherit host credentials. The proxy denies other destinations, including `unapproved.invalid`, and the denied call must not reach the fixture.
+
+A synthetic known-credential control must produce a valid SigV4 request at the fixture. The fixture independently reconstructs the canonical method, path, query, signed headers, and body hash, then checks the AWS4 HMAC key-derivation chain. A separate verifier test checks the published AWS IAM `ListUsers` known-answer signature so the verifier is not validated only against itself. For the negative case, all three credential environment variables are masked with `SentinelRegistry`/`buildMaskedEnvVars`; the access-key sentinel may be restored in the authorization header, while the session-token sentinel is not approved for localhost. The masked secret is never transmitted as a header, so header substitution cannot restore it. The fixture must reject the resulting signature with `SignatureDoesNotMatch`, even though it independently verifies that signature against the masked secret and signed token. Fixture headers remain parent-side and are never reflected; command outputs must contain none of the synthetic plaintext values. The successful baseline necessarily places synthetic plaintext credentials in its isolated child environment only.
+
+The passing proof establishes the exercised **masking incompatibility**, not an AWS authentication solution: replacing `AWS_SECRET_ACCESS_KEY` before SigV4 signing changes the signature, and the secret cannot be restored by proxy header substitution because it is not on the wire. It is evidence only for the exercised local AWS CLI signing flow and is intended to inform the Terraform AWS provider case; Terraform/tofu is not installed here and is not exercised. The AWS S3 backend and Cloudflare are out of scope for this proof. The user-run local AWS CLI proof passed; Terraform provider behavior remains inferred from the signing mechanism, not independently runtime-verified. This is not a live AWS request, production auth validation, credential-store isolation test, or guarantee supplied by an OS sandbox.
