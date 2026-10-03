@@ -22,6 +22,7 @@ const ENABLED = process.env.PI_SANDBOX_CREDENTIAL_CLI_ACCEPTANCE === "1";
 const GITHUB_SECRET = "pi-sandbox-cli-test-gh-secret-6a12";
 const NPM_SECRET = "pi-sandbox-cli-test-npm-secret-9c47";
 const UNAPPROVED_SECRET = "pi-sandbox-cli-test-unapproved-secret-3d85";
+const CLOUDFLARE_SECRET = "pi-sandbox-cli-test-cloudflare-secret-72bd";
 const API_HOST = privateInterfaceAddress();
 
 interface SeenRequest {
@@ -115,6 +116,7 @@ function isolatedEnv(root: string, cliPaths: string[]): NodeJS.ProcessEnv {
   return {
     PATH: [
       ...new Set([
+        dirname(process.execPath),
         ...cliPaths.map(dirname),
         "/usr/local/bin",
         "/usr/bin",
@@ -143,7 +145,7 @@ function isolatedEnv(root: string, cliPaths: string[]): NodeJS.ProcessEnv {
 
 function redactedCliError(stderr: string): string {
   let redacted = stderr;
-  for (const secret of [GITHUB_SECRET, NPM_SECRET, UNAPPROVED_SECRET]) {
+  for (const secret of [GITHUB_SECRET, NPM_SECRET, UNAPPROVED_SECRET, CLOUDFLARE_SECRET]) {
     redacted = redacted.replaceAll(secret, "[REDACTED]");
   }
   return redacted.slice(0, 4000).trim() || "(no stderr)";
@@ -389,15 +391,169 @@ test(
   },
 );
 
-const wranglerSkip = !ENABLED
-  ? disabledReason
-  : !findExecutable("wrangler")
-    ? "Wrangler CLI is absent; it is not installed or downloaded by this test"
-    : "unverified: Wrangler has no configured local API-base override in this fixture; " +
-      "no mock or live request is used";
-
 test(
-  "optional Wrangler CLI compatibility is explicitly unverified",
-  { skip: wranglerSkip },
-  () => {},
+  "real Wrangler whoami uses fake credentials and the local TLS proxy",
+  {
+    skip: !ENABLED && disabledReason,
+  },
+  async (t) => {
+    const wrangler = process.env.PI_SANDBOX_WRANGLER_BIN || findExecutable("wrangler");
+    if (!wrangler) {
+      t.skip(
+        "Wrangler CLI is absent; set PI_SANDBOX_WRANGLER_BIN or add wrangler to PATH; no CLI is installed or downloaded by this test",
+      );
+      return;
+    }
+
+    const registry = new SentinelRegistry();
+    const masked = buildMaskedEnvVars(
+      [{ name: "CLOUDFLARE_API_TOKEN", mode: "mask", injectHosts: ["localhost"] }],
+      ["localhost"],
+      registry,
+      { CLOUDFLARE_API_TOKEN: CLOUDFLARE_SECRET },
+    );
+    assert.deepEqual(masked.degradeToUnsetNames, []);
+    const cloudflareFake = masked.setEnvVars.CLOUDFLARE_API_TOKEN;
+    assert.ok(cloudflareFake);
+    assertNoPlaintext([cloudflareFake], [CLOUDFLARE_SECRET]);
+
+    const root = mkdtempSync(join(process.cwd(), ".pi-sandbox-wrangler-compatibility-"));
+    const seen: SeenRequest[] = [];
+    const deniedHosts: string[] = [];
+    let ca: ReturnType<typeof createMitmCA> | undefined;
+    let upstream: ReturnType<typeof createHttpsServer> | undefined;
+    let upstreamListening = false;
+    let proxy: NetServer | undefined;
+    let proxyListening = false;
+    try {
+      ca = createMitmCA({});
+      const leaf = mintLeafCert(ca, "localhost");
+      upstream = createHttpsServer({ key: leaf.keyPem, cert: leaf.certPem }, (req, res) => {
+        seen.push({ url: req.url ?? "", authorization: req.headers.authorization });
+        const path = new URL(req.url ?? "/", "https://localhost").pathname;
+        let result: unknown = undefined;
+        switch (path) {
+          case "/user/tokens/verify":
+            result = { id: "fixture-token", status: "active" };
+            break;
+          case "/user":
+            result = { id: "fixture-user", email: "fixture-user@example.test" };
+            break;
+          case "/accounts":
+            result = [{ id: "fixture-account", name: "Fixture account" }];
+            break;
+          case "/memberships":
+            result = [{ id: "fixture-membership", account: { id: "fixture-account" } }];
+            break;
+        }
+        if (result === undefined) {
+          res.writeHead(404, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              success: false,
+              errors: [{ code: 1000, message: "not found" }],
+            }),
+          );
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            success: true,
+            errors: [],
+            messages: [],
+            result,
+            ...(path === "/accounts" || path === "/memberships"
+              ? { result_info: { page: 1, per_page: 20, total_count: 1 } }
+              : {}),
+          }),
+        );
+      });
+      const upstreamPort = await listen(upstream, "localhost");
+      upstreamListening = true;
+      proxy = createHttpProxyServer({
+        filter: (port, host) => {
+          const allowed = host === "localhost" && port === upstreamPort;
+          if (!allowed) deniedHosts.push(host);
+          return allowed;
+        },
+        mitmCA: ca,
+        tlsTerminateUpstreamCA: ca.certPem,
+        mutateHeaders: (headers, host) =>
+          registry.substituteInHeaders(headers, host, domainMatchesPattern),
+      });
+      const proxyPort = await listen(proxy, "127.0.0.1");
+      proxyListening = true;
+      const env = {
+        ...isolatedEnv(root, [wrangler]),
+        CLOUDFLARE_API_TOKEN: cloudflareFake,
+        CLOUDFLARE_API_BASE_URL: `https://localhost:${upstreamPort}`,
+        CLOUDFLARE_AUTH_USE_KEYRING: "false",
+        WRANGLER_SEND_METRICS: "false",
+        WRANGLER_NO_SKILLS_UPDATE_PROMPTS: "true",
+        HTTPS_PROXY: `http://127.0.0.1:${proxyPort}`,
+        HTTP_PROXY: `http://127.0.0.1:${proxyPort}`,
+        no_proxy: "unrelated.invalid",
+        NODE_EXTRA_CA_CERTS: ca.certPath,
+      };
+      const updateCheckCache = join(root, "tmp", "update-check");
+      mkdirSync(updateCheckCache, { recursive: true });
+      writeFileSync(
+        join(updateCheckCache, "wrangler-latest.json"),
+        JSON.stringify({ latest: "4.147.0", lastUpdate: Date.now() }),
+      );
+      const args = ["whoami", "--json"];
+      assertNoPlaintext(
+        [...args, ...Object.values(env).filter((value): value is string => Boolean(value))],
+        [CLOUDFLARE_SECRET],
+      );
+      const run = await runCli(wrangler, args, env, root);
+      assert.equal(
+        run.status,
+        0,
+        `wrangler whoami must succeed against the local API fixture: ${redactedCliError(run.stderr)}`,
+      );
+      const identity = JSON.parse(run.stdout) as {
+        loggedIn?: boolean;
+        email?: string;
+        accounts?: Array<{ id?: string; name?: string }>;
+      };
+      assert.equal(identity.loggedIn, true);
+      assert.equal(identity.email, "fixture-user@example.test");
+      assert.deepEqual(identity.accounts, [{ id: "fixture-account", name: "Fixture account" }]);
+      assert.deepEqual(
+        new Set(seen.map((request) => new URL(request.url, "https://localhost").pathname)),
+        new Set(["/user/tokens/verify", "/user", "/accounts", "/memberships"]),
+        "real Wrangler whoami --json must call its token verification, user, accounts, and memberships endpoints",
+      );
+      assert.ok(seen.every((request) => request.authorization === `Bearer ${CLOUDFLARE_SECRET}`));
+
+      const requestsBeforeDeniedHost = seen.length;
+      const deniedEnv = {
+        ...env,
+        CLOUDFLARE_API_BASE_URL: "https://unapproved.invalid",
+      };
+      const deniedRun = await runCli(wrangler, args, deniedEnv, root);
+      assert.notEqual(deniedRun.status, 0, "an unapproved API host must not succeed");
+      assert.ok(
+        deniedHosts.includes("unapproved.invalid"),
+        "proxy must explicitly deny the unapproved host",
+      );
+      assert.equal(
+        seen.length,
+        requestsBeforeDeniedHost,
+        "unapproved host must not reach the fixture",
+      );
+      assertNoPlaintext(
+        [run.stdout, run.stderr, deniedRun.stdout, deniedRun.stderr],
+        [CLOUDFLARE_SECRET],
+      );
+    } finally {
+      if (proxyListening && proxy) await close(proxy);
+      if (upstreamListening && upstream) await close(upstream);
+      if (ca) await disposeMitmCA(ca);
+      registry.clear();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
 );

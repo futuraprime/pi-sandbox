@@ -1,18 +1,22 @@
 # Local credential CLI compatibility probes
 
-`test/credential-cli-compatibility.test.ts` is opt-in. It runs the installed `gh` and `npm` executables against a local HTTPS fixture through the sandbox runtime's TLS-terminating proxy; it does not install tools or contact a public service.
+`test/credential-cli-compatibility.test.ts` is opt-in. It runs installed `gh`, `npm`, and optionally Wrangler executables against local HTTPS fixtures through the sandbox runtime's TLS-terminating proxy; it does not install tools or contact a public service. Wrangler is selected from `PATH` or the explicit `PI_SANDBOX_WRANGLER_BIN` executable path. Isolated CLI environments prefer the test runner's Node executable directory so Node-based tools do not accidentally switch architecture via another system installation.
 
 Run only when you want to exercise the installed CLI versions:
 
 ```sh
 PI_SANDBOX_CREDENTIAL_CLI_ACCEPTANCE=1 pnpm exec tsx --test test/credential-cli-compatibility.test.ts
+# Optional, if Wrangler is not already on PATH:
+PI_SANDBOX_CREDENTIAL_CLI_ACCEPTANCE=1 PI_SANDBOX_WRANGLER_BIN=/path/to/wrangler pnpm exec tsx --test test/credential-cli-compatibility.test.ts
 ```
 
 Normal test runs skip these probes. The full repository checks are `pnpm run all` (format, lint, typecheck, and tests).
 
-## Verified result
+## Verification status
 
-User-run acceptance passed the real `gh` and npm probe; Wrangler was explicitly skipped because its CLI was absent. The subsequent `pnpm run all` passed formatting, lint, and TypeScript checks, with **189 tests passed, 0 failed, and 2 opt-in tests skipped** (191 total). This establishes the exercised local HTTP-token flows only; Wrangler, AWS CLI, Terraform, conditional approvals, and production credential-source isolation remain unverified or unimplemented. No live credential policy was changed.
+User-run opt-in acceptance passed both probes: real `gh`/npm and Wrangler **4.147.0**, with **2 passed, 0 failed, and 0 skipped**. The subsequent `pnpm run all` passed formatting, lint, and TypeScript, with **189 tests passed, 0 failed, and 2 opt-in skips** (191 total). The normal-suite skips are deliberate; the separate opt-in run exercised all three CLIs.
+
+Wrangler remains optional and skips only when no executable is available; a configured but unsupported or failing executable fails with its CLI diagnostics. No live credential policy was changed. Conditional approvals, production credential-source isolation, AWS CLI, and Terraform remain unimplemented or unverified.
 
 ## What it checks
 
@@ -24,4 +28,8 @@ User-run acceptance passed the real `gh` and npm probe; Wrangler was explicitly 
 
 This is evidence only for the installed CLI versions, their local API/auth-header behavior, and the exercised proxy path. It is not an OS sandbox/credential-store isolation test, a guarantee for other CLI versions or transports, nor protection against an approved upstream that deliberately exfiltrates a credential it is authorized to receive. The probe does not validate production GitHub or npm authentication.
 
-Wrangler is optional. Its test reports an explicit unverified skip when absent; if installed, it still skips because this fixture does not have a controlled Wrangler API-base override. No Wrangler command is mocked or sent to a live service. In the authoring environment `gh` and `npm` were present and `wrangler` was absent.
+- Wrangler is an independent optional probe, so it does not require the `gh` private-interface fixture. It runs the real `wrangler whoami --json` command with a synthetic `CLOUDFLARE_API_TOKEN`; the fixture handles the pinned CLI's `/user/tokens/verify`, `/user`, `/accounts`, and `/memberships` calls with controlled Cloudflare-style JSON responses and asserts the approved synthetic token arrives after substitution. A second invocation points the API base at `unapproved.invalid` and requires proxy denial without reaching the local upstream.
+- Wrangler 4.147.0's compiled source names `CLOUDFLARE_API_BASE_URL` (deprecated alias `CF_API_BASE_URL`) as the API-base override, `WRANGLER_SEND_METRICS=false` as the telemetry setting, and `CLOUDFLARE_AUTH_USE_KEYRING=false` to opt out of keyring storage. The probe also sets `WRANGLER_NO_SKILLS_UPDATE_PROMPTS=true`, uses an empty isolated credential home plus the environment token, routes Node/Undici `HTTPS_PROXY`/`HTTP_PROXY` through the fixture (`no_proxy=unrelated.invalid` so localhost is not bypassed), and adds the fixture CA to the CLI's trust store through `NODE_EXTRA_CA_CERTS`. The successful JSON `whoami` path does not invoke Wrangler's version update check in this pinned build. A fresh, fixture-owned update-check cache under the isolated `TMPDIR` also prevents the error-path updater from making an HTTP request during the negative-host probe. This does not disable update checks for other commands or Wrangler versions.
+- Wrangler uses a localhost-only fixture filter with no wildcard host/port grants. TLS verification remains enabled: the CLI trusts the ephemeral CA, and the proxy verifies its upstream TLS connection against that CA. The fixture never echoes credentials. The test inspects no real credential values and constructs child environments explicitly rather than inheriting Cloudflare credential variables.
+
+The passing Wrangler result establishes the exercised local `whoami --json` token-authentication flow, including proxy substitution, captured-output non-disclosure, and unapproved-host denial. It does not validate deployment commands, other Cloudflare integrations, production Cloudflare authentication, or general credential-store isolation.
