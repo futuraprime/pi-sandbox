@@ -6,6 +6,7 @@ import test, { mock, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { SandboxManager, type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
+import { globToRegex } from "@carderne/sandbox-runtime/dist/sandbox/sandbox-utils.js";
 import assert from "node:assert/strict";
 
 import { DEFAULT_CONFIG } from "../src/config.ts";
@@ -233,6 +234,21 @@ test("buildRuntimeConfig combines configured and session socket paths without mu
     assert.deepEqual(allowances.unixSockets, [sessionSocket]);
   } finally {
     rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("built-in PEM and key deny globs reach the runtime recursively", (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-key-deny-"));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const runtime = buildRuntimeConfig(DEFAULT_CONFIG, undefined, "darwin", cwd);
+  const canonicalCwd = canonicalizePath(cwd);
+
+  for (const extension of ["pem", "key"]) {
+    const pattern = join(canonicalCwd, "**", `*.${extension}`);
+    assert.equal(runtime.filesystem?.denyWrite?.includes(pattern), true, pattern);
+    const matcher = new RegExp(globToRegex(pattern));
+    assert.equal(matcher.test(join(canonicalCwd, `root.${extension}`)), true);
+    assert.equal(matcher.test(join(canonicalCwd, "nested", "deep", `private.${extension}`)), true);
   }
 });
 

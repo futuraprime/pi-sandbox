@@ -153,6 +153,26 @@ the same paths. This is the accepted C-13 contract shared by direct tools and
 Bash runtime policy; read and write denies and their existing specificity
 precedence remain unchanged.
 
+Filesystem globs use the pinned runtime's syntax in direct-tool matching and
+path canonicalization: `*` and `?` match within one path component, `**` can
+cross `/`, and `**/` matches zero or more directories. Bracket character
+classes such as `[ch]` are supported. The runtime treats any `[` or `]` as glob
+syntax; its regex converter treats an unclosed `[` as a literal character, but
+bracket-containing patterns still use exact glob matching rather than
+literal-path subtree matching. `!` is an ordinary literal character, not a
+wildcard or negation operator. Patterns with no glob characters retain
+literal-path behavior, including matching a literal directory and its
+descendants. For example, `*.pem` matches only a root-level PEM file; use
+`**/*.pem` to match root-level and nested PEM files.
+Existing custom patterns that relied on `*` spanning directories should be
+changed to `**` as needed; user configuration is not auto-migrated. Built-in
+PEM/key write denies use explicit `**/*.pem` and `**/*.key` patterns.
+
+Glob alignment is partial: the pinned runtime does not emit nested `denyRead`
+glob rules inside literal `allowRead` subpaths on macOS, and runtime write-rule
+precedence still differs when a more-specific allow overlaps a broader deny.
+Those OS-profile gaps are not fixed by direct-tool glob matching.
+
 Mandatory writes are denied before allow-rule precedence for direct `write`/
 `edit` calls and in the OS runtime. This protects Git configuration and standard
 hooks (including linked-worktree pointer/config files), `.gitmodules`, `.pi/**`

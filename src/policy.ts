@@ -2,6 +2,11 @@ import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
+import {
+  containsGlobChars,
+  globToRegex,
+} from "@carderne/sandbox-runtime/dist/sandbox/sandbox-utils.js";
+
 export type PolicyDecision = "allow" | "deny" | "prompt";
 
 function normalizeDomain(value: string): string {
@@ -90,9 +95,13 @@ export function canonicalizePath(filePath: string, cwd = process.cwd()): string 
   }
 }
 
+function firstGlobIndex(pattern: string): number {
+  return pattern.search(/[*?[\]]/);
+}
+
 function canonicalizeGlob(pattern: string, cwd: string): string {
   const absolutePattern = expandPath(pattern, cwd);
-  const wildcardIndex = absolutePattern.search(/[*!?]/);
+  const wildcardIndex = firstGlobIndex(absolutePattern);
   if (wildcardIndex < 0) return canonicalizePath(absolutePattern, cwd);
 
   const slashIndex = absolutePattern.lastIndexOf("/", wildcardIndex);
@@ -103,7 +112,13 @@ function canonicalizeGlob(pattern: string, cwd: string): string {
 }
 
 function canonicalizePattern(pattern: string, cwd: string): string {
-  return /[*?!]/.test(pattern) ? canonicalizeGlob(pattern, cwd) : canonicalizePath(pattern, cwd);
+  return firstGlobIndex(pattern) >= 0
+    ? canonicalizeGlob(pattern, cwd)
+    : canonicalizePath(pattern, cwd);
+}
+
+function isGlobPattern(pattern: string): boolean {
+  return containsGlobChars(pattern);
 }
 
 export function canonicalizePathPattern(pattern: string, cwd = process.cwd()): string {
@@ -115,7 +130,7 @@ export function pathPatternSpecificity(pattern: string, cwd = process.cwd()): nu
   return canonicalPattern
     .split("/")
     .filter(Boolean)
-    .reduce((specificity, segment) => specificity + (/[*?!]/.test(segment) ? 0 : 1), 0);
+    .reduce((specificity, segment) => specificity + (isGlobPattern(segment) ? 0 : 1), 0);
 }
 
 function pathRuleSpecificity(pattern: string, cwd: string): number {
@@ -679,9 +694,8 @@ export function matchesPattern(filePath: string, patterns: string[], cwd = proce
   return patterns.some((pattern) => {
     if (typeof pattern !== "string") return false;
     const absolutePattern = canonicalizePattern(pattern, cwd);
-    if (/[*?!]/.test(pattern)) {
-      const escaped = absolutePattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/[*!?]/g, ".*");
-      return new RegExp(`^${escaped}$`).test(absolutePath);
+    if (isGlobPattern(pattern)) {
+      return new RegExp(globToRegex(absolutePattern)).test(absolutePath);
     }
     const separator = absolutePattern.endsWith("/") ? "" : "/";
     return absolutePath === absolutePattern || absolutePath.startsWith(absolutePattern + separator);

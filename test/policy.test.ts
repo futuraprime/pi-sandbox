@@ -1,19 +1,25 @@
-import { mkdtempSync, mkdirSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
+import {
+  containsGlobChars,
+  globToRegex,
+} from "@carderne/sandbox-runtime/dist/sandbox/sandbox-utils.js";
 import assert from "node:assert/strict";
 
 import {
   allowsAllDomains,
   canonicalizePath,
+  canonicalizePathPattern,
   decideDomainPolicy,
   decidePathPolicy,
   decideWritePolicy,
   domainIsAllowed,
   extractDomainsFromCommand,
   matchesPattern,
+  pathPatternSpecificity,
   resolveWritePermission,
 } from "../src/policy.ts";
 
@@ -255,21 +261,94 @@ test("resolves write permission prompt choices", async () => {
   assert.deepEqual(applied, ["session:/tmp"]);
 });
 
-test("path patterns support directory prefixes and globs", () => {
+test("path matching follows pinned runtime glob syntax", (t) => {
   const root = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-policy-")));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const rootPem = join(root, "file.pem");
+  const nestedPem = join(root, "nested", "file.pem");
+  const rootCSource = join(root, "target1.c");
+  const nestedHeader = join(root, "nested", "target2.h");
+
   assert.equal(matchesPattern(join(root, "nested", "file.txt"), [root]), true);
-  assert.equal(matchesPattern(join(root, "file.pem"), [join(root, "*.pem")]), true);
-  assert.equal(matchesPattern(join(root, "file.txt"), [join(root, "*.pem")]), false);
+  assert.equal(matchesPattern(rootPem, [join(root, "*.pem")]), true);
+  assert.equal(matchesPattern(nestedPem, [join(root, "*.pem")]), false);
+  assert.equal(matchesPattern(rootPem, [join(root, "**", "*.pem")]), true);
+  assert.equal(matchesPattern(nestedPem, [join(root, "**", "*.pem")]), true);
+  assert.equal(matchesPattern(rootCSource, [join(root, "**", "target?.[ch]")]), true);
+  assert.equal(matchesPattern(nestedHeader, [join(root, "**", "target?.[ch]")]), true);
+  assert.equal(matchesPattern(nestedHeader, [join(root, "target?.[ch]")]), false);
+  assert.equal(
+    matchesPattern(join(root, "nested", "target10.c"), [join(root, "**", "target?.[ch]")]),
+    false,
+  );
+  assert.equal(matchesPattern(join(root, "!", "file.txt"), [join(root, "!", "*.txt")]), true);
+  assert.equal(matchesPattern(join(root, "x", "file.txt"), [join(root, "!", "*.txt")]), false);
+
+  const literalBracketDirectory = join(root, "literal[");
+  const literalClosingBracketDirectory = join(root, "literal]");
+  mkdirSync(literalBracketDirectory);
+  mkdirSync(literalClosingBracketDirectory);
+  for (const literalBracketPath of [literalBracketDirectory, literalClosingBracketDirectory]) {
+    assert.equal(containsGlobChars(literalBracketPath), true);
+    assert.equal(matchesPattern(literalBracketPath, [literalBracketPath]), true);
+    assert.equal(matchesPattern(join(literalBracketPath, "file.txt"), [literalBracketPath]), false);
+    for (const candidate of [literalBracketPath, join(literalBracketPath, "file.txt")]) {
+      assert.equal(
+        matchesPattern(candidate, [literalBracketPath]),
+        new RegExp(globToRegex(canonicalizePathPattern(literalBracketPath))).test(
+          canonicalizePath(candidate),
+        ),
+      );
+    }
+  }
+  assert.equal(
+    canonicalizePathPattern(literalBracketDirectory),
+    canonicalizePath(literalBracketDirectory),
+  );
 });
 
-test("canonicalizes symlinks and nonexistent descendants", () => {
+test("bracket classes are wildcard components for specificity ties", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-specificity-glob-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const classPattern = join(root, "dir", "[ab].txt");
+  const starPattern = join(root, "dir", "*.txt");
+  const target = join(root, "dir", "a.txt");
+
+  assert.equal(pathPatternSpecificity(classPattern), pathPatternSpecificity(starPattern));
+  assert.equal(
+    pathPatternSpecificity(join(root, "dir", "literal[")),
+    pathPatternSpecificity(starPattern),
+  );
+  assert.equal(
+    pathPatternSpecificity(join(root, "dir", "literal]")),
+    pathPatternSpecificity(starPattern),
+  );
+  assert.equal(
+    pathPatternSpecificity(join(root, "dir", "!.txt")),
+    pathPatternSpecificity(starPattern) + 1,
+  );
+  assert.equal(decidePathPolicy(target, [classPattern], [starPattern]), "deny");
+});
+
+test("canonicalizes symlinked glob prefixes and nonexistent tails", (t) => {
   const root = mkdtempSync(join(tmpdir(), "pi-sandbox-canonical-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
   const real = join(root, "real");
   const link = join(root, "link");
   mkdirSync(real);
   symlinkSync(real, link);
+
   assert.equal(
     canonicalizePath(join(link, "new", "file")),
     join(canonicalizePath(real), "new", "file"),
   );
+  const canonicalReal = canonicalizePath(real);
+  const pattern = join(link, "missing", "**", "*.pem");
+  const canonicalPattern = join(canonicalReal, "missing", "**", "*.pem");
+  assert.equal(canonicalizePathPattern(pattern), canonicalPattern);
+  assert.equal(
+    canonicalizePathPattern(join(link, "missing", "file[12].pem")),
+    join(canonicalReal, "missing", "file[12].pem"),
+  );
+  assert.equal(matchesPattern(join(link, "missing", "child.pem"), [pattern]), true);
 });

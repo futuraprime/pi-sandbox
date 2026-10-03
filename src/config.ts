@@ -59,7 +59,7 @@ export const DEFAULT_CONFIG: SandboxConfig = {
     denyRead: ["/Users", "/home"],
     allowRead: [".", "~/.config", "~/.local", "Library"],
     allowWrite: [".", "/tmp"],
-    denyWrite: [".env", ".env.*", "*.pem", "*.key"],
+    denyWrite: [".env", ".env.*", "**/*.pem", "**/*.key"],
   },
 };
 

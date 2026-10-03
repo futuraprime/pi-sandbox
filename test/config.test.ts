@@ -15,7 +15,25 @@ import {
   type SandboxConfigFile,
   validateCredentials,
 } from "../src/config.ts";
+import { matchesPattern } from "../src/policy.ts";
 import { updateSandboxConfigFile } from "../src/sandbox-command.ts";
+
+test("built-in PEM and key write denies remain recursive under runtime-compatible globs", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-default-key-deny-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const denyWrite = DEFAULT_CONFIG.filesystem?.denyWrite ?? [];
+
+  assert.deepEqual(denyWrite.slice(-2), ["**/*.pem", "**/*.key"]);
+  for (const extension of ["pem", "key"]) {
+    for (const target of [
+      join(root, `root.${extension}`),
+      join(root, "nested", "deep", `private.${extension}`),
+    ]) {
+      assert.equal(matchesPattern(target, denyWrite, root), true, target);
+    }
+  }
+  assert.equal(matchesPattern(join(root, "nested", "public.txt"), denyWrite, root), false);
+});
 
 test("omitted settings use their defaults without enabling generic SSH proxying", () => {
   const merged = mergeConfigLayers(DEFAULT_CONFIG, {}, {});
