@@ -1,11 +1,14 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -18,7 +21,7 @@ import assert from "node:assert/strict";
 
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { getMandatoryWriteDenyPaths } from "../src/sandbox-filesystem.ts";
-import { buildRuntimeConfig } from "../src/sandbox-runtime.ts";
+import { buildRuntimeConfig, createSandboxedBashOps } from "../src/sandbox-runtime.ts";
 
 function isolatedGitEnvironment(root: string): NodeJS.ProcessEnv {
   const env = { ...process.env };
@@ -274,5 +277,316 @@ test("macOS OS sandbox enforces protected project and Git writes despite explici
   } finally {
     await SandboxManager.reset();
     rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("macOS C-2 write precedence follows path specificity through the OS sandbox", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("macOS-only OS enforcement regression test");
+    return;
+  }
+
+  const scratch = mkdtempSync(join(process.cwd(), ".pi-sandbox-c2-"));
+  try {
+    const paths = {
+      created: join(scratch, "area", "grant", "created.txt"),
+      overwritten: join(scratch, "area", "grant", "overwritten.txt"),
+      deleted: join(scratch, "area", "grant", "deleted.txt"),
+      renameSource: join(scratch, "area", "grant", "rename-source.txt"),
+      renameTarget: join(scratch, "area", "grant", "rename-target.txt"),
+      atomicTemp: join(scratch, "area", "grant", "atomic-temp.txt"),
+      atomicTarget: join(scratch, "area", "grant", "atomic-target.txt"),
+      globDenyLiteralGrant: join(scratch, "glob-block", "literal-grant", "created.txt"),
+      literalDenyGlobGrant: join(
+        scratch,
+        "literal-block",
+        "glob-grant",
+        "created.txt",
+      ),
+      globGrant: join(scratch, "area", "glob-grant", "created.txt"),
+      nestedAllowed: join(scratch, "nested", "public", "created.txt"),
+      sibling: join(scratch, "area", "sibling", "untouched.txt"),
+      equalSpecificity: join(scratch, "tie", "untouched.txt"),
+      nestedDenied: join(scratch, "nested", "private", "untouched.txt"),
+      gitConfig: join(scratch, ".git", "config"),
+      gitHook: join(scratch, ".git", "hooks", "pre-commit"),
+      piSettings: join(scratch, ".pi", "settings.json"),
+      sandboxConfig: join(scratch, ".pi", "sandbox.json"),
+      runtimeGitConfig: join(scratch, ".gitconfig"),
+      runtimeShellConfig: join(scratch, ".bashrc"),
+      protectedAncestor: join(scratch, "move-zone", "protected", "deeper"),
+      movedAncestor: join(scratch, "move-zone", "moved-deeper"),
+      protectedLink: join(
+        scratch,
+        "move-zone",
+        "protected",
+        "deeper",
+        "existing-link",
+      ),
+      missingProtectedLink: join(
+        scratch,
+        "move-zone",
+        "protected",
+        "deeper",
+        "not-created-link",
+      ),
+      missingProtectedRenameLink: join(
+        scratch,
+        "move-zone",
+        "protected",
+        "deeper",
+        "renamed-link",
+      ),
+      attackerLink: join(scratch, "move-zone", "attacker-link"),
+      attackerSymlink: join(scratch, "move-zone", "attacker-symlink"),
+    };
+
+    const baselineFiles = new Map<string, string>([
+      [paths.overwritten, "original overwrite\n"],
+      [paths.deleted, "original delete\n"],
+      [paths.renameSource, "rename source\n"],
+      [paths.atomicTarget, "original atomic target\n"],
+      [paths.sibling, "sibling baseline\n"],
+      [paths.equalSpecificity, "tie baseline\n"],
+      [paths.nestedDenied, "nested deny baseline\n"],
+      [paths.gitConfig, "fixture git config\n"],
+      [paths.gitHook, "fixture git hook\n"],
+      [paths.piSettings, "fixture pi settings\n"],
+      [paths.sandboxConfig, "fixture sandbox config\n"],
+      [paths.runtimeGitConfig, "fixture runtime git config\n"],
+      [paths.runtimeShellConfig, "fixture runtime shell config\n"],
+    ]);
+    const deniedOperationFiles = new Map<string, string>([
+      [paths.sibling, "sibling baseline\n"],
+      [paths.equalSpecificity, "tie baseline\n"],
+      [paths.nestedDenied, "nested deny baseline\n"],
+      [paths.gitConfig, "fixture git config\n"],
+      [paths.gitHook, "fixture git hook\n"],
+      [paths.piSettings, "fixture pi settings\n"],
+      [paths.sandboxConfig, "fixture sandbox config\n"],
+      [paths.runtimeGitConfig, "fixture runtime git config\n"],
+      [paths.runtimeShellConfig, "fixture runtime shell config\n"],
+    ]);
+    for (const [path, contents] of baselineFiles) {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, contents);
+    }
+    for (const target of [
+      paths.globDenyLiteralGrant,
+      paths.literalDenyGlobGrant,
+      paths.globGrant,
+      paths.nestedAllowed,
+    ]) {
+      mkdirSync(dirname(target), { recursive: true });
+    }
+    mkdirSync(paths.protectedAncestor, { recursive: true });
+    writeFileSync(paths.attackerLink, "attacker replacement\n");
+    symlinkSync("attacker-controlled-target", paths.attackerSymlink);
+    symlinkSync("original-link-target", paths.protectedLink);
+
+    const allowWrite = [
+      join(scratch, "area", "grant"),
+      join(scratch, "area", "glob-grant", "*"),
+      join(scratch, "glob-block", "literal-grant"),
+      join(scratch, "literal-block", "glob-grant", "*"),
+      join(scratch, "tie", "*"),
+      join(scratch, "nested"),
+      join(scratch, "move-zone"),
+      paths.gitConfig,
+      paths.gitHook,
+      paths.piSettings,
+      paths.sandboxConfig,
+      paths.runtimeGitConfig,
+      paths.runtimeShellConfig,
+    ];
+    const denyWrite = [
+      scratch,
+      join(scratch, "area", "**"),
+      join(scratch, "glob-block", "**"),
+      join(scratch, "literal-block"),
+      join(scratch, "tie", "*"),
+      join(scratch, "nested", "private"),
+      join(scratch, "move-zone", "protected", "deeper", "existing-link"),
+      join(scratch, "move-zone", "protected", "deeper", "not-created-link"),
+      join(scratch, "move-zone", "protected", "deeper", "renamed-link"),
+    ];
+    const runtimeConfig = buildRuntimeConfig(
+      {
+        ...DEFAULT_CONFIG,
+        network: { ...DEFAULT_CONFIG.network!, allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [],
+          allowRead: [scratch],
+          allowWrite,
+          denyWrite,
+        },
+      },
+      undefined,
+      "darwin",
+      scratch,
+    );
+    await SandboxManager.initialize(runtimeConfig, async () => false);
+
+    const operations = [
+      ["create-in-narrow-grant", `fs.writeFileSync(paths.created, "created\\n")`],
+      ["overwrite-in-narrow-grant", `fs.writeFileSync(paths.overwritten, "overwritten\\n")`],
+      ["delete-in-narrow-grant", `fs.unlinkSync(paths.deleted)`],
+      ["rename-in-narrow-grant", `fs.renameSync(paths.renameSource, paths.renameTarget)`],
+      [
+        "atomic-replace-in-narrow-grant",
+        `fs.writeFileSync(paths.atomicTemp, "atomic replacement\\n"); fs.renameSync(paths.atomicTemp, paths.atomicTarget)`,
+      ],
+      [
+        "glob-deny-overridden-by-literal-grant",
+        `fs.writeFileSync(paths.globDenyLiteralGrant, "literal grant\\n")`,
+      ],
+      [
+        "literal-deny-overridden-by-more-specific-glob-grant",
+        `fs.writeFileSync(paths.literalDenyGlobGrant, "glob grant\\n")`,
+      ],
+      ["glob-narrow-grant", `fs.writeFileSync(paths.globGrant, "glob path grant\\n")`],
+      ["nested-sibling-of-deny", `fs.writeFileSync(paths.nestedAllowed, "nested allowed\\n")`],
+      ["deny-sibling", `fs.writeFileSync(paths.sibling, "changed\\n")`],
+      ["deny-equal-specificity-tie", `fs.writeFileSync(paths.equalSpecificity, "changed\\n")`],
+      ["deny-more-specific-nested-rule", `fs.writeFileSync(paths.nestedDenied, "changed\\n")`],
+      ["mandatory-git-config-deny", `fs.writeFileSync(paths.gitConfig, "changed\\n")`],
+      ["mandatory-git-hook-deny", `fs.writeFileSync(paths.gitHook, "changed\\n")`],
+      ["mandatory-pi-settings-deny", `fs.writeFileSync(paths.piSettings, "changed\\n")`],
+      ["mandatory-sandbox-config-deny", `fs.writeFileSync(paths.sandboxConfig, "changed\\n")`],
+      ["runtime-built-in-gitconfig-deny", `fs.writeFileSync(paths.runtimeGitConfig, "changed\\n")`],
+      ["runtime-built-in-bashrc-deny", `fs.writeFileSync(paths.runtimeShellConfig, "changed\\n")`],
+      [
+        "deny-symlink-replacement",
+        `fs.renameSync(paths.attackerLink, paths.protectedLink)`,
+      ],
+      [
+        "deny-symlink-at-nonexistent-protected-target",
+        `fs.symlinkSync("attacker-target", paths.missingProtectedLink)`,
+      ],
+      [
+        "deny-symlink-rename-to-nonexistent-protected-target",
+        `fs.renameSync(paths.attackerSymlink, paths.missingProtectedRenameLink)`,
+      ],
+      [
+        "deny-ancestor-directory-rename",
+        `fs.renameSync(paths.protectedAncestor, paths.movedAncestor)`,
+      ],
+    ] as const;
+    const marker = "__PI_SANDBOX_C2_RESULT__";
+    const probeSource = [
+      'const fs = require("node:fs");',
+      `const paths = ${JSON.stringify(paths)};`,
+      `const operations = ${JSON.stringify(operations)};`,
+      "const results = operations.map(([name, source]) => {",
+      "  try { Function(\"fs\", \"paths\", source)(fs, paths); return { name, status: \"ok\" }; }",
+      "  catch (error) { return { name, status: \"denied\", code: error.code }; }",
+      "});",
+      `process.stdout.write(${JSON.stringify(marker)} + JSON.stringify(results));`,
+    ].join("\n");
+    const output: Buffer[] = [];
+    const originalWrapWithSandbox = SandboxManager.wrapWithSandbox;
+    let observedSandboxExecWrapper = false;
+    SandboxManager.wrapWithSandbox = async (...args) => {
+      const wrapped = await originalWrapWithSandbox.apply(SandboxManager, args);
+      assert.match(wrapped, /\/usr\/bin\/sandbox-exec/, "production path must use sandbox-exec");
+      observedSandboxExecWrapper = true;
+      return wrapped;
+    };
+    let exitCode: number | null;
+    try {
+      ({ exitCode } = await createSandboxedBashOps().exec(
+        `${shellQuote(process.execPath)} -e ${shellQuote(probeSource)}`,
+        scratch,
+        {
+          onData: (data) => output.push(Buffer.from(data)),
+          env: { PATH: process.env.PATH, HOME: join(scratch, "home") },
+        },
+      ));
+    } finally {
+      SandboxManager.wrapWithSandbox = originalWrapWithSandbox;
+    }
+    assert.equal(
+      observedSandboxExecWrapper,
+      true,
+      "production exec must invoke sandbox-exec wrapper",
+    );
+    assert.equal(exitCode, 0, `sandbox probe exited nonzero:\n${Buffer.concat(output)}`);
+    const probeOutput = Buffer.concat(output).toString("utf8");
+    const markerIndex = probeOutput.lastIndexOf(marker);
+    assert.notEqual(markerIndex, -1, `sandbox probe emitted no results:\n${probeOutput}`);
+    const results = JSON.parse(probeOutput.slice(markerIndex + marker.length)) as Array<{
+      name: string;
+      status: "denied" | "ok";
+      code?: string;
+    }>;
+    assert.deepEqual(
+      results.map(({ name }) => name),
+      operations.map(([name]) => name),
+    );
+
+    const resultFor = (name: string) => results.find((result) => result.name === name);
+    for (const name of [
+      "create-in-narrow-grant",
+      "overwrite-in-narrow-grant",
+      "delete-in-narrow-grant",
+      "rename-in-narrow-grant",
+      "atomic-replace-in-narrow-grant",
+      "glob-deny-overridden-by-literal-grant",
+      "literal-deny-overridden-by-more-specific-glob-grant",
+      "glob-narrow-grant",
+      "nested-sibling-of-deny",
+    ]) {
+      assert.equal(resultFor(name)?.status, "ok", `narrower grant did not complete: ${name}`);
+    }
+    for (const name of [
+      "deny-sibling",
+      "deny-equal-specificity-tie",
+      "deny-more-specific-nested-rule",
+      "mandatory-git-config-deny",
+      "mandatory-git-hook-deny",
+      "mandatory-pi-settings-deny",
+      "mandatory-sandbox-config-deny",
+      "runtime-built-in-gitconfig-deny",
+      "runtime-built-in-bashrc-deny",
+      "deny-symlink-replacement",
+      "deny-symlink-at-nonexistent-protected-target",
+      "deny-symlink-rename-to-nonexistent-protected-target",
+      "deny-ancestor-directory-rename",
+    ]) {
+      const result = resultFor(name);
+      assert.equal(result?.status, "denied", `OS sandbox allowed protected write: ${name}`);
+      assert.ok(
+        result?.code === "EPERM" || result?.code === "EACCES",
+        `expected an OS permission denial for ${name}, received ${result?.code}`,
+      );
+    }
+
+    assert.equal(readFileSync(paths.created, "utf8"), "created\n");
+    assert.equal(readFileSync(paths.overwritten, "utf8"), "overwritten\n");
+    assert.equal(existsSync(paths.deleted), false);
+    assert.equal(existsSync(paths.renameSource), false);
+    assert.equal(readFileSync(paths.renameTarget, "utf8"), "rename source\n");
+    assert.equal(existsSync(paths.atomicTemp), false);
+    assert.equal(readFileSync(paths.atomicTarget, "utf8"), "atomic replacement\n");
+    assert.equal(readFileSync(paths.globDenyLiteralGrant, "utf8"), "literal grant\n");
+    assert.equal(readFileSync(paths.literalDenyGlobGrant, "utf8"), "glob grant\n");
+    assert.equal(readFileSync(paths.globGrant, "utf8"), "glob path grant\n");
+    assert.equal(readFileSync(paths.nestedAllowed, "utf8"), "nested allowed\n");
+    for (const [path, contents] of deniedOperationFiles) {
+      assert.equal(readFileSync(path, "utf8"), contents, `denied operation changed ${path}`);
+    }
+    assert.equal(readFileSync(paths.attackerLink, "utf8"), "attacker replacement\n");
+    assert.equal(readlinkSync(paths.attackerSymlink), "attacker-controlled-target");
+    assert.equal(readlinkSync(paths.protectedLink), "original-link-target");
+    assert.throws(() => lstatSync(paths.missingProtectedLink), { code: "ENOENT" });
+    assert.throws(() => lstatSync(paths.missingProtectedRenameLink), { code: "ENOENT" });
+    assert.equal(existsSync(paths.protectedAncestor), true);
+    assert.equal(existsSync(paths.movedAncestor), false);
+  } finally {
+    try {
+      await SandboxManager.reset();
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
   }
 });
