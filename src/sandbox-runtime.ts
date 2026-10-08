@@ -13,6 +13,10 @@ import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-a
 
 import { type SandboxConfig, validateCredentials } from "./config.ts";
 import { usesGitSshTransport } from "./diagnostics.ts";
+import {
+  adaptMacosWriteSpecificityProfile,
+  registerMacosWritePolicyProvenance,
+} from "./macos-write-specificity.ts";
 import { canonicalizePath, canonicalizePathPattern, decideDomainPolicy } from "./policy.ts";
 import { getProtectedSandboxConfigPaths } from "./sandbox-command.ts";
 import { getEffectiveFilesystemPolicy, getMandatoryWriteDenyPaths } from "./sandbox-filesystem.ts";
@@ -203,8 +207,17 @@ export function buildRuntimeConfig(
 ): SandboxRuntimeConfig {
   const effective = resolveAllowances(config, allowances, cwd);
   const protectedConfigPaths = getProtectedSandboxConfigPaths(cwd);
+  const ordinaryDenyWrite = canonicalizeFilesystemPatterns(config.filesystem?.denyWrite ?? [], cwd);
+  const mandatoryDenyWrite = canonicalizeFilesystemPatterns(
+    [
+      ...getMandatoryWriteDenyPaths(cwd),
+      protectedConfigPaths.projectPath,
+      protectedConfigPaths.globalPath,
+    ],
+    cwd,
+  );
   const credentials = canonicalizeCredentials(validateCredentials(config.credentials), cwd);
-  return {
+  const runtimeConfig: SandboxRuntimeConfig = {
     network: {
       ...config.network,
       // Runtime 0.0.70 evaluates deny rules before allow rules. Route every
@@ -222,15 +235,7 @@ export function buildRuntimeConfig(
         cwd,
       ),
       allowWrite: canonicalizeFilesystemPatterns(effective.writePaths, cwd),
-      denyWrite: canonicalizeFilesystemPatterns(
-        [
-          ...(config.filesystem?.denyWrite ?? []),
-          ...getMandatoryWriteDenyPaths(cwd),
-          protectedConfigPaths.projectPath,
-          protectedConfigPaths.globalPath,
-        ],
-        cwd,
-      ),
+      denyWrite: unique([...ordinaryDenyWrite, ...mandatoryDenyWrite]),
     },
     credentials,
     ignoreViolations: config.ignoreViolations,
@@ -239,6 +244,8 @@ export function buildRuntimeConfig(
     allowPty: config.allowPty,
     enableWeakerNetworkIsolation: true,
   };
+  registerMacosWritePolicyProvenance(runtimeConfig, ordinaryDenyWrite, mandatoryDenyWrite);
+  return runtimeConfig;
 }
 
 export async function initializeSandbox(
@@ -503,9 +510,17 @@ export function createSandboxedBashOps(shellPath?: string): BashOperations {
       };
 
       try {
-        const wrappedCommand = augmentMacosBrowserProfile(
+        const runtimeConfig = SandboxManager.getConfig();
+        const writeSpecificityAdapted = adaptMacosWriteSpecificityProfile(
           await SandboxManager.wrapWithSandbox(commandToWrap, shell),
-          SandboxManager.getConfig()?.allowBrowserProcess === true,
+          runtimeConfig,
+          process.platform,
+          commandToWrap,
+          shell,
+        );
+        const wrappedCommand = augmentMacosBrowserProfile(
+          writeSpecificityAdapted,
+          runtimeConfig?.allowBrowserProcess === true,
         );
         // The runtime only acquires a command-scoped cleanup resource when it
         // returns an actual wrapper. Calling cleanup for an unchanged command

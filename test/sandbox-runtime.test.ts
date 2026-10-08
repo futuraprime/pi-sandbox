@@ -6,10 +6,16 @@ import test, { mock, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { SandboxManager, type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
-import { globToRegex } from "@carderne/sandbox-runtime/dist/sandbox/sandbox-utils.js";
+import { wrapCommandWithSandboxMacOS } from "@carderne/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js";
+import {
+  getDefaultWritePaths,
+  globToRegex,
+  removeTrailingGlobSuffix,
+} from "@carderne/sandbox-runtime/dist/sandbox/sandbox-utils.js";
 import assert from "node:assert/strict";
 
 import { DEFAULT_CONFIG } from "../src/config.ts";
+import { adaptMacosWriteSpecificityProfile } from "../src/macos-write-specificity.ts";
 import { canonicalizePath } from "../src/policy.ts";
 import { getProtectedSandboxConfigPaths } from "../src/sandbox-command.ts";
 import { resolveDerivedFilesystemAllowances } from "../src/sandbox-filesystem.ts";
@@ -26,6 +32,87 @@ import {
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function generatedMacosWrapper(
+  config: SandboxRuntimeConfig,
+  command = "printf profile-test",
+  shell = "bash",
+): string {
+  const filesystem = config.filesystem!;
+  return wrapCommandWithSandboxMacOS({
+    command,
+    binShell: shell,
+    needsNetworkRestriction: false,
+    allowUnixSockets: [],
+    allowAllUnixSockets: false,
+    allowLocalBinding: false,
+    allowMachLookup: [],
+    allowPty: false,
+    allowBrowserProcess: false,
+    enableWeakerNetworkIsolation: false,
+    allowAppleEvents: false,
+    readConfig: { denyOnly: [], allowWithinDeny: [] },
+    writeConfig: {
+      allowOnly: [
+        ...getDefaultWritePaths(),
+        ...(filesystem.allowWrite ?? []).map(removeTrailingGlobSuffix),
+      ],
+      denyWithinAllow: (filesystem.denyWrite ?? []).map(removeTrailingGlobSuffix),
+    },
+  });
+}
+
+function decodedMacosProfile(wrapped: string): string {
+  const prefix = "/usr/bin/sandbox-exec -p '";
+  const prefixIndex = wrapped.indexOf(prefix);
+  assert.notEqual(prefixIndex, -1);
+  const start = prefixIndex + prefix.length - 1;
+  let end = -1;
+  for (let index = start + 1; index < wrapped.length; index += 1) {
+    if (wrapped.startsWith(`'"'"'`, index)) index += 4;
+    else if (wrapped[index] === "'") {
+      end = index;
+      break;
+    }
+  }
+  assert.notEqual(end, -1);
+  return wrapped.slice(start + 1, end).replaceAll(`'"'"'`, "'");
+}
+
+function macosWriteForms(profile: string): string[] {
+  const label = "; File write\n";
+  const marker = profile.indexOf(label);
+  assert.notEqual(marker, -1);
+  const start = marker + label.length;
+  const sectionEnd = profile.indexOf("\n;", start);
+  const section = profile.slice(start, sectionEnd < 0 ? undefined : sectionEnd);
+  const forms: string[] = [];
+  for (let index = 0; index < section.length; ) {
+    while (/\s/.test(section[index] ?? "")) index += 1;
+    if (index === section.length) break;
+    const formStart = index;
+    let depth = 0;
+    let quoted = false;
+    let escaped = false;
+    for (; index < section.length; index += 1) {
+      const character = section[index]!;
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (character === "\\") escaped = true;
+        else if (character === '"') quoted = false;
+      } else if (character === '"') quoted = true;
+      else if (character === "(") depth += 1;
+      else if (character === ")" && --depth === 0) {
+        index += 1;
+        forms.push(section.slice(formStart, index));
+        break;
+      }
+    }
+    assert.equal(depth, 0);
+    assert.equal(quoted, false);
+  }
+  return forms;
 }
 
 function createExecTestContext(
@@ -349,6 +436,233 @@ test("buildRuntimeConfig emits mandatory write denies ahead of configured write 
   assert.equal(runtime.filesystem?.allowWrite?.includes(cwd), true);
   assert.equal(runtime.filesystem?.allowWrite?.includes(join(cwd, ".pi")), true);
 });
+
+test("macOS write adapter narrows only less-specific ordinary denies", (t) => {
+  const cwd = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-c2-write-quote-'")));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const config = {
+    ...DEFAULT_CONFIG,
+    filesystem: {
+      ...DEFAULT_CONFIG.filesystem!,
+      allowRead: [cwd],
+      allowWrite: [
+        join(cwd, "area", "grant"),
+        join(cwd, "area", "glob-grant", "*"),
+        join(cwd, "glob-block", "literal-grant"),
+        join(cwd, "literal-block", "glob-grant", "*"),
+        join(cwd, "tie", "*"),
+        join(cwd, "nested"),
+        join(cwd, ".pi"),
+        join(cwd, ".pi", "nested-grant"),
+      ],
+      denyRead: [],
+      denyWrite: [
+        cwd,
+        join(cwd, "area", "**"),
+        join(cwd, "glob-block", "**"),
+        join(cwd, "literal-block"),
+        join(cwd, "tie", "*"),
+        join(cwd, "nested", "private"),
+        join(cwd, ".pi"),
+      ],
+    },
+  };
+  const runtime = buildRuntimeConfig(config, undefined, "darwin", cwd);
+  const original = generatedMacosWrapper(runtime);
+  const originalForms = macosWriteForms(decodedMacosProfile(original));
+  const adapted = adaptMacosWriteSpecificityProfile(original, runtime, "darwin");
+  const profile = decodedMacosProfile(adapted);
+  const forms = macosWriteForms(profile);
+  const tag = profile.match(/^\(deny default \(with message "([^"]+)"\)\)$/m)?.[1];
+  assert.ok(tag);
+
+  const allowWrite = runtime.filesystem!.allowWrite!;
+  const areaGrant = allowWrite.find((path) => path.endsWith("/area/grant"))!;
+  const globGrant = allowWrite.find((path) => path.endsWith("/area/glob-grant/*"))!;
+  const denyFor = (expression: string) =>
+    forms.find(
+      (form) =>
+        form.startsWith(`(deny file-write*\n  ${expression}\n`) ||
+        form.startsWith(`(deny file-write*\n  (require-all\n    ${expression}\n`),
+    );
+  const narrowableRootDeny = denyFor(`(subpath ${JSON.stringify(canonicalizePath(cwd))})`);
+  assert.ok(narrowableRootDeny?.includes("(require-all"));
+  assert.ok(narrowableRootDeny?.includes(`(require-not (subpath ${JSON.stringify(areaGrant)}))`));
+
+  const areaDeny = denyFor(`(subpath ${JSON.stringify(join(cwd, "area"))})`);
+  assert.ok(areaDeny?.includes(`(require-not (regex ${JSON.stringify(globToRegex(globGrant))}))`));
+  const globDeny = denyFor(`(subpath ${JSON.stringify(join(cwd, "glob-block"))})`);
+  assert.ok(
+    globDeny?.includes(
+      `(require-not (subpath ${JSON.stringify(join(cwd, "glob-block", "literal-grant"))}))`,
+    ),
+  );
+  const literalDeny = denyFor(`(subpath ${JSON.stringify(join(cwd, "literal-block"))})`);
+  const literalGlobGrant = allowWrite.find((path) => path.endsWith("/literal-block/glob-grant/*"))!;
+  assert.ok(
+    literalDeny?.includes(`(require-not (regex ${JSON.stringify(globToRegex(literalGlobGrant))}))`),
+  );
+
+  const tieGrant = allowWrite.find((path) => path.endsWith("/tie/*"))!;
+  const tieExpression = `(regex ${JSON.stringify(globToRegex(tieGrant))})`;
+  const tiedDeny = denyFor(tieExpression);
+  assert.ok(tiedDeny);
+  assert.ok(tiedDeny.includes(tieExpression));
+  assert.equal(tiedDeny.includes(`(require-not ${tieExpression})`), false);
+  const nestedDenyExpression = `(subpath ${JSON.stringify(join(cwd, "nested", "private"))})`;
+  const nestedDeny = denyFor(nestedDenyExpression);
+  assert.ok(nestedDeny);
+  assert.ok(nestedDeny.includes(nestedDenyExpression));
+  const nestedGrant = allowWrite.find((path) => path.endsWith("/nested"))!;
+  const nestedGrantExpression = `(subpath ${JSON.stringify(nestedGrant)})`;
+  assert.equal(nestedDeny.includes(`(require-not ${nestedGrantExpression})`), false);
+
+  const mandatoryPiDeny = denyFor(`(subpath ${JSON.stringify(join(cwd, ".pi"))})`);
+  assert.ok(mandatoryPiDeny);
+  assert.doesNotMatch(mandatoryPiDeny, /require-not/);
+  const originalLiteralSafeguards = originalForms.filter(
+    (form) =>
+      form.startsWith("(deny file-write-create\n  (literal ") ||
+      form.startsWith("(deny file-write-unlink\n  (literal "),
+  );
+  assert.ok(originalLiteralSafeguards.length > 0);
+  for (const operation of ["file-write-create", "file-write-unlink"]) {
+    assert.ok(
+      originalLiteralSafeguards.some((form) => form.startsWith(`(deny ${operation}\n  (literal `)),
+      `expected generated literal ${operation} safeguards`,
+    );
+  }
+  for (const safeguard of originalLiteralSafeguards) {
+    assert.ok(forms.includes(safeguard), `adapted profile must preserve ${safeguard}`);
+  }
+  const builtInDeny = denyFor(`(subpath ${JSON.stringify(join(process.cwd(), ".bashrc"))})`);
+  assert.ok(builtInDeny);
+  assert.doesNotMatch(builtInDeny, /require-not/);
+  assert.ok(profile.includes(cwd), "the decoded profile preserves apostrophes in configured paths");
+  assert.equal(adaptMacosWriteSpecificityProfile(adapted, runtime, "darwin"), adapted);
+});
+
+test("macOS write adapter fails closed for unsupported platforms, provenance, and profile shapes", (t) => {
+  const cwd = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-c2-write-guard-")));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const runtime = buildRuntimeConfig(
+    {
+      ...DEFAULT_CONFIG,
+      filesystem: {
+        ...DEFAULT_CONFIG.filesystem!,
+        allowRead: [cwd],
+        allowWrite: [join(cwd, "grant")],
+        denyRead: [],
+        denyWrite: [cwd],
+      },
+    },
+    undefined,
+    "darwin",
+    cwd,
+  );
+  const wrapped = generatedMacosWrapper(runtime);
+  assert.equal(adaptMacosWriteSpecificityProfile(wrapped, runtime, "linux"), wrapped);
+  assert.equal(adaptMacosWriteSpecificityProfile(wrapped, { ...runtime }, "darwin"), wrapped);
+  const originalAllowWrite = runtime.filesystem!.allowWrite![0]!;
+  runtime.filesystem!.allowWrite![0] = join(cwd, "mutated-grant");
+  assert.equal(adaptMacosWriteSpecificityProfile(wrapped, runtime, "darwin"), wrapped);
+  runtime.filesystem!.allowWrite![0] = originalAllowWrite;
+  const malformedProfileQuote = wrapped.replace(
+    "/usr/bin/sandbox-exec -p '",
+    "/usr/bin/sandbox-exec -p ",
+  );
+  assert.notEqual(malformedProfileQuote, wrapped);
+  assert.equal(
+    adaptMacosWriteSpecificityProfile(malformedProfileQuote, runtime, "darwin"),
+    malformedProfileQuote,
+  );
+
+  const unexpected = wrapped.replace(
+    "; File write\n",
+    '; File write\n(deny file-write* (literal "/unexpected-shape"))\n',
+  );
+  assert.notEqual(unexpected, wrapped);
+  assert.equal(adaptMacosWriteSpecificityProfile(unexpected, runtime, "darwin"), unexpected);
+  const adapted = adaptMacosWriteSpecificityProfile(wrapped, runtime, "darwin");
+  assert.notEqual(adapted, wrapped);
+  assert.equal(adaptMacosWriteSpecificityProfile(adapted, runtime, "darwin"), adapted);
+});
+
+test(
+  "createSandboxedBashOps adapts the generated profile using its real command and shell",
+  {
+    skip: process.platform !== "darwin",
+  },
+  async (t) => {
+    const cwd = canonicalizePath(
+      mkdtempSync(join(tmpdir(), "pi-sandbox-production-write-adapter-")),
+    );
+    const shellPath = join(cwd, "capture-shell");
+    const capturePath = join(cwd, "wrapped-command");
+    t.after(() => {
+      mock.restoreAll();
+      rmSync(cwd, { recursive: true, force: true });
+    });
+    writeFileSync(shellPath, '#!/bin/sh\nprintf \'%s\' "$2" > "$PI_SANDBOX_WRAPPED_CAPTURE"\n', {
+      mode: 0o755,
+    });
+
+    const runtime = buildRuntimeConfig(
+      {
+        ...DEFAULT_CONFIG,
+        filesystem: {
+          ...DEFAULT_CONFIG.filesystem!,
+          allowRead: [cwd],
+          allowWrite: [join(cwd, "grant")],
+          denyRead: [],
+          denyWrite: [cwd],
+        },
+      },
+      undefined,
+      "darwin",
+      cwd,
+    );
+    let observedCommand = "";
+    let observedShell = "";
+    mock.method(SandboxManager, "getConfig", () => runtime);
+    mock.method(SandboxManager, "wrapWithSandbox", async (command: string, shell: string) => {
+      observedCommand = command;
+      observedShell = shell;
+      return generatedMacosWrapper(runtime, command, shell);
+    });
+    mock.method(SandboxManager, "cleanupAfterCommand", () => {});
+
+    const command = "printf production-adapter-test";
+    const commandToWrap = `unset GIT_SSH_COMMAND; ${command}`;
+    const result = await createSandboxedBashOps(shellPath).exec(command, cwd, {
+      onData: () => {},
+      env: { ...process.env, PI_SANDBOX_WRAPPED_CAPTURE: capturePath },
+    });
+
+    assert.deepEqual(result, { exitCode: 0 });
+    assert.equal(observedCommand, commandToWrap);
+    assert.equal(observedShell, shellPath);
+    const generated = generatedMacosWrapper(runtime, commandToWrap, shellPath);
+    const spawnedCommand = readFileSync(capturePath, "utf8");
+    assert.notEqual(
+      spawnedCommand,
+      generated,
+      "the production wrapper must use the adapted profile",
+    );
+    const profile = decodedMacosProfile(spawnedCommand);
+    const rootDeny = macosWriteForms(profile).find(
+      (form) =>
+        form.startsWith("(deny file-write*") &&
+        form.includes(`(subpath ${JSON.stringify(canonicalizePath(cwd))})`),
+    );
+    assert.ok(rootDeny);
+    assert.ok(
+      rootDeny.includes(
+        `(require-not (subpath ${JSON.stringify(canonicalizePath(join(cwd, "grant")))}))`,
+      ),
+    );
+  },
+);
 
 test("runtime network callback applies shared specificity without deny-first short-circuiting", async () => {
   const callback = createNetworkAskCallback(["*", "api.example.com"], ["*.example.com"]);
