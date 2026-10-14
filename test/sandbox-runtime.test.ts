@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test, { mock, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -9,13 +9,17 @@ import { SandboxManager, type SandboxRuntimeConfig } from "@carderne/sandbox-run
 import { wrapCommandWithSandboxMacOS } from "@carderne/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js";
 import {
   getDefaultWritePaths,
+  containsGlobChars,
   globToRegex,
   removeTrailingGlobSuffix,
 } from "@carderne/sandbox-runtime/dist/sandbox/sandbox-utils.js";
 import assert from "node:assert/strict";
 
 import { DEFAULT_CONFIG } from "../src/config.ts";
-import { adaptMacosWriteSpecificityProfile } from "../src/macos-write-specificity.ts";
+import {
+  adaptMacosReadSpecificityProfile,
+  adaptMacosWriteSpecificityProfile,
+} from "../src/macos-write-specificity.ts";
 import { canonicalizePath } from "../src/policy.ts";
 import { getProtectedSandboxConfigPaths } from "../src/sandbox-command.ts";
 import { resolveDerivedFilesystemAllowances } from "../src/sandbox-filesystem.ts";
@@ -52,7 +56,15 @@ function generatedMacosWrapper(
     allowBrowserProcess: false,
     enableWeakerNetworkIsolation: false,
     allowAppleEvents: false,
-    readConfig: { denyOnly: [], allowWithinDeny: [] },
+    readConfig: {
+      denyOnly: [
+        ...(filesystem.denyRead ?? []),
+        ...(config.credentials?.files ?? [])
+          .filter((file) => file.mode === "deny" || file.mode === "mask")
+          .map((file) => file.path),
+      ].map(removeTrailingGlobSuffix),
+      allowWithinDeny: (filesystem.allowRead ?? []).map(removeTrailingGlobSuffix),
+    },
     writeConfig: {
       allowOnly: [
         ...getDefaultWritePaths(),
@@ -80,8 +92,7 @@ function decodedMacosProfile(wrapped: string): string {
   return wrapped.slice(start + 1, end).replaceAll(`'"'"'`, "'");
 }
 
-function macosWriteForms(profile: string): string[] {
-  const label = "; File write\n";
+function macosSectionForms(profile: string, label: string): string[] {
   const marker = profile.indexOf(label);
   assert.notEqual(marker, -1);
   const start = marker + label.length;
@@ -113,6 +124,52 @@ function macosWriteForms(profile: string): string[] {
     assert.equal(quoted, false);
   }
   return forms;
+}
+
+function macosWriteForms(profile: string): string[] {
+  return macosSectionForms(profile, "; File write\n");
+}
+
+function macosReadForms(profile: string): string[] {
+  return macosSectionForms(profile, "; File read\n");
+}
+
+function generatedMacosReadWrapper(
+  config: SandboxRuntimeConfig,
+  command = "printf profile-test",
+  shell = "bash",
+): string {
+  const filesystem = config.filesystem!;
+  const credentialDenyRead =
+    config.credentials?.files?.flatMap((file) =>
+      file.mode === "deny" || file.mode === "mask" ? [file.path] : [],
+    ) ?? [];
+  return wrapCommandWithSandboxMacOS({
+    command,
+    binShell: shell,
+    needsNetworkRestriction: false,
+    allowUnixSockets: [],
+    allowAllUnixSockets: false,
+    allowLocalBinding: false,
+    allowMachLookup: [],
+    allowPty: false,
+    allowBrowserProcess: false,
+    enableWeakerNetworkIsolation: false,
+    allowAppleEvents: false,
+    readConfig: {
+      denyOnly: [...(filesystem.denyRead ?? []), ...credentialDenyRead].map(
+        removeTrailingGlobSuffix,
+      ),
+      allowWithinDeny: (filesystem.allowRead ?? []).map(removeTrailingGlobSuffix),
+    },
+    writeConfig: {
+      allowOnly: [
+        ...getDefaultWritePaths(),
+        ...(filesystem.allowWrite ?? []).map(removeTrailingGlobSuffix),
+      ],
+      denyWithinAllow: (filesystem.denyWrite ?? []).map(removeTrailingGlobSuffix),
+    },
+  });
 }
 
 function createExecTestContext(
@@ -542,6 +599,239 @@ test("macOS write adapter narrows only less-specific ordinary denies", (t) => {
   assert.equal(adaptMacosWriteSpecificityProfile(adapted, runtime, "darwin"), adapted);
 });
 
+test("macOS read adapter guards ordinary denies only against more-specific grants", (t) => {
+  const cwd = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-c1-read-matrix-")));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const paths = {
+    nestedGlobDeny: join(cwd, "area", "private", "**", "secret.txt"),
+    literalDeny: join(cwd, "literal-zone"),
+    globGrant: join(cwd, "literal-zone", "public", "**", "safe.txt"),
+    globDeny: join(cwd, "glob-zone", "private", "**", "secret.txt"),
+    literalGrant: join(cwd, "glob-zone", "private", "deep", "safe.txt"),
+    tie: join(cwd, "tie", "**", "same.txt"),
+    siblingDeny: join(cwd, "siblings", "private", "**", "secret.txt"),
+    siblingGrant: join(cwd, "siblings", "public", "specific", "**", "safe.txt"),
+    narrowerDeny: join(cwd, "deep", "private", "secret.txt"),
+    broaderGrant: join(cwd, "deep"),
+  };
+  const runtime = buildRuntimeConfig(
+    {
+      ...DEFAULT_CONFIG,
+      filesystem: {
+        ...DEFAULT_CONFIG.filesystem!,
+        denyRead: [
+          paths.nestedGlobDeny,
+          paths.literalDeny,
+          paths.globDeny,
+          paths.tie,
+          paths.siblingDeny,
+          paths.narrowerDeny,
+        ],
+        allowRead: [
+          join(cwd, "area"),
+          paths.globGrant,
+          paths.literalGrant,
+          paths.tie,
+          paths.siblingGrant,
+          paths.broaderGrant,
+        ],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    },
+    undefined,
+    "darwin",
+    cwd,
+  );
+  const expression = (pattern: string) => {
+    const normalized = removeTrailingGlobSuffix(pattern);
+    return containsGlobChars(normalized)
+      ? `(regex ${JSON.stringify(globToRegex(normalized))})`
+      : `(subpath ${JSON.stringify(normalized)})`;
+  };
+  const original = generatedMacosReadWrapper(runtime);
+  const originalProfile = decodedMacosProfile(original);
+  const originalReadForms = macosReadForms(originalProfile);
+  const originalWriteForms = macosWriteForms(originalProfile);
+  const nestedDenyIndex = originalProfile.indexOf(expression(paths.nestedGlobDeny));
+  const literalAllowIndex = originalProfile.indexOf(expression(join(cwd, "area")));
+  assert.ok(nestedDenyIndex >= 0 && nestedDenyIndex < literalAllowIndex);
+  const adapted = adaptMacosReadSpecificityProfile(original, runtime, "darwin");
+  const profile = decodedMacosProfile(adapted);
+  const marker = "; pi-sandbox read specificity\n";
+  const finalRules = profile.slice(profile.lastIndexOf(marker) + marker.length);
+  const finalRuleForms = macosSectionForms(profile, marker);
+  const finalRuleFor = (operation: string, pattern: string) =>
+    finalRuleForms.find(
+      (form) =>
+        form.startsWith(`(deny ${operation}\n  (require-all\n    ${expression(pattern)}\n`) ||
+        form.startsWith(`(deny ${operation}\n  ${expression(pattern)}\n`),
+    );
+
+  assert.notEqual(adapted, original);
+  assert.ok(finalRules.includes(`(require-not ${expression(paths.globGrant)})`));
+  assert.ok(finalRules.includes(`(require-not ${expression(paths.literalGrant)})`));
+  assert.ok(finalRules.includes(`(require-not ${expression(paths.siblingGrant)})`));
+  const narrowerDenyRule = finalRuleFor("file-read*", paths.narrowerDeny);
+  assert.ok(narrowerDenyRule);
+  assert.ok(narrowerDenyRule.includes("(require-not (vnode-type DIRECTORY))"));
+  assert.equal(narrowerDenyRule.includes(`(require-not ${expression(paths.broaderGrant)})`), false);
+  const tieDataDeny = finalRuleFor("file-read-data", paths.tie);
+  assert.ok(tieDataDeny);
+  assert.equal(tieDataDeny.includes(`(require-not ${expression(paths.tie)})`), false);
+  const tieDeny = finalRuleForms.find((form) =>
+    form.startsWith(`(deny file-read*\n  (require-all\n    ${expression(paths.tie)}\n`),
+  );
+  assert.ok(tieDeny);
+  assert.equal(
+    tieDeny.includes(`(require-not ${expression(paths.tie)})`),
+    false,
+    "an equal-specificity grant must not override its deny",
+  );
+  assert.deepEqual(
+    macosReadForms(profile).filter((form) => !form.startsWith("(deny file-read")),
+    originalReadForms.filter((form) => !form.startsWith("(deny file-read")),
+  );
+  assert.deepEqual(macosWriteForms(profile), originalWriteForms);
+  assert.equal(
+    profile.match(/\(allow file-read-metadata\s+\(vnode-type DIRECTORY\)\)/g)?.length,
+    1,
+    "directory traversal metadata must remain unchanged",
+  );
+  assert.equal(adaptMacosReadSpecificityProfile(adapted, runtime, "darwin"), adapted);
+
+  const rootGrant = join(cwd, "root-deny", "narrow-grant");
+  const rootRuntime = buildRuntimeConfig(
+    {
+      ...DEFAULT_CONFIG,
+      filesystem: {
+        ...DEFAULT_CONFIG.filesystem!,
+        denyRead: ["/"],
+        allowRead: [rootGrant],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    },
+    undefined,
+    "darwin",
+    cwd,
+  );
+  const rootAdapted = adaptMacosReadSpecificityProfile(
+    generatedMacosReadWrapper(rootRuntime),
+    rootRuntime,
+    "darwin",
+  );
+  const rootProfile = decodedMacosProfile(rootAdapted);
+  const rootFinalRules = macosSectionForms(rootProfile, marker);
+  const rootDeny = rootFinalRules.find((form) => form.startsWith("(deny file-read-data\n"));
+  assert.ok(rootDeny);
+  assert.ok(rootDeny.includes(`(require-not ${expression(rootGrant)})`));
+  assert.ok(rootDeny.includes('(require-not (literal "/"))'));
+  assert.ok(rootProfile.includes('(allow file-read* (literal "/"))'));
+});
+
+test("macOS read adapter leaves credential denies hard and preserves generated rules", (t) => {
+  const cwd = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-c1-credential-")));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const credentialPath = join(cwd, "area", "credential.json");
+  const maskedCredentialPath = join(cwd, "area", "masked-credential.json");
+  mkdirSync(dirname(maskedCredentialPath), { recursive: true });
+  writeFileSync(maskedCredentialPath, "credential fixture");
+  const runtime = buildRuntimeConfig(
+    {
+      ...DEFAULT_CONFIG,
+      credentials: {
+        files: [
+          { path: credentialPath, mode: "deny" },
+          { path: maskedCredentialPath, mode: "mask", injectHosts: ["example.invalid"] },
+        ],
+      },
+      filesystem: {
+        ...DEFAULT_CONFIG.filesystem!,
+        denyRead: [join(cwd, "area", "**", "private.txt")],
+        allowRead: [join(cwd, "area")],
+        allowWrite: [join(cwd, "write")],
+        denyWrite: [join(cwd, "write", "blocked")],
+      },
+    },
+    undefined,
+    "darwin",
+    cwd,
+  );
+  const original = generatedMacosReadWrapper(runtime);
+  const originalProfile = decodedMacosProfile(original);
+  const adapted = adaptMacosReadSpecificityProfile(original, runtime, "darwin");
+  const profile = decodedMacosProfile(adapted);
+  const marker = "; pi-sandbox read specificity\n";
+  const finalRules = profile.slice(profile.lastIndexOf(marker) + marker.length);
+  const credentialMatcher = `(subpath ${JSON.stringify(credentialPath)})`;
+  const maskedCredentialMatcher = `(subpath ${JSON.stringify(maskedCredentialPath)})`;
+  const credentialDeny = `(deny file-read*\n  ${credentialMatcher}\n`;
+  const maskedCredentialDeny = `(deny file-read*\n  ${maskedCredentialMatcher}\n`;
+
+  assert.ok(finalRules.includes(credentialDeny));
+  assert.ok(finalRules.includes(maskedCredentialDeny));
+  assert.equal(finalRules.includes(`(require-not ${credentialMatcher})`), false);
+  assert.equal(finalRules.includes(`(require-not ${maskedCredentialMatcher})`), false);
+  const originalReadForms = macosReadForms(originalProfile);
+  const adaptedReadForms = macosReadForms(profile);
+  const originalCredentialDeny = originalReadForms.find(
+    (form) => form.startsWith("(deny file-read*") && form.includes(credentialMatcher),
+  );
+  assert.ok(originalCredentialDeny);
+  assert.ok(adaptedReadForms.includes(originalCredentialDeny));
+  assert.deepEqual(
+    adaptedReadForms.filter((form) => !form.startsWith("(deny file-read")),
+    originalReadForms.filter((form) => !form.startsWith("(deny file-read")),
+  );
+  assert.deepEqual(macosWriteForms(profile), macosWriteForms(originalProfile));
+  assert.equal(
+    profile.match(/\(allow file-read-metadata\s+\(vnode-type DIRECTORY\)\)/g)?.length,
+    1,
+  );
+});
+
+test("macOS read adapter blocks when the correction cannot be verified", (t) => {
+  const cwd = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-c1-read-guard-")));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const runtime = buildRuntimeConfig(
+    {
+      ...DEFAULT_CONFIG,
+      filesystem: {
+        ...DEFAULT_CONFIG.filesystem!,
+        denyRead: [join(cwd, "**", "private.txt")],
+        allowRead: [cwd],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    },
+    undefined,
+    "darwin",
+    cwd,
+  );
+  const wrapped = generatedMacosReadWrapper(runtime);
+  assert.throws(
+    () => adaptMacosReadSpecificityProfile(wrapped, { ...runtime }, "darwin"),
+    /provenance/i,
+  );
+  const originalAllowRead = runtime.filesystem!.allowRead![0]!;
+  runtime.filesystem!.allowRead![0] = join(cwd, "mutated");
+  assert.throws(() => adaptMacosReadSpecificityProfile(wrapped, runtime, "darwin"), /changed/i);
+  runtime.filesystem!.allowRead![0] = originalAllowRead;
+  const malformed = wrapped.replace("/usr/bin/sandbox-exec -p '", "/usr/bin/sandbox-exec -p ");
+  assert.throws(() => adaptMacosReadSpecificityProfile(malformed, runtime, "darwin"), /profile/i);
+  const unexpected = wrapped.replace(
+    "; File read\n",
+    '; File read\n(deny file-read* (literal "/unexpected-shape"))\n',
+  );
+  assert.throws(() => adaptMacosReadSpecificityProfile(unexpected, runtime, "darwin"), /profile/i);
+  assert.equal(adaptMacosReadSpecificityProfile(wrapped, runtime, "linux"), wrapped);
+  assert.throws(
+    () => adaptMacosReadSpecificityProfile(wrapped, undefined, "darwin"),
+    /provenance/i,
+  );
+});
+
 test("macOS write adapter fails closed for unsupported platforms, provenance, and profile shapes", (t) => {
   const cwd = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-c2-write-guard-")));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
@@ -612,9 +902,9 @@ test(
         ...DEFAULT_CONFIG,
         filesystem: {
           ...DEFAULT_CONFIG.filesystem!,
-          allowRead: [cwd],
+          allowRead: [cwd, join(cwd, "secret", "public")],
           allowWrite: [join(cwd, "grant")],
-          denyRead: [],
+          denyRead: [join(cwd, "secret")],
           denyWrite: [cwd],
         },
       },
@@ -660,6 +950,70 @@ test(
       rootDeny.includes(
         `(require-not (subpath ${JSON.stringify(canonicalizePath(join(cwd, "grant")))}))`,
       ),
+    );
+    const readRules = macosSectionForms(profile, "; pi-sandbox read specificity\n");
+    assert.ok(readRules.some((form) => form.startsWith("(deny file-read-data\n")));
+    assert.ok(
+      readRules.some(
+        (form) =>
+          form.startsWith("(deny file-read*\n") &&
+          form.includes("(require-not (vnode-type DIRECTORY))"),
+      ),
+    );
+  },
+);
+
+test(
+  "createSandboxedBashOps blocks required read-policy correction when the generated profile is unknown",
+  { skip: process.platform !== "darwin" },
+  async (t) => {
+    const cwd = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-c1-production-guard-")));
+    const shellPath = join(cwd, "capture-shell");
+    const executionMarker = join(cwd, "spawned");
+    t.after(() => {
+      mock.restoreAll();
+      rmSync(cwd, { recursive: true, force: true });
+    });
+    writeFileSync(shellPath, `#!/bin/sh\nprintf invoked > ${shellQuote(executionMarker)}\n`, {
+      mode: 0o755,
+    });
+
+    const runtime = buildRuntimeConfig(
+      {
+        ...DEFAULT_CONFIG,
+        filesystem: {
+          ...DEFAULT_CONFIG.filesystem!,
+          denyRead: [join(cwd, "private")],
+          allowRead: [cwd],
+          allowWrite: [],
+          denyWrite: [],
+        },
+      },
+      undefined,
+      "darwin",
+      cwd,
+    );
+    mock.method(SandboxManager, "getConfig", () => runtime);
+    mock.method(SandboxManager, "wrapWithSandbox", async (command: string, shell: string) =>
+      generatedMacosReadWrapper(runtime, command, shell).replace(
+        "; File read\n",
+        '; File read\n(allow file-read* (literal "/unknown-profile-shape"))\n',
+      ),
+    );
+    const cleanup = mock.method(SandboxManager, "cleanupAfterCommand", () => {});
+
+    await assert.rejects(
+      createSandboxedBashOps(shellPath).exec("printf must-not-run", cwd, {
+        onData: () => {},
+        env: { ...process.env },
+      }),
+      /cannot verify the macOS read profile/i,
+    );
+    assert.throws(() => readFileSync(executionMarker), { code: "ENOENT" });
+    assert.equal(
+      cleanup.mock.callCount(),
+      1,
+      "wrapper resources are cleaned after fail-closed rejection",
     );
   },
 );

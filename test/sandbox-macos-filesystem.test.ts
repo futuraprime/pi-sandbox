@@ -280,6 +280,239 @@ test("macOS OS sandbox enforces protected project and Git writes despite explici
   }
 });
 
+test("macOS C-1 read precedence follows path specificity through Seatbelt", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("macOS-only OS enforcement regression test");
+    return;
+  }
+
+  const scratch = realpathSync(mkdtempSync(join(process.cwd(), ".pi-sandbox-c1-")));
+  try {
+    const paths = {
+      nestedDenied: join(scratch, "area", "private", "deep", "secret.txt"),
+      siblingAllowed: join(scratch, "area", "public.txt"),
+      literalDenyGlobGrant: join(scratch, "literal-zone", "public", "allowed.txt"),
+      literalDenyBlockedSibling: join(scratch, "literal-zone", "private", "blocked.txt"),
+      globDenyLiteralGrant: join(scratch, "glob-zone", "private", "allowed.txt"),
+      globDenyBlockedSibling: join(scratch, "glob-zone", "private", "blocked.txt"),
+      equalSpecificity: join(scratch, "tie", "same.txt"),
+      credential: join(scratch, "area", "credential.json"),
+      maskedCredential: join(scratch, "area", "masked-credential.json"),
+      deniedDirectoryFile: join(scratch, "area", "denied-directory", "private.txt"),
+    };
+    const deniedDirectory = dirname(paths.deniedDirectoryFile);
+    for (const path of Object.values(paths)) {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, `${path}\n`);
+    }
+
+    const runtimeConfig = buildRuntimeConfig(
+      {
+        ...DEFAULT_CONFIG,
+        network: { ...DEFAULT_CONFIG.network!, allowedDomains: [], deniedDomains: [] },
+        credentials: {
+          files: [
+            { path: paths.credential, mode: "deny" },
+            { path: paths.maskedCredential, mode: "mask", injectHosts: ["example.invalid"] },
+          ],
+        },
+        filesystem: {
+          denyRead: [
+            deniedDirectory,
+            join(scratch, "area", "private", "**", "secret.txt"),
+            join(scratch, "literal-zone"),
+            join(scratch, "glob-zone", "**", "blocked.txt"),
+            join(scratch, "tie", "*"),
+          ],
+          allowRead: [
+            scratch,
+            join(scratch, "literal-zone", "public", "*"),
+            join(scratch, "glob-zone", "private", "allowed.txt"),
+            join(scratch, "tie", "*"),
+          ],
+          allowWrite: [],
+          denyWrite: [],
+        },
+      },
+      undefined,
+      "darwin",
+      scratch,
+    );
+    await SandboxManager.initialize(runtimeConfig, async () => false);
+
+    const marker = "__PI_SANDBOX_C1_READ_RESULT__";
+    const probeSource = [
+      'const fs = require("node:fs");',
+      `const paths = ${JSON.stringify(paths)};`,
+      "const results = Object.entries(paths).map(([name, path]) => {",
+      '  try { return { name, status: "read", value: fs.readFileSync(path, "utf8") }; }',
+      '  catch (error) { return { name, status: "denied", code: error.code }; }',
+      "});",
+      `try { results.push({ name: "deniedDirectoryTraversal", status: "read", value: fs.realpathSync(${JSON.stringify(deniedDirectory)}) }); }`,
+      'catch (error) { results.push({ name: "deniedDirectoryTraversal", status: "denied", code: error.code }); }',
+      `try { results.push({ name: "deniedDirectoryListing", status: "read", value: fs.readdirSync(${JSON.stringify(deniedDirectory)}) }); }`,
+      'catch (error) { results.push({ name: "deniedDirectoryListing", status: "denied", code: error.code }); }',
+      `try { results.push({ name: "rootTraversal", status: "read", value: fs.realpathSync("/") }); }`,
+      'catch (error) { results.push({ name: "rootTraversal", status: "denied", code: error.code }); }',
+      `process.stdout.write(${JSON.stringify(marker)} + JSON.stringify(results));`,
+    ].join("\n");
+    const output: Buffer[] = [];
+    const result = await createSandboxedBashOps().exec(
+      `${shellQuote(process.execPath)} -e ${shellQuote(probeSource)}`,
+      scratch,
+      {
+        onData: (data) => output.push(Buffer.from(data)),
+        env: { PATH: process.env.PATH, HOME: join(scratch, "home") },
+      },
+    );
+    assert.equal(result.exitCode, 0, `sandbox read probe failed:\n${Buffer.concat(output)}`);
+    const text = Buffer.concat(output).toString("utf8");
+    const markerIndex = text.lastIndexOf(marker);
+    assert.notEqual(markerIndex, -1, `sandbox read probe emitted no results:\n${text}`);
+    const results = JSON.parse(text.slice(markerIndex + marker.length)) as Array<{
+      name: string;
+      status: "denied" | "read";
+      value?: string;
+      code?: string;
+    }>;
+    const resultFor = (name: string) => results.find((entry) => entry.name === name);
+
+    for (const name of [
+      "siblingAllowed",
+      "literalDenyGlobGrant",
+      "globDenyLiteralGrant",
+    ] as const) {
+      assert.equal(
+        resultFor(name)?.status,
+        "read",
+        `higher-specificity read grant failed: ${name}: ${JSON.stringify(results)}`,
+      );
+    }
+    for (const name of [
+      "nestedDenied",
+      "literalDenyBlockedSibling",
+      "globDenyBlockedSibling",
+      "equalSpecificity",
+      "credential",
+      "maskedCredential",
+      "deniedDirectoryFile",
+      "deniedDirectoryListing",
+    ]) {
+      const entry = resultFor(name);
+      assert.equal(entry?.status, "denied", `Seatbelt allowed denied read: ${name}`);
+      assert.ok(
+        entry?.code === "EPERM" || entry?.code === "EACCES",
+        `expected OS read denial for ${name}, got ${entry?.code}`,
+      );
+    }
+    assert.equal(
+      resultFor("deniedDirectoryTraversal")?.status,
+      "read",
+      `directory metadata needed for traversal was denied: ${JSON.stringify(results)}`,
+    );
+    assert.equal(
+      resultFor("rootTraversal")?.status,
+      "read",
+      `pinned literal root access was denied: ${JSON.stringify(results)}`,
+    );
+  } finally {
+    try {
+      await SandboxManager.reset();
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }
+});
+
+test("macOS C-1 root read deny permits only narrower grants through Seatbelt", async (t) => {
+  if (process.platform !== "darwin") {
+    t.skip("macOS-only OS enforcement regression test");
+    return;
+  }
+
+  const scratch = realpathSync(mkdtempSync(join(process.cwd(), ".pi-sandbox-c1-root-")));
+  try {
+    const allowedFile = join(scratch, "narrow", "allowed.txt");
+    const deniedFile = join(scratch, "narrow", "blocked.txt");
+    mkdirSync(dirname(allowedFile), { recursive: true });
+    writeFileSync(allowedFile, "explicitly allowed\n");
+    writeFileSync(deniedFile, "must stay denied\n");
+    const runtimeConfig = buildRuntimeConfig(
+      {
+        ...DEFAULT_CONFIG,
+        filesystem: {
+          ...DEFAULT_CONFIG.filesystem!,
+          denyRead: ["/"],
+          allowRead: [
+            "/System",
+            "/usr",
+            "/Library",
+            "/bin",
+            "/sbin",
+            "/dev",
+            "/etc",
+            "/private/var",
+            dirname(process.execPath),
+            process.execPath,
+            allowedFile,
+          ],
+          allowWrite: [],
+          denyWrite: [],
+        },
+      },
+      undefined,
+      "darwin",
+      scratch,
+    );
+    await SandboxManager.initialize(runtimeConfig, async () => false);
+
+    const marker = "__PI_SANDBOX_C1_ROOT_RESULT__";
+    const probeSource = [
+      'const fs = require("node:fs");',
+      `const paths = ${JSON.stringify({ allowedFile, deniedFile })};`,
+      "const results = Object.entries(paths).map(([name, path]) => {",
+      '  try { return { name, status: "read", value: fs.readFileSync(path, "utf8") }; }',
+      '  catch (error) { return { name, status: "denied", code: error.code }; }',
+      "});",
+      'try { results.push({ name: "rootTraversal", status: "read", value: fs.realpathSync("/") }); }',
+      'catch (error) { results.push({ name: "rootTraversal", status: "denied", code: error.code }); }',
+      `process.stdout.write(${JSON.stringify(marker)} + JSON.stringify(results));`,
+    ].join("\n");
+    const output: Buffer[] = [];
+    const result = await createSandboxedBashOps().exec(
+      `${shellQuote(process.execPath)} -e ${shellQuote(probeSource)}`,
+      scratch,
+      {
+        onData: (data) => output.push(Buffer.from(data)),
+        env: { PATH: process.env.PATH, HOME: join(scratch, "home") },
+      },
+    );
+    assert.equal(result.exitCode, 0, `root-deny read probe failed:\n${Buffer.concat(output)}`);
+    const text = Buffer.concat(output).toString("utf8");
+    const markerIndex = text.lastIndexOf(marker);
+    assert.notEqual(markerIndex, -1, `root-deny probe emitted no results:\n${text}`);
+    const results = JSON.parse(text.slice(markerIndex + marker.length)) as Array<{
+      name: string;
+      status: "denied" | "read";
+      value?: string;
+      code?: string;
+    }>;
+    const resultFor = (name: string) => results.find((entry) => entry.name === name);
+    assert.equal(resultFor("allowedFile")?.status, "read", JSON.stringify(results));
+    assert.equal(resultFor("allowedFile")?.value, "explicitly allowed\n");
+    const denied = resultFor("deniedFile");
+    assert.equal(denied?.status, "denied", `root deny was overridden: ${JSON.stringify(results)}`);
+    assert.ok(denied?.code === "EPERM" || denied?.code === "EACCES", JSON.stringify(results));
+    assert.equal(resultFor("rootTraversal")?.status, "read", JSON.stringify(results));
+  } finally {
+    try {
+      await SandboxManager.reset();
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }
+});
+
 test("macOS C-2 write precedence follows path specificity through the OS sandbox", async (t) => {
   if (process.platform !== "darwin") {
     t.skip("macOS-only OS enforcement regression test");

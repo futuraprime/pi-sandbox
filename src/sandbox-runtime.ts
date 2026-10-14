@@ -14,7 +14,9 @@ import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-a
 import { type SandboxConfig, validateCredentials } from "./config.ts";
 import { usesGitSshTransport } from "./diagnostics.ts";
 import {
+  adaptMacosReadSpecificityProfile,
   adaptMacosWriteSpecificityProfile,
+  registerMacosReadPolicyProvenance,
   registerMacosWritePolicyProvenance,
 } from "./macos-write-specificity.ts";
 import { canonicalizePath, canonicalizePathPattern, decideDomainPolicy } from "./policy.ts";
@@ -244,6 +246,7 @@ export function buildRuntimeConfig(
     allowPty: config.allowPty,
     enableWeakerNetworkIsolation: true,
   };
+  registerMacosReadPolicyProvenance(runtimeConfig);
   registerMacosWritePolicyProvenance(runtimeConfig, ordinaryDenyWrite, mandatoryDenyWrite);
   return runtimeConfig;
 }
@@ -511,21 +514,28 @@ export function createSandboxedBashOps(shellPath?: string): BashOperations {
 
       try {
         const runtimeConfig = SandboxManager.getConfig();
+        const generatedCommand = await SandboxManager.wrapWithSandbox(commandToWrap, shell);
+        // Track wrapper-owned resources before profile validation can reject the
+        // generated command, so cleanup still runs on a fail-closed adapter error.
+        cleanupRequired = generatedCommand !== commandToWrap;
         const writeSpecificityAdapted = adaptMacosWriteSpecificityProfile(
-          await SandboxManager.wrapWithSandbox(commandToWrap, shell),
+          generatedCommand,
           runtimeConfig,
           process.platform,
           commandToWrap,
           shell,
         );
-        const wrappedCommand = augmentMacosBrowserProfile(
+        const browserAdapted = augmentMacosBrowserProfile(
           writeSpecificityAdapted,
           runtimeConfig?.allowBrowserProcess === true,
         );
-        // The runtime only acquires a command-scoped cleanup resource when it
-        // returns an actual wrapper. Calling cleanup for an unchanged command
-        // could decrement the active count belonging to another command.
-        cleanupRequired = wrappedCommand !== commandToWrap;
+        const wrappedCommand = adaptMacosReadSpecificityProfile(
+          browserAdapted,
+          runtimeConfig,
+          process.platform,
+          commandToWrap,
+          shell,
+        );
 
         child = spawn(shell, [...args, wrappedCommand], {
           cwd,

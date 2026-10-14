@@ -18,8 +18,18 @@ interface WritePolicyProvenance {
   mandatoryDenyWrite: string[];
 }
 
+interface ReadPolicyProvenance {
+  filesystemDisabled: boolean;
+  allowRead: string[];
+  denyRead: string[];
+  credentialFiles: string;
+}
+
 const provenance = new WeakMap<SandboxRuntimeConfig, WritePolicyProvenance>();
+const readProvenance = new WeakMap<SandboxRuntimeConfig, ReadPolicyProvenance>();
+const readSectionLabel = "; File read\n";
 const writeSectionLabel = "; File write\n";
+const readSpecificityMarker = "; pi-sandbox read specificity";
 const shellProfilePrefix = "/usr/bin/sandbox-exec -p '";
 
 type ProfileForm = { text: string; start: number; end: number };
@@ -35,6 +45,15 @@ export function registerMacosWritePolicyProvenance(
     denyWrite: [...(config.filesystem?.denyWrite ?? [])],
     ordinaryDenyWrite: [...ordinaryDenyWrite],
     mandatoryDenyWrite: [...mandatoryDenyWrite],
+  });
+}
+
+export function registerMacosReadPolicyProvenance(config: SandboxRuntimeConfig): void {
+  readProvenance.set(config, {
+    filesystemDisabled: config.filesystem?.disabled === true,
+    allowRead: [...(config.filesystem?.allowRead ?? [])],
+    denyRead: [...(config.filesystem?.denyRead ?? [])],
+    credentialFiles: JSON.stringify(config.credentials?.files ?? []),
   });
 }
 
@@ -61,10 +80,10 @@ function shellQuoteProfile(profile: string): string {
   return `'${profile.replaceAll("'", `'"'"'`)}'`;
 }
 
-function profileWriteSection(profile: string): { forms: ProfileForm[] } | null {
-  const marker = profile.indexOf(writeSectionLabel);
-  if (marker < 0 || profile.indexOf(writeSectionLabel, marker + 1) >= 0) return null;
-  const start = marker + writeSectionLabel.length;
+function profileSection(profile: string, label: string): { forms: ProfileForm[] } | null {
+  const marker = profile.indexOf(label);
+  if (marker < 0 || profile.indexOf(label, marker + 1) >= 0) return null;
+  const start = marker + label.length;
   const nextSection = profile.indexOf("\n;", start);
   const end = nextSection < 0 ? profile.length : nextSection;
   const section = profile.slice(start, end);
@@ -102,6 +121,14 @@ function profileWriteSection(profile: string): { forms: ProfileForm[] } | null {
     if (depth !== 0 || quoted) return null;
   }
   return { forms };
+}
+
+function profileReadSection(profile: string): { forms: ProfileForm[] } | null {
+  return profileSection(profile, readSectionLabel);
+}
+
+function profileWriteSection(profile: string): { forms: ProfileForm[] } | null {
+  return profileSection(profile, writeSectionLabel);
 }
 
 function profileTag(profile: string): string | null {
@@ -164,6 +191,233 @@ function referenceWriteSection(
   );
   if (firstMove < allowCount) return null;
   return { ...section, allowCount, denyCount: firstMove - allowCount, tag };
+}
+
+function referenceReadSection(
+  config: SandboxRuntimeConfig,
+  command: string,
+  shell: string,
+): { forms: ProfileForm[]; tag: string } | null {
+  const filesystem = config.filesystem;
+  if (!filesystem || filesystem.disabled || !filesystem.allowRead || !filesystem.denyRead)
+    return null;
+  if (config.network?.tlsTerminate) return null;
+
+  const credentialFiles = config.credentials?.files ?? [];
+  const credentialDenyRead = credentialFiles
+    .filter((file) => file.mode === "deny")
+    .map((file) => file.path);
+  const maskedCredentialFiles = credentialFiles
+    .filter((file) => file.mode === "mask")
+    .map((file) => file.path);
+  const denyOnly = [
+    ...new Set([...filesystem.denyRead, ...credentialDenyRead]),
+    ...maskedCredentialFiles,
+  ].map(removeTrailingGlobSuffix);
+  const referenceCommand = wrapCommandWithSandboxMacOS({
+    command,
+    binShell: shell,
+    needsNetworkRestriction: false,
+    allowUnixSockets: [],
+    allowAllUnixSockets: false,
+    allowLocalBinding: false,
+    allowMachLookup: [],
+    allowPty: false,
+    allowBrowserProcess: false,
+    enableWeakerNetworkIsolation: false,
+    allowAppleEvents: false,
+    readConfig: {
+      denyOnly,
+      allowWithinDeny: filesystem.allowRead.map(removeTrailingGlobSuffix),
+    },
+    writeConfig: {
+      allowOnly: [
+        ...getDefaultWritePaths(),
+        ...(filesystem.allowWrite ?? []).map(removeTrailingGlobSuffix),
+      ],
+      denyWithinAllow: (filesystem.denyWrite ?? []).map(removeTrailingGlobSuffix),
+    },
+  });
+  const bounds = shellQuotedProfileBounds(referenceCommand);
+  if (!bounds) return null;
+  const profile = decodeShellQuotedProfile(referenceCommand, bounds);
+  const section = profileReadSection(profile);
+  const tag = profileTag(profile);
+  if (!section || !tag) return null;
+  return { ...section, tag };
+}
+
+function readSpecificityFailure(reason: string): Error {
+  return new Error(
+    `Sandbox Bash blocked: cannot verify the macOS read profile (${reason}); the stock read profile may allow denied files.`,
+  );
+}
+
+/**
+ * Re-emit generated read denies after all profile grants, excluding only
+ * strictly more-specific explicit grants. Directory metadata remains usable
+ * for traversal, while file data (including directory listings) stays denied.
+ * Credential file denies stay hard.
+ */
+export function adaptMacosReadSpecificityProfile(
+  wrappedCommand: string,
+  config: SandboxRuntimeConfig | undefined,
+  platform: NodeJS.Platform = process.platform,
+  command = "printf profile-test",
+  shell = "bash",
+): string {
+  if (platform !== "darwin") return wrappedCommand;
+
+  const bounds = shellQuotedProfileBounds(wrappedCommand);
+  const profile = bounds ? decodeShellQuotedProfile(wrappedCommand, bounds) : undefined;
+  const section = profile ? profileReadSection(profile) : null;
+  const hasPotentialReadConflict = Boolean(
+    section?.forms.some(({ text }) => text.startsWith("(deny file-read*")) &&
+    section.forms.some(
+      ({ text }) =>
+        text.startsWith("(allow file-read*\n  (") ||
+        text.startsWith("(allow file-read* file-write*\n  ("),
+    ),
+  );
+  if (!config) {
+    if (hasPotentialReadConflict)
+      throw readSpecificityFailure("configuration provenance is unavailable");
+    return wrappedCommand;
+  }
+
+  const origin = readProvenance.get(config);
+  const filesystem = config.filesystem;
+  if (!origin) {
+    const policyRequired =
+      !filesystem?.disabled &&
+      ((filesystem?.denyRead?.length ?? 0) > 0 || (config.credentials?.files?.length ?? 0) > 0);
+    if (policyRequired || hasPotentialReadConflict)
+      throw readSpecificityFailure("configuration provenance is unavailable");
+    return wrappedCommand;
+  }
+  if (
+    origin.filesystemDisabled !== (filesystem?.disabled === true) ||
+    JSON.stringify(origin.allowRead) !== JSON.stringify(filesystem?.allowRead ?? []) ||
+    JSON.stringify(origin.denyRead) !== JSON.stringify(filesystem?.denyRead ?? []) ||
+    origin.credentialFiles !== JSON.stringify(config.credentials?.files ?? [])
+  ) {
+    throw readSpecificityFailure("registered policy arrays changed");
+  }
+  if (origin.filesystemDisabled) return wrappedCommand;
+  const policyRequired = origin.denyRead.length > 0 || origin.credentialFiles !== "[]";
+  if (!policyRequired) return wrappedCommand;
+  if (!filesystem?.allowRead || !filesystem.denyRead || config.network?.tlsTerminate) {
+    throw readSpecificityFailure("unsupported runtime configuration");
+  }
+  if (!bounds || !profile || !section)
+    throw readSpecificityFailure("generated profile shape is unsupported");
+
+  const tag = profileTag(profile);
+  const reference = referenceReadSection(config, command, shell);
+  if (
+    !tag ||
+    !reference ||
+    tag !== reference.tag ||
+    section.forms.length !== reference.forms.length
+  )
+    throw readSpecificityFailure("generated read section does not match pinned 0.0.72");
+
+  const hasExistingGuards = profile.includes(readSpecificityMarker);
+  if (
+    (!hasExistingGuards &&
+      section.forms.some((form, index) => form.text !== reference.forms[index]?.text)) ||
+    (hasExistingGuards && profile.split(readSpecificityMarker).length !== 2)
+  ) {
+    throw readSpecificityFailure("generated read section does not match pinned 0.0.72");
+  }
+
+  const uniqueMatchers = (patterns: string[]) =>
+    patterns
+      .map(matcher)
+      .filter(
+        (candidate, index, all) =>
+          all.findIndex((other) => other.identity === candidate.identity) === index,
+      );
+  const allowedMatchers = uniqueMatchers(filesystem.allowRead);
+  const ordinaryDenies = uniqueMatchers(origin.denyRead);
+  const credentialDenies = uniqueMatchers(
+    (config.credentials?.files ?? []).map((file) => file.path),
+  );
+  const credentialIdentities = new Set(credentialDenies.map(({ identity }) => identity));
+  const ordinaryByExpression = new Map(ordinaryDenies.map((denied) => [denied.expression, denied]));
+  const expectedForms = reference.forms.map((form) => ({ ...form }));
+
+  for (const [index, form] of expectedForms.entries()) {
+    if (!form.text.startsWith("(deny file-read*\n")) continue;
+    const pathMatcher = form.text.match(/^\(deny file-read\*\n  (.+)\n  \(with message /s)?.[1];
+    const denied = pathMatcher ? ordinaryByExpression.get(pathMatcher) : undefined;
+    if (!denied || credentialIdentities.has(denied.identity)) continue;
+    const exclusions = allowedMatchers
+      .filter((allowed) => allowed.specificity > denied.specificity)
+      .map(({ expression }) => expression);
+    if (exclusions.length === 0) continue;
+    const guarded = withAllowExclusions(form.text, tag, exclusions);
+    if (!guarded) throw readSpecificityFailure("generated deny matcher is unsupported");
+    expectedForms[index] = { ...form, text: guarded };
+  }
+
+  const finalRules = [
+    ...ordinaryDenies.flatMap((denied) => {
+      const exclusions = allowedMatchers
+        .filter((allowed) => allowed.specificity > denied.specificity)
+        .map(({ expression }) => expression);
+      const dataExclusions =
+        denied.identity === "subpath:/" ? [...exclusions, '(literal "/")'] : exclusions;
+      return [
+        readGuardRule("file-read*", denied.expression, tag, exclusions, true),
+        readGuardRule("file-read-data", denied.expression, tag, dataExclusions),
+      ];
+    }),
+    ...credentialDenies.map(
+      (denied) => `(deny file-read*\n  ${denied.expression}\n  (with message "${tag}"))`,
+    ),
+  ];
+  const appended = `\n${readSpecificityMarker}\n${finalRules.join("\n")}`;
+  const formsMatchAdapted = expectedForms.every(
+    (form, index) => section.forms[index]?.text === form.text,
+  );
+  if (hasExistingGuards) {
+    if (!formsMatchAdapted || !profile.endsWith(appended)) {
+      throw readSpecificityFailure("existing downstream guard section was modified");
+    }
+    return wrappedCommand;
+  }
+
+  let modifiedProfile = profile;
+  for (const [index, form] of [...expectedForms.entries()].sort(
+    ([left], [right]) => right - left,
+  )) {
+    const originalForm = section.forms[index]!;
+    if (form.text !== originalForm.text) {
+      modifiedProfile = `${modifiedProfile.slice(0, originalForm.start)}${form.text}${modifiedProfile.slice(originalForm.end)}`;
+    }
+  }
+  modifiedProfile += appended;
+  return `${wrappedCommand.slice(0, bounds.start)}${shellQuoteProfile(modifiedProfile)}${wrappedCommand.slice(bounds.end + 1)}`;
+}
+
+function readGuardRule(
+  operation: string,
+  pathExpression: string,
+  tag: string,
+  exclusions: string[],
+  excludeDirectories = false,
+): string {
+  const constraints = [
+    pathExpression,
+    ...(excludeDirectories ? ["(require-not (vnode-type DIRECTORY))"] : []),
+    ...exclusions.map((expression) => `(require-not ${expression})`),
+  ];
+  const matcherExpression =
+    constraints.length === 1
+      ? constraints[0]!
+      : `(require-all\n${constraints.map((constraint) => `    ${constraint}`).join("\n")}\n  )`;
+  return `(deny ${operation}\n  ${matcherExpression}\n  (with message "${tag}"))`;
 }
 
 function withAllowExclusions(form: string, tag: string, exclusions: string[]): string | null {
