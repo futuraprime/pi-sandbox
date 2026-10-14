@@ -168,10 +168,18 @@ Existing custom patterns that relied on `*` spanning directories should be
 changed to `**` as needed; user configuration is not auto-migrated. Built-in
 PEM/key write denies use explicit `**/*.pem` and `**/*.key` patterns.
 
-Glob alignment is partial: the pinned runtime does not emit nested `denyRead`
-glob rules inside literal `allowRead` subpaths on macOS, and runtime write-rule
-precedence still differs when a more-specific allow overlaps a broader deny.
-Those OS-profile gaps are not fixed by direct-tool glob matching.
+On macOS, the Bash runtime applies guarded read-profile corrections for the
+pinned `@carderne/sandbox-runtime` 0.0.72 profile: ordinary `denyRead` rules
+retain specificity-aware precedence, directory metadata remains available for
+realpath/traversal, and denied file contents and directory listings remain
+blocked. Equal-specificity denies still win, and more-specific configured grants
+(including a grant beneath `denyRead: ["/"]`) may override broader ordinary
+denies. The pinned literal `/` permission is retained. Credential-file denies
+remain hard, including the macOS fallback for `mode: "mask"` files. The adapter
+only changes a verified generated macOS Bash profile; if a required correction
+cannot be verified, Bash is blocked. It does not change the pinned dependency,
+other platforms, direct-tool policy, or macOS file-mask delivery (which remains
+deny-only in runtime 0.0.72).
 
 Mandatory writes are denied before allow-rule precedence for direct `write`/
 `edit` calls and in the OS runtime. This protects Git configuration and standard
