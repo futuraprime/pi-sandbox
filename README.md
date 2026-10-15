@@ -117,9 +117,24 @@ explicitly for the session.
 
 **Bash commands** are wrapped with `sandbox-exec` (macOS) or `bubblewrap`
 (Linux) to enforce network and filesystem restrictions at the OS level. Commands
-entered with `!` are sandboxed by default. The current implementation accepts
-`sandboxUserShell: false` to bypass sandboxing for `!` commands, but its trust
-model remains under review; do not use it in untrusted projects.
+entered with `!` or `!!` are sandboxed when the sandbox is enabled.
+`sandboxUserShell` is no longer supported: global and project declarations warn
+and are ignored.
+
+For a blocked manual command, the permission prompt can offer **Run once
+unsandboxed** before execution or **Retry once unsandboxed** after an attributed
+runtime denial. Approval runs the entire original command without sandbox
+restrictions, not just the blocked operation, and does not grant access to later
+commands. A runtime retry can repeat side effects from a partially executed
+command; the prompt warns before approval. Existing permission-grant choices
+remain available for promptable rules; ordinary deny rules offer only the
+one-command bypass or abort. Agent-issued Bash never gets a bypass choice.
+
+Preflight catches recognized network and SSH-agent blocks, not every shell
+operation. Protected-config/Git-upstream guards, attributed mandatory write
+denials, and unavailable sandbox state remain blocked. No UI, cancel, timeout,
+or stale approval leaves the command blocked. `!!` keeps its normal exclusion
+from model context, including bypass diagnostics.
 
 **Read, write, and edit tool calls** are intercepted before execution and
 checked against the same filesystem policy. The OS-level sandbox cannot cover
