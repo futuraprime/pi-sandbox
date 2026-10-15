@@ -166,6 +166,422 @@ test("mergeConfigLayers applies local scalar precedence and cumulative empty arr
   assert.deepEqual(merged.network?.allowedDomains, DEFAULT_CONFIG.network?.allowedDomains);
 });
 
+test("mergeConfigLayers ignores invalid scalar overrides and retains inherited settings", () => {
+  const defaults: SandboxConfig = {
+    ...DEFAULT_CONFIG,
+    enabled: false,
+    sandboxUserShell: false,
+    permissionPromptTimeoutSeconds: 45,
+    enableWeakerNestedSandbox: false,
+    enableWeakerNetworkIsolation: false,
+    allowAppleEvents: false,
+    mandatoryDenySearchDepth: 3,
+    allowPty: false,
+    allowBrowserProcess: false,
+    bwrapPath: "/usr/bin/bwrap",
+    socatPath: "/usr/bin/socat",
+    ripgrep: { command: "rg", argv0: "rg" },
+    seccomp: { applyPath: "/usr/bin/apply-seccomp", argv0: "seccomp" },
+    windows: {
+      sandboxUser: "sandbox-user",
+      sublayerGuid: "00000000-0000-4000-8000-000000000001",
+      proxyPortRange: [60080, 60089],
+      srtWin: { path: "/usr/bin/srt-win" },
+    },
+    network: {
+      ...DEFAULT_CONFIG.network!,
+      filterRequest: async () => ({ action: "allow" }),
+      strictAllowlist: true,
+      allowAllUnixSockets: true,
+      allowLocalBinding: true,
+      httpProxyPort: 8080,
+      socksProxyPort: 1080,
+      allowUnauthenticatedSocksProxy: true,
+      mitmProxy: { socketPath: "/tmp/mitm.sock", domains: ["example.com"] },
+      tlsTerminate: { caCertPath: "/tmp/ca.pem", caKeyPath: "/tmp/ca.key" },
+      parentProxy: { http: "https://proxy.example.com", noProxy: "localhost" },
+    },
+    filesystem: { ...DEFAULT_CONFIG.filesystem!, disabled: true },
+  };
+  const cases: Array<{
+    name: string;
+    override: unknown;
+    select: (config: SandboxConfig) => unknown;
+    inherited: unknown;
+  }> = [
+    {
+      name: "enabled",
+      override: { enabled: "false" },
+      select: (config) => config.enabled,
+      inherited: false,
+    },
+    {
+      name: "enabled",
+      override: { enabled: null },
+      select: (config) => config.enabled,
+      inherited: false,
+    },
+    {
+      name: "sandboxUserShell",
+      override: { sandboxUserShell: [] },
+      select: (config) => config.sandboxUserShell,
+      inherited: false,
+    },
+    {
+      name: "sandboxUserShell",
+      override: { sandboxUserShell: 0 },
+      select: (config) => config.sandboxUserShell,
+      inherited: false,
+    },
+    {
+      name: "permissionPromptTimeoutSeconds",
+      override: { permissionPromptTimeoutSeconds: "0" },
+      select: (config) => config.permissionPromptTimeoutSeconds,
+      inherited: 45,
+    },
+    {
+      name: "permissionPromptTimeoutSeconds",
+      override: { permissionPromptTimeoutSeconds: Number.POSITIVE_INFINITY },
+      select: (config) => config.permissionPromptTimeoutSeconds,
+      inherited: 45,
+    },
+    {
+      name: "permissionPromptTimeoutSeconds",
+      override: { permissionPromptTimeoutSeconds: Number.NaN },
+      select: (config) => config.permissionPromptTimeoutSeconds,
+      inherited: 45,
+    },
+    {
+      name: "enableWeakerNestedSandbox",
+      override: { enableWeakerNestedSandbox: "false" },
+      select: (config) => config.enableWeakerNestedSandbox,
+      inherited: false,
+    },
+    {
+      name: "enableWeakerNetworkIsolation",
+      override: { enableWeakerNetworkIsolation: 1 },
+      select: (config) => config.enableWeakerNetworkIsolation,
+      inherited: false,
+    },
+    {
+      name: "allowAppleEvents",
+      override: { allowAppleEvents: "true" },
+      select: (config) => config.allowAppleEvents,
+      inherited: false,
+    },
+    {
+      name: "allowAppleEvents",
+      override: { allowAppleEvents: {} },
+      select: (config) => config.allowAppleEvents,
+      inherited: false,
+    },
+    {
+      name: "mandatoryDenySearchDepth",
+      override: { mandatoryDenySearchDepth: 11 },
+      select: (config) => config.mandatoryDenySearchDepth,
+      inherited: 3,
+    },
+    {
+      name: "allowPty",
+      override: { allowPty: "false" },
+      select: (config) => config.allowPty,
+      inherited: false,
+    },
+    {
+      name: "allowBrowserProcess",
+      override: { allowBrowserProcess: "false" },
+      select: (config) => config.allowBrowserProcess,
+      inherited: false,
+    },
+    {
+      name: "bwrapPath",
+      override: { bwrapPath: "bwrap" },
+      select: (config) => config.bwrapPath,
+      inherited: "/usr/bin/bwrap",
+    },
+    {
+      name: "socatPath",
+      override: { socatPath: false },
+      select: (config) => config.socatPath,
+      inherited: "/usr/bin/socat",
+    },
+    {
+      name: "network.strictAllowlist",
+      override: { network: { strictAllowlist: "false" } },
+      select: (config) => config.network?.strictAllowlist,
+      inherited: true,
+    },
+    {
+      name: "network.allowAllUnixSockets",
+      override: { network: { allowAllUnixSockets: 0 } },
+      select: (config) => config.network?.allowAllUnixSockets,
+      inherited: true,
+    },
+    {
+      name: "network.allowLocalBinding",
+      override: { network: { allowLocalBinding: "false" } },
+      select: (config) => config.network?.allowLocalBinding,
+      inherited: true,
+    },
+    {
+      name: "network.httpProxyPort",
+      override: { network: { httpProxyPort: "8081" } },
+      select: (config) => config.network?.httpProxyPort,
+      inherited: 8080,
+    },
+    {
+      name: "network.httpProxyPort",
+      override: { network: { httpProxyPort: 0 } },
+      select: (config) => config.network?.httpProxyPort,
+      inherited: 8080,
+    },
+    {
+      name: "network.httpProxyPort",
+      override: { network: { httpProxyPort: 8080.5 } },
+      select: (config) => config.network?.httpProxyPort,
+      inherited: 8080,
+    },
+    {
+      name: "network.socksProxyPort",
+      override: { network: { socksProxyPort: 65536 } },
+      select: (config) => config.network?.socksProxyPort,
+      inherited: 1080,
+    },
+    {
+      name: "network.allowUnauthenticatedSocksProxy",
+      override: { network: { allowUnauthenticatedSocksProxy: "true" } },
+      select: (config) => config.network?.allowUnauthenticatedSocksProxy,
+      inherited: true,
+    },
+    {
+      name: "network.filterRequest",
+      override: { network: { filterRequest: "allow all" } },
+      select: (config) => config.network?.filterRequest,
+      inherited: defaults.network?.filterRequest,
+    },
+    {
+      name: "filesystem.disabled",
+      override: { filesystem: { disabled: "false" } },
+      select: (config) => config.filesystem?.disabled,
+      inherited: true,
+    },
+    {
+      name: "network.mitmProxy",
+      override: { network: { mitmProxy: { socketPath: "", domains: ["example.com"] } } },
+      select: (config) => config.network?.mitmProxy,
+      inherited: defaults.network?.mitmProxy,
+    },
+    {
+      name: "network.tlsTerminate",
+      override: { network: { tlsTerminate: { caCertPath: "" } } },
+      select: (config) => config.network?.tlsTerminate,
+      inherited: defaults.network?.tlsTerminate,
+    },
+    {
+      name: "network.parentProxy",
+      override: { network: { parentProxy: { http: "not a URL" } } },
+      select: (config) => config.network?.parentProxy,
+      inherited: defaults.network?.parentProxy,
+    },
+    {
+      name: "ripgrep",
+      override: { ripgrep: { command: 42 } },
+      select: (config) => config.ripgrep,
+      inherited: defaults.ripgrep,
+    },
+    {
+      name: "seccomp",
+      override: { seccomp: { argv0: false } },
+      select: (config) => config.seccomp,
+      inherited: defaults.seccomp,
+    },
+    {
+      name: "windows",
+      override: { windows: { sandboxUser: "a-username-that-is-longer-than-twenty" } },
+      select: (config) => config.windows,
+      inherited: defaults.windows,
+    },
+    {
+      name: "windows.proxyPortRange",
+      override: { windows: { proxyPortRange: [1, 100] } },
+      select: (config) => config.windows,
+      inherited: defaults.windows,
+    },
+  ];
+
+  const snapshotDefaults = () => ({
+    ...defaults,
+    network: { ...defaults.network!, filterRequest: undefined },
+  });
+  for (const { name, override, select, inherited } of cases) {
+    const originalDefaults = structuredClone(snapshotDefaults());
+    const invalidConfig = override as SandboxConfigFile;
+    const originalInvalidConfig = structuredClone(invalidConfig);
+    const originalError = console.error;
+
+    for (const scope of ["global", "project"] as const) {
+      const warnings: string[] = [];
+      console.error = (...args: unknown[]) => warnings.push(String(args[0]));
+      try {
+        const merged =
+          scope === "global"
+            ? mergeConfigLayers(defaults, invalidConfig, {})
+            : mergeConfigLayers(defaults, defaults, invalidConfig);
+        assert.deepEqual(select(merged), inherited, `${scope}: ${name}`);
+        assert.equal(warnings.length, 1, `${scope}: ${name}`);
+        const warningPath = name === "windows.proxyPortRange" ? "windows" : name;
+        assert.match(warnings[0]!, new RegExp(warningPath.replaceAll(".", "\\.")));
+        assert.deepEqual(snapshotDefaults(), originalDefaults, `${name}: defaults mutated`);
+        assert.deepEqual(invalidConfig, originalInvalidConfig, `${name}: override mutated`);
+      } finally {
+        console.error = originalError;
+      }
+    }
+  }
+});
+
+test("mergeConfigLayers preserves valid scalar precedence, false and finite timeout values", () => {
+  const defaults: SandboxConfig = {
+    ...DEFAULT_CONFIG,
+    enabled: true,
+    permissionPromptTimeoutSeconds: 30,
+    network: { ...DEFAULT_CONFIG.network!, allowLocalBinding: true },
+    filesystem: { ...DEFAULT_CONFIG.filesystem!, disabled: true },
+  };
+  const globalConfig: SandboxConfigFile = {
+    enabled: false,
+    permissionPromptTimeoutSeconds: 10,
+    mandatoryDenySearchDepth: 10,
+    allowBrowserProcess: true,
+    network: { allowLocalBinding: false, httpProxyPort: 8081 },
+    filesystem: { disabled: false },
+  };
+  const projectConfig: SandboxConfigFile = {
+    enabled: true,
+    sandboxUserShell: false,
+    permissionPromptTimeoutSeconds: -2,
+    mandatoryDenySearchDepth: 1,
+    allowBrowserProcess: false,
+    network: { strictAllowlist: false, allowLocalBinding: false, httpProxyPort: 8082 },
+    filesystem: { disabled: false },
+  };
+  const snapshots = [defaults, globalConfig, projectConfig].map((value) => structuredClone(value));
+
+  const merged = mergeConfigLayers(defaults, globalConfig, projectConfig);
+
+  assert.equal(merged.enabled, true);
+  assert.equal(merged.sandboxUserShell, false);
+  assert.equal(merged.permissionPromptTimeoutSeconds, -2);
+  assert.equal(
+    mergeConfigLayers(defaults, {}, { permissionPromptTimeoutSeconds: 0 })
+      .permissionPromptTimeoutSeconds,
+    0,
+  );
+  assert.equal(merged.mandatoryDenySearchDepth, 1);
+  assert.equal(merged.allowBrowserProcess, false);
+  assert.equal(merged.network?.strictAllowlist, false);
+  assert.equal(merged.network?.allowLocalBinding, false);
+  assert.equal(merged.network?.httpProxyPort, 8082);
+  assert.equal(merged.filesystem?.disabled, false);
+  assert.deepEqual(defaults, snapshots[0]);
+  assert.deepEqual(globalConfig, snapshots[1]);
+  assert.deepEqual(projectConfig, snapshots[2]);
+});
+
+test("mergeConfigLayers omits undefined overrides and atomically replaces valid nested values", () => {
+  const defaultFilterRequest = async () => ({ action: "allow" as const });
+  const filterRequest = async () => ({ action: "deny" as const, reason: "blocked" });
+  const defaults: SandboxConfig = {
+    ...DEFAULT_CONFIG,
+    ripgrep: { command: "rg", args: ["--default"], argv0: "default-rg" },
+    seccomp: { applyPath: "/default/seccomp", argv0: "default-seccomp" },
+    network: {
+      ...DEFAULT_CONFIG.network!,
+      strictAllowlist: false,
+      filterRequest: defaultFilterRequest,
+      mitmProxy: { socketPath: "/tmp/default-mitm.sock", domains: ["default.example.com"] },
+    },
+  };
+  const globalConfig: SandboxConfigFile = {
+    enabled: false,
+    network: { strictAllowlist: true },
+  };
+  const projectConfig: SandboxConfigFile = {
+    enabled: undefined,
+    ripgrep: { command: "custom-rg" },
+    seccomp: { applyPath: "/custom/seccomp" },
+    network: {
+      strictAllowlist: undefined,
+      filterRequest,
+      mitmProxy: { socketPath: "/tmp/project-mitm.sock", domains: ["project.example.com"] },
+    },
+  };
+  const warnings: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => warnings.push(String(args[0]));
+  try {
+    const merged = mergeConfigLayers(defaults, globalConfig, projectConfig);
+
+    assert.equal(merged.enabled, false);
+    assert.equal(merged.network?.strictAllowlist, true);
+    assert.equal(merged.network?.filterRequest, filterRequest);
+    assert.deepEqual(merged.network?.mitmProxy, projectConfig.network?.mitmProxy);
+    assert.deepEqual(merged.ripgrep, { command: "custom-rg" });
+    assert.deepEqual(merged.seccomp, { applyPath: "/custom/seccomp" });
+    assert.deepEqual(warnings, []);
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test("loadConfig warns and ignores malformed scalar JSON overrides", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-invalid-scalars-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const originalError = console.error;
+  const warnings: string[] = [];
+  process.env.PI_CODING_AGENT_DIR = join(root, "global");
+  const cwd = join(root, "project");
+  try {
+    mkdirSync(join(root, "global"), { recursive: true });
+    mkdirSync(join(cwd, ".pi"), { recursive: true });
+    writeFileSync(
+      join(root, "global", "sandbox.json"),
+      JSON.stringify({
+        enabled: false,
+        permissionPromptTimeoutSeconds: 20,
+        network: { allowLocalBinding: true },
+        filesystem: { disabled: true },
+      }),
+      "utf8",
+    );
+    writeFileSync(
+      join(cwd, ".pi", "sandbox.json"),
+      JSON.stringify({
+        enabled: "false",
+        permissionPromptTimeoutSeconds: "0",
+        network: { allowLocalBinding: "false" },
+        filesystem: { disabled: "false" },
+      }),
+      "utf8",
+    );
+    console.error = (...args: unknown[]) => warnings.push(String(args[0]));
+
+    const config = loadConfig(cwd);
+
+    assert.equal(config.enabled, false);
+    assert.equal(config.permissionPromptTimeoutSeconds, 20);
+    assert.equal(config.network?.allowLocalBinding, true);
+    assert.equal(config.filesystem?.disabled, true);
+    assert.equal(warnings.length, 4);
+    assert.ok(warnings.every((warning) => warning.startsWith("Warning: Ignoring invalid")));
+  } finally {
+    console.error = originalError;
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+  }
+});
+
 test("mergeConfigLayers composes every supported array and ignoreViolations key", () => {
   const defaults: SandboxConfig = {
     ...DEFAULT_CONFIG,

@@ -3,6 +3,9 @@ import { join } from "node:path";
 
 import {
   CredentialsConfigSchema,
+  FilesystemConfigSchema,
+  NetworkConfigSchema,
+  SandboxRuntimeConfigSchema,
   type CredentialEnvVarConfig,
   type CredentialFileConfig,
   type CredentialsConfig,
@@ -90,11 +93,118 @@ function configuredSection(value: unknown): Record<string, unknown> {
   return isRecord(value) ? value : {};
 }
 
+type ConfigValueSchema = { safeParse(value: unknown): { success: boolean } };
+type ScalarValidator = { schema: ConfigValueSchema; expected: string };
+
+const runtimeConfigShape = SandboxRuntimeConfigSchema.innerType().shape;
+
+const runtimeConfigScalarKeys = [
+  "enableWeakerNestedSandbox",
+  "enableWeakerNetworkIsolation",
+  "allowAppleEvents",
+  "ripgrep",
+  "mandatoryDenySearchDepth",
+  "allowPty",
+  "allowBrowserProcess",
+  "seccomp",
+  "bwrapPath",
+  "socatPath",
+  "windows",
+] as const;
+
+const topLevelScalarValidators: Record<string, ScalarValidator> = {
+  enabled: {
+    schema: { safeParse: (value) => ({ success: typeof value === "boolean" }) },
+    expected: "a boolean",
+  },
+  sandboxUserShell: {
+    schema: { safeParse: (value) => ({ success: typeof value === "boolean" }) },
+    expected: "a boolean",
+  },
+  permissionPromptTimeoutSeconds: {
+    schema: {
+      safeParse: (value) => ({ success: typeof value === "number" && Number.isFinite(value) }),
+    },
+    expected: "a finite number",
+  },
+  ...Object.fromEntries(
+    runtimeConfigScalarKeys.map((key) => [
+      key,
+      {
+        schema: runtimeConfigShape[key],
+        expected: "a valid sandbox-runtime value",
+      },
+    ]),
+  ),
+};
+
+const networkScalarValidators: Record<string, ScalarValidator> = {
+  strictAllowlist: { schema: NetworkConfigSchema.shape.strictAllowlist, expected: "a boolean" },
+  allowAllUnixSockets: {
+    schema: NetworkConfigSchema.shape.allowAllUnixSockets,
+    expected: "a boolean",
+  },
+  allowLocalBinding: { schema: NetworkConfigSchema.shape.allowLocalBinding, expected: "a boolean" },
+  httpProxyPort: {
+    schema: NetworkConfigSchema.shape.httpProxyPort,
+    expected: "an integer from 1 to 65535",
+  },
+  socksProxyPort: {
+    schema: NetworkConfigSchema.shape.socksProxyPort,
+    expected: "an integer from 1 to 65535",
+  },
+  allowUnauthenticatedSocksProxy: {
+    schema: NetworkConfigSchema.shape.allowUnauthenticatedSocksProxy,
+    expected: "a boolean",
+  },
+  mitmProxy: {
+    schema: NetworkConfigSchema.shape.mitmProxy,
+    expected: "a valid MITM proxy configuration",
+  },
+  tlsTerminate: {
+    schema: NetworkConfigSchema.shape.tlsTerminate,
+    expected: "a valid TLS termination configuration",
+  },
+  parentProxy: {
+    schema: NetworkConfigSchema.shape.parentProxy,
+    expected: "a valid parent proxy configuration",
+  },
+  filterRequest: {
+    schema: NetworkConfigSchema.shape.filterRequest,
+    expected: "a function",
+  },
+};
+
+function validatedSection(
+  value: unknown,
+  label: string,
+  validators: Record<string, ScalarValidator>,
+): Record<string, unknown> {
+  const result = { ...configuredSection(value) };
+  for (const [key, { schema, expected }] of Object.entries(validators)) {
+    if (!Object.hasOwn(result, key)) continue;
+    if (result[key] === undefined) {
+      delete result[key];
+    } else if (!schema.safeParse(result[key]).success) {
+      const path = label ? `${label}.${key}` : key;
+      console.error(`Warning: Ignoring invalid ${path}; expected ${expected}`);
+      delete result[key];
+    }
+  }
+  return result;
+}
+
 function mergeObjects(base: SandboxConfig, overrides: SandboxConfigFile): SandboxConfig {
-  const network = configuredSection(overrides.network);
+  const network = validatedSection(overrides.network, "network", networkScalarValidators);
   const { sshProxy: _ignoredSshProxy, ...safeNetwork } = network;
-  const filesystem = configuredSection(overrides.filesystem);
-  const { credentials: _ignoredCredentials, ...safeOverrides } = overrides;
+  const filesystem = validatedSection(overrides.filesystem, "filesystem", {
+    disabled: { schema: FilesystemConfigSchema.shape.disabled, expected: "a boolean" },
+  });
+  const { credentials: _ignoredCredentials, ...safeOverrides } = validatedSection(
+    overrides,
+    "",
+    topLevelScalarValidators,
+  );
 
   return {
     ...base,
