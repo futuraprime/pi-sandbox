@@ -418,7 +418,10 @@ test("diagnostics round-trip explicit manual unsandboxed choices", () => {
     const parsed = parseDiagnosticBlock(`output\n${block}`);
     assert.equal(parsed?.data.choice, choice);
     assert.equal(parsed?.data.finalOutcome, "success");
-    assert.match(parsed ? renderDiagnosticNotice(parsed.data) : "", /unsandboxed attempt succeeded/);
+    assert.match(
+      parsed ? renderDiagnosticNotice(parsed.data) : "",
+      /unsandboxed attempt succeeded/,
+    );
     assert.match(parsed?.data.action ?? "", /once unsandboxed/);
   }
 });

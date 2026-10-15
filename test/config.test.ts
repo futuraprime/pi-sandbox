@@ -152,7 +152,9 @@ test("mergeConfigLayers warns and ignores deprecated sandboxUserShell from eithe
     assert.equal("sandboxUserShell" in merged, false);
     assert.equal(warnings.length, 2);
     assert.ok(
-      warnings.every((warning) => /deprecated sandboxUserShell.*per-command approval/.test(warning)),
+      warnings.every((warning) =>
+        /deprecated sandboxUserShell.*per-command approval/.test(warning),
+      ),
     );
   } finally {
     console.error = originalError;

@@ -936,9 +936,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
           });
           const recognizedFallbackBypass =
             events.length === 0 &&
-            (primary?.type === "network" ||
-              primary?.type === "read" ||
-              primary?.type === "write");
+            (primary?.type === "network" || primary?.type === "read" || primary?.type === "write");
           const confirmedManualBypass =
             !hasProtectedBypassTarget &&
             (events.length > 0 ||

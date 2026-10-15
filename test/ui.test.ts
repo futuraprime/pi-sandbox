@@ -69,7 +69,10 @@ test("manual command prompts expose an explicit one-time unsandboxed choice", as
       label: "Run once unsandboxed",
     }),
   );
-  assert.deepEqual(denied.rendered().filter((line) => line.includes("Allow for")), []);
+  assert.deepEqual(
+    denied.rendered().filter((line) => line.includes("Allow for")),
+    [],
+  );
   denied.component.handleInput("u");
   assert.deepEqual(await denied.result, {
     action: "run-once-unsandboxed",
@@ -88,11 +91,7 @@ test("manual bypass warnings remain visible at width 50 and bypass skips rule va
       warning,
     }),
   );
-  const manualText = manual.component
-    .render(50)
-    .join(" ")
-    .replaceAll("⚠", "")
-    .replace(/\s+/g, " ");
+  const manualText = manual.component.render(50).join(" ").replaceAll("⚠", "").replace(/\s+/g, " ");
   assert.match(manualText, /entire original command runs without sandbox restrictions/);
   assert.match(manualText, /may have partly run; retrying repeats side effects/);
   manual.component.handleInput("u");
@@ -105,11 +104,7 @@ test("manual bypass warnings remain visible at width 50 and bypass skips rule va
       warning,
     }),
   );
-  const sshText = ssh.component
-    .render(50)
-    .join(" ")
-    .replaceAll("⚠", "")
-    .replace(/\s+/g, " ");
+  const sshText = ssh.component.render(50).join(" ").replaceAll("⚠", "").replace(/\s+/g, " ");
   assert.match(sshText, /entire original command runs without sandbox restrictions/);
   assert.match(sshText, /may have partly run; retrying repeats side effects/);
   ssh.component.handleInput("u");

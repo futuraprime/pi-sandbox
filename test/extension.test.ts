@@ -20,8 +20,8 @@ import assert from "node:assert/strict";
 import { DEFAULT_CONFIG, type SandboxConfig } from "../src/config.ts";
 import { renderDiagnosticBlockData, type SandboxDiagnosticBlockData } from "../src/diagnostics.ts";
 import extension from "../src/extension.ts";
-import { extractDomainsFromCommand } from "../src/policy.ts";
 import { getVolumeCaseSensitivity } from "../src/path-security.ts";
+import { extractDomainsFromCommand } from "../src/policy.ts";
 import {
   gitUpstreamMutationCommands,
   nonGitUpstreamMutationCommands,
@@ -195,9 +195,7 @@ function respondToPrompts(ctx: ExtensionContext, key: () => string) {
 }
 
 function manualDomainCommand(domain: string): string {
-  const command = `false && curl https://${domain}; printf '%s' ${shellQuote(
-    `https://${domain}`,
-  )}`;
+  const command = `false && curl https://${domain}; printf '%s' ${shellQuote(`https://${domain}`)}`;
   assert.deepEqual(extractDomainsFromCommand(command), [domain]);
   return command;
 }
@@ -2050,243 +2048,257 @@ test(
   "manual domain bypass runs once locally without persisting access",
   { timeout: 15_000 },
   async () => {
-  const root = makeProjectTempDirectory("manual-domain-bypass");
-  mkdirSync(join(root, ".pi"), { recursive: true });
-  writeFileSync(
-    join(root, ".pi", "sandbox.json"),
-    JSON.stringify({ network: { deniedDomains: ["denied.example"] } }),
-  );
-  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
-  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
-  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => "printf next-command");
+    const root = makeProjectTempDirectory("manual-domain-bypass");
+    mkdirSync(join(root, ".pi"), { recursive: true });
+    writeFileSync(
+      join(root, ".pi", "sandbox.json"),
+      JSON.stringify({ network: { deniedDomains: ["denied.example"] } }),
+    );
+    const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+    const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+    const wrapMock = mock.method(
+      SandboxManager,
+      "wrapWithSandbox",
+      async () => "printf next-command",
+    );
 
-  try {
-    const { pi, handlers, sentMessages } = makePi();
-    extension(pi);
-    const ctx = makeContext(root, []);
-    const choices = ["u", "u", "esc"];
-    const prompts = respondToPrompts(ctx, () => choices.shift() ?? "esc");
-    await handlers.get("session_start")?.({}, ctx);
+    try {
+      const { pi, handlers, sentMessages } = makePi();
+      extension(pi);
+      const ctx = makeContext(root, []);
+      const choices = ["u", "u", "esc"];
+      const prompts = respondToPrompts(ctx, () => choices.shift() ?? "esc");
+      await handlers.get("session_start")?.({}, ctx);
 
-    for (const domain of ["denied.example", "unmatched.example"]) {
-      const command = manualDomainCommand(domain);
-      const response = await handlers.get("user_bash")?.({ command, excludeFromContext: true }, ctx);
-      assert.ok(response?.operations, `${domain} should offer a one-time local operation`);
-      if (domain === "denied.example") {
-        assert.match(prompts.rendered[0] ?? "", /Run once unsandboxed/);
-        assert.doesNotMatch(
-          prompts.rendered[0] ?? "",
-          /Allow for this session only|Allow for this project|Allow for all projects/,
+      for (const domain of ["denied.example", "unmatched.example"]) {
+        const command = manualDomainCommand(domain);
+        const response = await handlers.get("user_bash")?.(
+          { command, excludeFromContext: true },
+          ctx,
         );
+        assert.ok(response?.operations, `${domain} should offer a one-time local operation`);
+        if (domain === "denied.example") {
+          assert.match(prompts.rendered[0] ?? "", /Run once unsandboxed/);
+          assert.doesNotMatch(
+            prompts.rendered[0] ?? "",
+            /Allow for this session only|Allow for this project|Allow for all projects/,
+          );
+        }
+        let output = "";
+        const result = await response.operations.exec(command, root, {
+          onData: (data: Buffer) => (output += data.toString()),
+          timeout: 5,
+          env: process.env,
+        });
+        assert.equal(result.exitCode, 0);
+        assert.match(output, /RUNNING ONCE UNSANDBOXED/);
+        assert.match(output, new RegExp(domain.replaceAll(".", "\\.")));
+        assert.equal(wrapMock.mock.callCount(), 0);
       }
+
+      const repeated = await handlers.get("user_bash")?.(
+        { command: manualDomainCommand("denied.example"), excludeFromContext: true },
+        ctx,
+      );
+      assert.equal(repeated?.operations, undefined);
+      assert.equal(repeated?.result?.exitCode, 1);
+      assert.equal(wrapMock.mock.callCount(), 0);
+
+      const ordinaryCommand = "printf next-command";
+      const ordinary = await handlers.get("user_bash")?.(
+        { command: ordinaryCommand, excludeFromContext: true },
+        ctx,
+      );
+      assert.ok(ordinary?.operations);
+      let ordinaryOutput = "";
+      const ordinaryResult = await ordinary.operations.exec(ordinaryCommand, root, {
+        onData: (data: Buffer) => (ordinaryOutput += data.toString()),
+        timeout: 5,
+        env: process.env,
+      });
+      assert.equal(ordinaryResult.exitCode, 0);
+      assert.equal(ordinaryOutput, "next-command");
+      assert.equal(wrapMock.mock.callCount(), 1);
+      assert.equal(prompts.count, 3);
+      assert.deepEqual(sentMessages, []);
+      assert.equal(resetMock.mock.callCount(), 0);
+    } finally {
+      wrapMock.mock.restore();
+      resetMock.mock.restore();
+      managerMock.mock.restore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "legacy sandboxUserShell false does not disable the manual shell sandbox",
+  { timeout: 15_000 },
+  async () => {
+    const root = makeProjectTempDirectory("legacy-manual-shell-sandbox");
+    const config = {
+      ...makePromptTestConfig(),
+      sandboxUserShell: false,
+    } as unknown as SandboxConfig;
+    const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+    const wrapMock = mock.method(
+      SandboxManager,
+      "wrapWithSandbox",
+      async () => "printf legacy-config",
+    );
+
+    try {
+      const { pi, handlers } = makePi();
+      extension(pi, { configLoader: () => config });
+      const ctx = makeContext(root, []);
+      await handlers.get("session_start")?.({}, ctx);
+
+      const command = "printf original-command";
+      const response = await handlers.get("user_bash")?.({ command }, ctx);
+      assert.ok(response?.operations);
       let output = "";
       const result = await response.operations.exec(command, root, {
         onData: (data: Buffer) => (output += data.toString()),
         timeout: 5,
         env: process.env,
       });
+
       assert.equal(result.exitCode, 0);
-      assert.match(output, /RUNNING ONCE UNSANDBOXED/);
-      assert.match(output, new RegExp(domain.replaceAll(".", "\\.")));
-      assert.equal(wrapMock.mock.callCount(), 0);
+      assert.equal(output, "legacy-config");
+      assert.equal(wrapMock.mock.callCount(), 1);
+    } finally {
+      wrapMock.mock.restore();
+      managerMock.mock.restore();
+      rmSync(root, { recursive: true, force: true });
     }
-
-    const repeated = await handlers.get("user_bash")?.(
-      { command: manualDomainCommand("denied.example"), excludeFromContext: true },
-      ctx,
-    );
-    assert.equal(repeated?.operations, undefined);
-    assert.equal(repeated?.result?.exitCode, 1);
-    assert.equal(wrapMock.mock.callCount(), 0);
-
-    const ordinaryCommand = "printf next-command";
-    const ordinary = await handlers.get("user_bash")?.(
-      { command: ordinaryCommand, excludeFromContext: true },
-      ctx,
-    );
-    assert.ok(ordinary?.operations);
-    let ordinaryOutput = "";
-    const ordinaryResult = await ordinary.operations.exec(ordinaryCommand, root, {
-      onData: (data: Buffer) => (ordinaryOutput += data.toString()),
-      timeout: 5,
-      env: process.env,
-    });
-    assert.equal(ordinaryResult.exitCode, 0);
-    assert.equal(ordinaryOutput, "next-command");
-    assert.equal(wrapMock.mock.callCount(), 1);
-    assert.equal(prompts.count, 3);
-    assert.deepEqual(sentMessages, []);
-    assert.equal(resetMock.mock.callCount(), 0);
-  } finally {
-    wrapMock.mock.restore();
-    resetMock.mock.restore();
-    managerMock.mock.restore();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test(
-  "legacy sandboxUserShell false does not disable the manual shell sandbox",
-  { timeout: 15_000 },
-  async () => {
-  const root = makeProjectTempDirectory("legacy-manual-shell-sandbox");
-  const config = {
-    ...makePromptTestConfig(),
-    sandboxUserShell: false,
-  } as unknown as SandboxConfig;
-  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
-  const wrapMock = mock.method(
-    SandboxManager,
-    "wrapWithSandbox",
-    async () => "printf legacy-config",
-  );
-
-  try {
-    const { pi, handlers } = makePi();
-    extension(pi, { configLoader: () => config });
-    const ctx = makeContext(root, []);
-    await handlers.get("session_start")?.({}, ctx);
-
-    const command = "printf original-command";
-    const response = await handlers.get("user_bash")?.({ command }, ctx);
-    assert.ok(response?.operations);
-    let output = "";
-    const result = await response.operations.exec(command, root, {
-      onData: (data: Buffer) => (output += data.toString()),
-      timeout: 5,
-      env: process.env,
-    });
-
-    assert.equal(result.exitCode, 0);
-    assert.equal(output, "legacy-config");
-    assert.equal(wrapMock.mock.callCount(), 1);
-  } finally {
-    wrapMock.mock.restore();
-    managerMock.mock.restore();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+  },
+);
 
 test(
   "Linux SSH preflight offers a local one-time choice without granting socket access",
   { timeout: 15_000 },
   async () => {
-  const root = makeProjectTempDirectory("linux-ssh-manual-bypass");
-  allowSshTestDomain(root);
-  const originalSocket = process.env.SSH_AUTH_SOCK;
-  process.env.SSH_AUTH_SOCK = join(root, "agent.sock");
-  const initialized: unknown[] = [];
-  const managerMock = mock.method(SandboxManager, "initialize", async (config: unknown) => {
-    initialized.push(config);
-  });
-  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => {
-    throw new Error("manual SSH choice must run locally, not through the wrapper");
-  });
-
-  try {
-    const { pi, handlers } = makePi();
-    extension(pi, { platform: "linux" });
-    const ctx = makeContext(root, []);
-    const prompts = respondToPrompts(ctx, () => "u");
-    await handlers.get("session_start")?.({}, ctx);
-
-    const command = "false && ssh host; printf linux-safe";
-    const response = await handlers.get("user_bash")?.({ command, excludeFromContext: true }, ctx);
-    assert.ok(response?.operations);
-    let output = "";
-    const result = await response.operations.exec(command, root, {
-      onData: (data: Buffer) => (output += data.toString()),
-      timeout: 5,
-      env: process.env,
+    const root = makeProjectTempDirectory("linux-ssh-manual-bypass");
+    allowSshTestDomain(root);
+    const originalSocket = process.env.SSH_AUTH_SOCK;
+    process.env.SSH_AUTH_SOCK = join(root, "agent.sock");
+    const initialized: unknown[] = [];
+    const managerMock = mock.method(SandboxManager, "initialize", async (config: unknown) => {
+      initialized.push(config);
+    });
+    const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => {
+      throw new Error("manual SSH choice must run locally, not through the wrapper");
     });
 
-    assert.equal(result.exitCode, 0);
-    assert.match(output, /RUNNING ONCE UNSANDBOXED/);
-    assert.match(output, /linux-safe/);
-    assert.match(prompts.rendered[0] ?? "", /Run once unsandboxed/);
-    assert.doesNotMatch(prompts.rendered[0] ?? "", /Allow SSH use for this session/);
-    assert.equal(wrapMock.mock.callCount(), 0);
-    assert.equal(initialized.length, 1);
-    assert.deepEqual(
-      (initialized[0] as { network?: { allowUnixSockets?: string[] } }).network?.allowUnixSockets,
-      [],
-    );
-  } finally {
-    wrapMock.mock.restore();
-    managerMock.mock.restore();
-    if (originalSocket === undefined) delete process.env.SSH_AUTH_SOCK;
-    else process.env.SSH_AUTH_SOCK = originalSocket;
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+    try {
+      const { pi, handlers } = makePi();
+      extension(pi, { platform: "linux" });
+      const ctx = makeContext(root, []);
+      const prompts = respondToPrompts(ctx, () => "u");
+      await handlers.get("session_start")?.({}, ctx);
+
+      const command = "false && ssh host; printf linux-safe";
+      const response = await handlers.get("user_bash")?.(
+        { command, excludeFromContext: true },
+        ctx,
+      );
+      assert.ok(response?.operations);
+      let output = "";
+      const result = await response.operations.exec(command, root, {
+        onData: (data: Buffer) => (output += data.toString()),
+        timeout: 5,
+        env: process.env,
+      });
+
+      assert.equal(result.exitCode, 0);
+      assert.match(output, /RUNNING ONCE UNSANDBOXED/);
+      assert.match(output, /linux-safe/);
+      assert.match(prompts.rendered[0] ?? "", /Run once unsandboxed/);
+      assert.doesNotMatch(prompts.rendered[0] ?? "", /Allow SSH use for this session/);
+      assert.equal(wrapMock.mock.callCount(), 0);
+      assert.equal(initialized.length, 1);
+      assert.deepEqual(
+        (initialized[0] as { network?: { allowUnixSockets?: string[] } }).network?.allowUnixSockets,
+        [],
+      );
+    } finally {
+      wrapMock.mock.restore();
+      managerMock.mock.restore();
+      if (originalSocket === undefined) delete process.env.SSH_AUTH_SOCK;
+      else process.env.SSH_AUTH_SOCK = originalSocket;
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   "runtime sandbox denial retries only the original manual command locally",
   { timeout: 15_000 },
   async () => {
-  const root = makeProjectTempDirectory("manual-runtime-retry");
-  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
-  const wrapMock = mock.method(
-    SandboxManager,
-    "wrapWithSandbox",
-    async () =>
-      "printf 'partial sandbox output\\n' >&2; printf 'network connection to runtime.example: Operation not permitted\\n' >&2; exit 1",
-  );
+    const root = makeProjectTempDirectory("manual-runtime-retry");
+    const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+    const wrapMock = mock.method(
+      SandboxManager,
+      "wrapWithSandbox",
+      async () =>
+        "printf 'partial sandbox output\\n' >&2; printf 'network connection to runtime.example: Operation not permitted\\n' >&2; exit 1",
+    );
 
-  try {
-    const { pi, handlers, sentMessages } = makePi();
-    extension(pi);
-    const ctx = makeContext(root, []);
-    const prompts = respondToPrompts(ctx, () => "u");
-    await handlers.get("session_start")?.({}, ctx);
+    try {
+      const { pi, handlers, sentMessages } = makePi();
+      extension(pi);
+      const ctx = makeContext(root, []);
+      const prompts = respondToPrompts(ctx, () => "u");
+      await handlers.get("session_start")?.({}, ctx);
 
-    const command = "printf runtime-safe";
-    const response = await handlers.get("user_bash")?.({ command, excludeFromContext: true }, ctx);
-    assert.ok(response?.operations);
-    let output = "";
-    const result = await response.operations.exec(command, root, {
-      onData: (data: Buffer) => (output += data.toString()),
-      timeout: 5,
-      env: process.env,
-    });
+      const command = "printf runtime-safe";
+      const response = await handlers.get("user_bash")?.(
+        { command, excludeFromContext: true },
+        ctx,
+      );
+      assert.ok(response?.operations);
+      let output = "";
+      const result = await response.operations.exec(command, root, {
+        onData: (data: Buffer) => (output += data.toString()),
+        timeout: 5,
+        env: process.env,
+      });
 
-    assert.equal(result.exitCode, 0);
-    assert.match(output, /partial sandbox output/);
-    assert.match(output, /UNSANDBOXED RETRY:.*repeats side effects/);
-    assert.match(output, /runtime-safe/);
-    assert.match(output, /unsandboxed attempt succeeded/);
-    assert.match(prompts.rendered[0] ?? "", /Retry once unsandboxed/);
-    assert.match(prompts.rendered[0] ?? "", /repeats side effects/);
-    assert.equal(prompts.count, 1);
-    assert.equal(wrapMock.mock.callCount(), 1);
-    assert.equal(sentMessages.length, 0);
+      assert.equal(result.exitCode, 0);
+      assert.match(output, /partial sandbox output/);
+      assert.match(output, /UNSANDBOXED RETRY:.*repeats side effects/);
+      assert.match(output, /runtime-safe/);
+      assert.match(output, /unsandboxed attempt succeeded/);
+      assert.match(prompts.rendered[0] ?? "", /Retry once unsandboxed/);
+      assert.match(prompts.rendered[0] ?? "", /repeats side effects/);
+      assert.equal(prompts.count, 1);
+      assert.equal(wrapMock.mock.callCount(), 1);
+      assert.equal(sentMessages.length, 0);
 
-    const visibleCommand = "printf visible-runtime-safe";
-    const visible = await handlers.get("user_bash")?.({ command: visibleCommand }, ctx);
-    assert.ok(visible?.operations);
-    const visibleResult = await visible.operations.exec(visibleCommand, root, {
-      onData: () => undefined,
-      timeout: 5,
-      env: process.env,
-    });
-    assert.equal(visibleResult.exitCode, 0);
-    assert.equal(prompts.count, 2);
-    assert.match(prompts.rendered[1] ?? "", /Retry once unsandboxed/);
-    assert.equal(wrapMock.mock.callCount(), 2);
-    assert.equal(sentMessages.length, 1);
-    assert.equal(sentMessages[0]?.customType, "sandbox-diagnostic");
-    assert.equal(sentMessages[0]?.display, false);
-  } finally {
-    wrapMock.mock.restore();
-    managerMock.mock.restore();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+      const visibleCommand = "printf visible-runtime-safe";
+      const visible = await handlers.get("user_bash")?.({ command: visibleCommand }, ctx);
+      assert.ok(visible?.operations);
+      const visibleResult = await visible.operations.exec(visibleCommand, root, {
+        onData: () => undefined,
+        timeout: 5,
+        env: process.env,
+      });
+      assert.equal(visibleResult.exitCode, 0);
+      assert.equal(prompts.count, 2);
+      assert.match(prompts.rendered[1] ?? "", /Retry once unsandboxed/);
+      assert.equal(wrapMock.mock.callCount(), 2);
+      assert.equal(sentMessages.length, 1);
+      assert.equal(sentMessages[0]?.customType, "sandbox-diagnostic");
+      assert.equal(sentMessages[0]?.display, false);
+    } finally {
+      wrapMock.mock.restore();
+      managerMock.mock.restore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
-test(
-  "ordinary command failures do not offer a manual bypass",
-  { timeout: 15_000 },
-  async () => {
+test("ordinary command failures do not offer a manual bypass", { timeout: 15_000 }, async () => {
   const root = makeProjectTempDirectory("manual-bypass-ordinary-failure");
   const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
   const wrapMock = mock.method(
@@ -2328,138 +2340,155 @@ test(
   "manual bypass operations reject mismatched, reused, aborted, and stale approvals",
   { timeout: 15_000 },
   async () => {
-  const root = makeProjectTempDirectory("manual-bypass-validation");
-  mkdirSync(join(root, ".pi"), { recursive: true });
-  writeFileSync(
-    join(root, ".pi", "sandbox.json"),
-    JSON.stringify({ network: { deniedDomains: ["blocked.example"] } }),
-  );
-  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
-  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
-  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => "printf unexpected");
+    const root = makeProjectTempDirectory("manual-bypass-validation");
+    mkdirSync(join(root, ".pi"), { recursive: true });
+    writeFileSync(
+      join(root, ".pi", "sandbox.json"),
+      JSON.stringify({ network: { deniedDomains: ["blocked.example"] } }),
+    );
+    const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+    const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+    const wrapMock = mock.method(
+      SandboxManager,
+      "wrapWithSandbox",
+      async () => "printf unexpected",
+    );
 
-  try {
-    const { pi, handlers } = makePi();
-    extension(pi);
-    const ctx = makeContext(root, []);
-    const prompts = respondToPrompts(ctx, () => "u");
-    await handlers.get("session_start")?.({}, ctx);
+    try {
+      const { pi, handlers } = makePi();
+      extension(pi);
+      const ctx = makeContext(root, []);
+      const prompts = respondToPrompts(ctx, () => "u");
+      await handlers.get("session_start")?.({}, ctx);
 
-    const getBypass = async (command: string) => {
-      const response = await handlers.get("user_bash")?.(
-        { command, excludeFromContext: true },
-        ctx,
+      const getBypass = async (command: string) => {
+        const response = await handlers.get("user_bash")?.(
+          { command, excludeFromContext: true },
+          ctx,
+        );
+        assert.ok(response?.operations);
+        return response.operations;
+      };
+      const execOptions = (signal?: AbortSignal) => ({
+        onData: () => undefined,
+        timeout: 5,
+        env: process.env,
+        signal,
+      });
+
+      const wrongCommand = manualDomainCommand("blocked.example");
+      await assert.rejects(
+        (await getBypass(wrongCommand)).exec(`${wrongCommand} `, root, execOptions()),
+        /Unsandboxed approval is no longer valid for this command and session\./,
       );
-      assert.ok(response?.operations);
-      return response.operations;
-    };
-    const execOptions = (signal?: AbortSignal) => ({
-      onData: () => undefined,
-      timeout: 5,
-      env: process.env,
-      signal,
-    });
+      await assert.rejects(
+        (await getBypass(wrongCommand)).exec(wrongCommand, `${root}-wrong`, execOptions()),
+        /Unsandboxed approval is no longer valid for this command and session\./,
+      );
+      const abortController = new AbortController();
+      abortController.abort();
+      await assert.rejects(
+        (await getBypass(wrongCommand)).exec(
+          wrongCommand,
+          root,
+          execOptions(abortController.signal),
+        ),
+        /no longer valid/,
+      );
 
-    const wrongCommand = manualDomainCommand("blocked.example");
-    await assert.rejects(
-      (await getBypass(wrongCommand)).exec(`${wrongCommand} `, root, execOptions()),
-      /Unsandboxed approval is no longer valid for this command and session\./,
-    );
-    await assert.rejects(
-      (await getBypass(wrongCommand)).exec(wrongCommand, `${root}-wrong`, execOptions()),
-      /Unsandboxed approval is no longer valid for this command and session\./,
-    );
-    const abortController = new AbortController();
-    abortController.abort();
-    await assert.rejects(
-      (await getBypass(wrongCommand)).exec(wrongCommand, root, execOptions(abortController.signal)),
-      /no longer valid/,
-    );
+      const consumed = await getBypass(wrongCommand);
+      const firstRun = await consumed.exec(wrongCommand, root, execOptions());
+      assert.equal(firstRun.exitCode, 0);
+      await assert.rejects(
+        consumed.exec(wrongCommand, root, execOptions()),
+        /already been consumed/,
+      );
 
-    const consumed = await getBypass(wrongCommand);
-    const firstRun = await consumed.exec(wrongCommand, root, execOptions());
-    assert.equal(firstRun.exitCode, 0);
-    await assert.rejects(consumed.exec(wrongCommand, root, execOptions()), /already been consumed/);
+      const oldGenerationCommand = manualDomainCommand("blocked.example");
+      const oldGeneration = await getBypass(oldGenerationCommand);
+      await handlers.get("session_start")?.({}, ctx);
+      await assert.rejects(
+        oldGeneration.exec(oldGenerationCommand, root, execOptions()),
+        /no longer valid/,
+      );
 
-    const oldGenerationCommand = manualDomainCommand("blocked.example");
-    const oldGeneration = await getBypass(oldGenerationCommand);
-    await handlers.get("session_start")?.({}, ctx);
-    await assert.rejects(
-      oldGeneration.exec(oldGenerationCommand, root, execOptions()),
-      /no longer valid/,
-    );
-
-    const staleReadinessCommand = manualDomainCommand("blocked.example");
-    const staleReadiness = await getBypass(staleReadinessCommand);
-    await handlers.get("session_shutdown")?.({}, ctx);
-    await assert.rejects(
-      staleReadiness.exec(staleReadinessCommand, root, execOptions()),
-      /no longer valid/,
-    );
-    assert.equal(prompts.count, 6);
-    assert.ok(prompts.rendered.every((prompt) => /Run once unsandboxed/.test(prompt)));
-    assert.equal(wrapMock.mock.callCount(), 0);
-  } finally {
-    wrapMock.mock.restore();
-    resetMock.mock.restore();
-    managerMock.mock.restore();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+      const staleReadinessCommand = manualDomainCommand("blocked.example");
+      const staleReadiness = await getBypass(staleReadinessCommand);
+      await handlers.get("session_shutdown")?.({}, ctx);
+      await assert.rejects(
+        staleReadiness.exec(staleReadinessCommand, root, execOptions()),
+        /no longer valid/,
+      );
+      assert.equal(prompts.count, 6);
+      assert.ok(prompts.rendered.every((prompt) => /Run once unsandboxed/.test(prompt)));
+      assert.equal(wrapMock.mock.callCount(), 0);
+    } finally {
+      wrapMock.mock.restore();
+      resetMock.mock.restore();
+      managerMock.mock.restore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test(
   "manual bypass is unavailable without UI, after cancel, and after prompt timeout",
   { timeout: 15_000 },
   async () => {
-  const root = makeProjectTempDirectory("manual-bypass-no-prompt");
-  const config = makePromptTestConfig();
-  config.network!.deniedDomains = ["blocked.example"];
-  config.permissionPromptTimeoutSeconds = 0.01;
-  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
-  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => "printf unexpected");
+    const root = makeProjectTempDirectory("manual-bypass-no-prompt");
+    const config = makePromptTestConfig();
+    config.network!.deniedDomains = ["blocked.example"];
+    config.permissionPromptTimeoutSeconds = 0.01;
+    const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+    const wrapMock = mock.method(
+      SandboxManager,
+      "wrapWithSandbox",
+      async () => "printf unexpected",
+    );
 
-  try {
-    const { pi, handlers } = makePi();
-    extension(pi, { configLoader: () => config });
-    const ctx = makeContext(root, []);
-    const prompts = respondToPrompts(ctx, () => "esc");
-    await handlers.get("session_start")?.({}, ctx);
-    const command = manualDomainCommand("blocked.example");
+    try {
+      const { pi, handlers } = makePi();
+      extension(pi, { configLoader: () => config });
+      const ctx = makeContext(root, []);
+      const prompts = respondToPrompts(ctx, () => "esc");
+      await handlers.get("session_start")?.({}, ctx);
+      const command = manualDomainCommand("blocked.example");
 
-    ctx.hasUI = false;
-    const noUi = await handlers.get("user_bash")?.({ command }, ctx);
-    assert.equal(noUi?.operations, undefined);
-    assert.equal(noUi?.result?.exitCode, 1);
-    assert.equal(prompts.count, 0);
+      ctx.hasUI = false;
+      const noUi = await handlers.get("user_bash")?.({ command }, ctx);
+      assert.equal(noUi?.operations, undefined);
+      assert.equal(noUi?.result?.exitCode, 1);
+      assert.equal(prompts.count, 0);
 
-    ctx.hasUI = true;
-    const cancelled = await handlers.get("user_bash")?.({ command }, ctx);
-    assert.equal(cancelled?.operations, undefined);
-    assert.equal(cancelled?.result?.exitCode, 1);
-    assert.equal(prompts.count, 1);
+      ctx.hasUI = true;
+      const cancelled = await handlers.get("user_bash")?.({ command }, ctx);
+      assert.equal(cancelled?.operations, undefined);
+      assert.equal(cancelled?.result?.exitCode, 1);
+      assert.equal(prompts.count, 1);
 
-    let timeoutPromptCount = 0;
-    (ctx.ui as any).custom = (factory: any) =>
-      new Promise((resolve) => {
-        factory(
-          { requestRender: () => undefined },
-          { fg: (_colour: string, text: string) => text },
-          {},
-          (result: unknown) => resolve(result),
-        );
-        timeoutPromptCount += 1;
-      });
-    const timedOut = await handlers.get("user_bash")?.({ command }, ctx);
-    assert.equal(timedOut?.operations, undefined);
-    assert.equal(timedOut?.result?.exitCode, 1);
-    assert.equal(timeoutPromptCount, 1);
-    assert.equal(wrapMock.mock.callCount(), 0);
-  } finally {
-    wrapMock.mock.restore();
-    managerMock.mock.restore();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+      let timeoutPromptCount = 0;
+      (ctx.ui as any).custom = (factory: any) =>
+        new Promise((resolve) => {
+          factory(
+            { requestRender: () => undefined },
+            { fg: (_colour: string, text: string) => text },
+            {},
+            (result: unknown) => resolve(result),
+          );
+          timeoutPromptCount += 1;
+        });
+      const timedOut = await handlers.get("user_bash")?.({ command }, ctx);
+      assert.equal(timedOut?.operations, undefined);
+      assert.equal(timedOut?.result?.exitCode, 1);
+      assert.equal(timeoutPromptCount, 1);
+      assert.equal(wrapMock.mock.callCount(), 0);
+    } finally {
+      wrapMock.mock.restore();
+      managerMock.mock.restore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("user_bash streams normal output once without diagnostic metadata", async () => {
   const root = makeProjectTempDirectory("user-bash-normal");
@@ -3081,215 +3110,219 @@ test(
   "Bash write diagnostics apply shared specificity to direct and nested commands",
   { timeout: 15_000 },
   async () => {
-  const root = makeProjectTempDirectory("write-policy-matrix");
-  const outsideBase = join(dirname(root), basename(root));
-  const defaultTarget = join(root, "default", "output.txt");
-  const hardDeniedTarget = join(`${outsideBase}-hard`, "secret.txt");
-  const equalDeniedTarget = join(root, "equal", "output.txt");
-  const specificAllowedTarget = join(root, "specific", "output.txt");
-  const unmatchedTarget = join(`${outsideBase}-unmatched`, "nested", "output.txt");
-  const nestedCommand = `bash -c ${shellQuote(`printf x > ${unmatchedTarget}`)}`;
-  const outcomes = new Map<string, string[]>();
-  const attempts = new Map<string, number>();
-  const events: string[] = [];
-  const initializedAllowWrites: string[][] = [];
-  const managerMock = mock.method(
-    SandboxManager,
-    "initialize",
-    async (config: Parameters<typeof SandboxManager.initialize>[0]) => {
-      events.push("initialize");
-      initializedAllowWrites.push(config.filesystem?.allowWrite ?? []);
-    },
-  );
-  const resetMock = mock.method(SandboxManager, "reset", async () => {
-    events.push("reset");
-  });
-  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async (command: string) => {
-    const fixtureCommand = stripOrdinarySshEnvironmentPrefix(command);
-    events.push(`wrap:${fixtureCommand}`);
-    const attempt = attempts.get(fixtureCommand) ?? 0;
-    attempts.set(fixtureCommand, attempt + 1);
-    const commandOutcomes = outcomes.get(fixtureCommand);
-    assert.ok(commandOutcomes, `missing deterministic runtime fixture for ${fixtureCommand}`);
-    return commandOutcomes[Math.min(attempt, commandOutcomes.length - 1)]!;
-  });
-
-  async function runUserBash(
-    handlers: ReturnType<typeof makePi>["handlers"],
-    command: string,
-    ctx: ExtensionContext,
-  ): Promise<{ result: { exitCode: number | null }; output: string }> {
-    const response = await handlers.get("user_bash")?.({ command, excludeFromContext: false }, ctx);
-    assert.ok(response?.operations);
-    let output = "";
-    const result = await response.operations.exec(command, root, {
-      onData: (data: Buffer) => {
-        output += data.toString();
+    const root = makeProjectTempDirectory("write-policy-matrix");
+    const outsideBase = join(dirname(root), basename(root));
+    const defaultTarget = join(root, "default", "output.txt");
+    const hardDeniedTarget = join(`${outsideBase}-hard`, "secret.txt");
+    const equalDeniedTarget = join(root, "equal", "output.txt");
+    const specificAllowedTarget = join(root, "specific", "output.txt");
+    const unmatchedTarget = join(`${outsideBase}-unmatched`, "nested", "output.txt");
+    const nestedCommand = `bash -c ${shellQuote(`printf x > ${unmatchedTarget}`)}`;
+    const outcomes = new Map<string, string[]>();
+    const attempts = new Map<string, number>();
+    const events: string[] = [];
+    const initializedAllowWrites: string[][] = [];
+    const managerMock = mock.method(
+      SandboxManager,
+      "initialize",
+      async (config: Parameters<typeof SandboxManager.initialize>[0]) => {
+        events.push("initialize");
+        initializedAllowWrites.push(config.filesystem?.allowWrite ?? []);
       },
-      timeout: 5,
-      env: process.env,
+    );
+    const resetMock = mock.method(SandboxManager, "reset", async () => {
+      events.push("reset");
     });
-    return { result, output };
-  }
+    const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async (command: string) => {
+      const fixtureCommand = stripOrdinarySshEnvironmentPrefix(command);
+      events.push(`wrap:${fixtureCommand}`);
+      const attempt = attempts.get(fixtureCommand) ?? 0;
+      attempts.set(fixtureCommand, attempt + 1);
+      const commandOutcomes = outcomes.get(fixtureCommand);
+      assert.ok(commandOutcomes, `missing deterministic runtime fixture for ${fixtureCommand}`);
+      return commandOutcomes[Math.min(attempt, commandOutcomes.length - 1)]!;
+    });
 
-  try {
-    const { pi, handlers, sentMessages } = makePi();
-    extension(pi);
-    const ctx = makeContext(root, []);
-    await handlers.get("session_start")?.({}, ctx);
-    let promptCount = 0;
-    const promptSnapshots: string[] = [];
-    (ctx.ui as any).custom = (factory: any) =>
-      new Promise((resolve) => {
-        const component = factory(
-          { requestRender: () => undefined },
-          { fg: (_colour: string, text: string) => text },
-          {},
-          (result: unknown) => resolve(result),
-        );
-        const prompt = component.render(120).join("\n");
-        promptSnapshots.push(prompt);
-        promptCount += 1;
-        try {
-          if (/Allow for this session only/.test(prompt)) {
-            component.handleInput("s");
-          } else {
-            assert.match(prompt, /Retry once unsandboxed/);
-            assert.doesNotMatch(
-              prompt,
-              /Allow for this session only|Allow for this project|Allow for all projects/,
-            );
-            component.handleInput("esc");
-          }
-        } finally {
-          component.dispose?.();
-        }
-      });
-
-    const defaultCommand = `printf x > ${defaultTarget}`;
-    outcomes.set(defaultCommand, [blockedWriteCommand(defaultTarget)]);
-    const defaultEventsStart = events.length;
-    const defaultResult = await runUserBash(handlers, defaultCommand, ctx);
-    assert.equal(defaultResult.result.exitCode, 1);
-    assert.equal(promptCount, 1);
-    assert.match(promptSnapshots[0] ?? "", /Retry once unsandboxed/);
-    assert.doesNotMatch(
-      promptSnapshots[0] ?? "",
-      /Allow for this session only|Allow for this project|Allow for all projects/,
-    );
-    assert.deepEqual(events.slice(defaultEventsStart), [`wrap:${defaultCommand}`]);
-    assert.equal(attempts.get(defaultCommand), 1);
-    assert.equal(resetMock.mock.callCount(), 0);
-    assert.match(sentMessages.at(-1)?.content ?? "", /type: write/);
-    assert.equal(sentMessages.at(-1)?.content.includes(`target: ${defaultTarget}`), true);
-    assert.match(sentMessages.at(-1)?.content ?? "", /rule: allowWrite/);
-    assert.match(sentMessages.at(-1)?.content ?? "", /prompted: yes/);
-    assert.match(sentMessages.at(-1)?.content ?? "", /choice: abort/);
-    assert.match(sentMessages.at(-1)?.content ?? "", /retried: no/);
-    assert.match(sentMessages.at(-1)?.content ?? "", /final_outcome: failure/);
-    assert.match(sentMessages.at(-1)?.content ?? "", /action: write access allowed/);
-
-    mkdirSync(join(root, ".pi"), { recursive: true });
-    writeFileSync(
-      join(root, ".pi", "sandbox.json"),
-      JSON.stringify({
-        filesystem: {
-          allowWrite: ["./specific", join(root, "*", "output.txt")],
-          denyWrite: [".", hardDeniedTarget, join(root, "equal", "*")],
+    async function runUserBash(
+      handlers: ReturnType<typeof makePi>["handlers"],
+      command: string,
+      ctx: ExtensionContext,
+    ): Promise<{ result: { exitCode: number | null }; output: string }> {
+      const response = await handlers.get("user_bash")?.(
+        { command, excludeFromContext: false },
+        ctx,
+      );
+      assert.ok(response?.operations);
+      let output = "";
+      const result = await response.operations.exec(command, root, {
+        onData: (data: Buffer) => {
+          output += data.toString();
         },
-      }),
-    );
-
-    const policyCases = [
-      {
-        target: hardDeniedTarget,
-        rule: "denyWrite",
-        action: "blocked by denyWrite; change policy",
-      },
-      {
-        target: equalDeniedTarget,
-        rule: "denyWrite",
-        action: "blocked by denyWrite; change policy",
-      },
-      {
-        target: specificAllowedTarget,
-        rule: "allowWrite",
-        action: "write access allowed",
-      },
-    ] as const;
-
-    for (const policyCase of policyCases) {
-      for (const nested of [false, true]) {
-        const command = `printf x > ${policyCase.target}`;
-        const executedCommand = nested ? `bash -c ${shellQuote(command)}` : command;
-        outcomes.set(executedCommand, [blockedWriteCommand(policyCase.target, nested)]);
-        const promptCountBefore = promptCount;
-        const eventsStart = events.length;
-        const resetsBefore = resetMock.mock.callCount();
-        const initializationsBefore = initializedAllowWrites.length;
-        const response = await runUserBash(handlers, executedCommand, ctx);
-        assert.equal(response.result.exitCode, 1);
-        assert.equal(promptCount, promptCountBefore + 1);
-        const prompt = promptSnapshots.at(-1) ?? "";
-        assert.match(prompt, /Retry once unsandboxed/);
-        assert.doesNotMatch(
-          prompt,
-          /Allow for this session only|Allow for this project|Allow for all projects/,
-        );
-        assert.equal(attempts.get(executedCommand), 1);
-        assert.equal(resetMock.mock.callCount(), resetsBefore);
-        assert.equal(initializedAllowWrites.length, initializationsBefore);
-        assert.deepEqual(events.slice(eventsStart), [`wrap:${executedCommand}`]);
-        assert.equal(response.output.includes("retrying"), false);
-
-        const diagnostic = sentMessages.at(-1)?.content ?? "";
-        assert.match(diagnostic, /type: write/);
-        assert.equal(diagnostic.includes(`target: ${policyCase.target}`), true);
-        assert.equal(diagnostic.includes(`rule: ${policyCase.rule}`), true);
-        assert.match(diagnostic, /prompted: yes/);
-        assert.match(diagnostic, /choice: abort/);
-        assert.match(diagnostic, /retried: no/);
-        assert.match(diagnostic, /final_outcome: failure/);
-        assert.equal(diagnostic.includes(`action: ${policyCase.action}`), true);
-      }
+        timeout: 5,
+        env: process.env,
+      });
+      return { result, output };
     }
 
-    const retryEventsStart = events.length;
-    const retryInitializationsStart = initializedAllowWrites.length;
-    const retryPromptCountStart = promptCount;
-    outcomes.set(nestedCommand, [
-      blockedWriteCommand(unmatchedTarget, true),
-      "printf nested-success",
-    ]);
-    const nestedResult = await runUserBash(handlers, nestedCommand, ctx);
-    assert.equal(nestedResult.result.exitCode, 0);
-    assert.equal(promptCount, retryPromptCountStart + 1);
-    assert.match(promptSnapshots.at(-1) ?? "", /Allow for this session only/);
-    assert.match(promptSnapshots.at(-1) ?? "", /Retry once unsandboxed/);
-    assert.match(nestedResult.output, /retried successfully/);
-    assert.match(sentMessages.at(-1)?.content ?? "", /final_outcome: success/);
-    assert.match(sentMessages.at(-1)?.content ?? "", /retried: yes/);
-    assert.match(sentMessages.at(-1)?.content ?? "", /choice: session/);
-    assert.deepEqual(events.slice(retryEventsStart), [
-      `wrap:${nestedCommand}`,
-      "reset",
-      "initialize",
-      `wrap:${nestedCommand}`,
-    ]);
-    assert.equal(initializedAllowWrites.length, retryInitializationsStart + 1);
-    assert.equal(initializedAllowWrites.at(-1)?.includes(unmatchedTarget), true);
-    assert.equal(promptCount, 8);
-    assert.equal(promptSnapshots.length, promptCount);
+    try {
+      const { pi, handlers, sentMessages } = makePi();
+      extension(pi);
+      const ctx = makeContext(root, []);
+      await handlers.get("session_start")?.({}, ctx);
+      let promptCount = 0;
+      const promptSnapshots: string[] = [];
+      (ctx.ui as any).custom = (factory: any) =>
+        new Promise((resolve) => {
+          const component = factory(
+            { requestRender: () => undefined },
+            { fg: (_colour: string, text: string) => text },
+            {},
+            (result: unknown) => resolve(result),
+          );
+          const prompt = component.render(120).join("\n");
+          promptSnapshots.push(prompt);
+          promptCount += 1;
+          try {
+            if (/Allow for this session only/.test(prompt)) {
+              component.handleInput("s");
+            } else {
+              assert.match(prompt, /Retry once unsandboxed/);
+              assert.doesNotMatch(
+                prompt,
+                /Allow for this session only|Allow for this project|Allow for all projects/,
+              );
+              component.handleInput("esc");
+            }
+          } finally {
+            component.dispose?.();
+          }
+        });
 
-    const persisted = JSON.parse(readFileSync(join(root, ".pi", "sandbox.json"), "utf8"));
-    assert.equal(persisted.filesystem.allowWrite.includes(unmatchedTarget), false);
-  } finally {
-    wrapMock.mock.restore();
-    resetMock.mock.restore();
-    managerMock.mock.restore();
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+      const defaultCommand = `printf x > ${defaultTarget}`;
+      outcomes.set(defaultCommand, [blockedWriteCommand(defaultTarget)]);
+      const defaultEventsStart = events.length;
+      const defaultResult = await runUserBash(handlers, defaultCommand, ctx);
+      assert.equal(defaultResult.result.exitCode, 1);
+      assert.equal(promptCount, 1);
+      assert.match(promptSnapshots[0] ?? "", /Retry once unsandboxed/);
+      assert.doesNotMatch(
+        promptSnapshots[0] ?? "",
+        /Allow for this session only|Allow for this project|Allow for all projects/,
+      );
+      assert.deepEqual(events.slice(defaultEventsStart), [`wrap:${defaultCommand}`]);
+      assert.equal(attempts.get(defaultCommand), 1);
+      assert.equal(resetMock.mock.callCount(), 0);
+      assert.match(sentMessages.at(-1)?.content ?? "", /type: write/);
+      assert.equal(sentMessages.at(-1)?.content.includes(`target: ${defaultTarget}`), true);
+      assert.match(sentMessages.at(-1)?.content ?? "", /rule: allowWrite/);
+      assert.match(sentMessages.at(-1)?.content ?? "", /prompted: yes/);
+      assert.match(sentMessages.at(-1)?.content ?? "", /choice: abort/);
+      assert.match(sentMessages.at(-1)?.content ?? "", /retried: no/);
+      assert.match(sentMessages.at(-1)?.content ?? "", /final_outcome: failure/);
+      assert.match(sentMessages.at(-1)?.content ?? "", /action: write access allowed/);
+
+      mkdirSync(join(root, ".pi"), { recursive: true });
+      writeFileSync(
+        join(root, ".pi", "sandbox.json"),
+        JSON.stringify({
+          filesystem: {
+            allowWrite: ["./specific", join(root, "*", "output.txt")],
+            denyWrite: [".", hardDeniedTarget, join(root, "equal", "*")],
+          },
+        }),
+      );
+
+      const policyCases = [
+        {
+          target: hardDeniedTarget,
+          rule: "denyWrite",
+          action: "blocked by denyWrite; change policy",
+        },
+        {
+          target: equalDeniedTarget,
+          rule: "denyWrite",
+          action: "blocked by denyWrite; change policy",
+        },
+        {
+          target: specificAllowedTarget,
+          rule: "allowWrite",
+          action: "write access allowed",
+        },
+      ] as const;
+
+      for (const policyCase of policyCases) {
+        for (const nested of [false, true]) {
+          const command = `printf x > ${policyCase.target}`;
+          const executedCommand = nested ? `bash -c ${shellQuote(command)}` : command;
+          outcomes.set(executedCommand, [blockedWriteCommand(policyCase.target, nested)]);
+          const promptCountBefore: number = promptCount;
+          const eventsStart = events.length;
+          const resetsBefore = resetMock.mock.callCount();
+          const initializationsBefore = initializedAllowWrites.length;
+          const response = await runUserBash(handlers, executedCommand, ctx);
+          assert.equal(response.result.exitCode, 1);
+          assert.equal(promptCount, promptCountBefore + 1);
+          const prompt = promptSnapshots.at(-1) ?? "";
+          assert.match(prompt, /Retry once unsandboxed/);
+          assert.doesNotMatch(
+            prompt,
+            /Allow for this session only|Allow for this project|Allow for all projects/,
+          );
+          assert.equal(attempts.get(executedCommand), 1);
+          assert.equal(resetMock.mock.callCount(), resetsBefore);
+          assert.equal(initializedAllowWrites.length, initializationsBefore);
+          assert.deepEqual(events.slice(eventsStart), [`wrap:${executedCommand}`]);
+          assert.equal(response.output.includes("retrying"), false);
+
+          const diagnostic = sentMessages.at(-1)?.content ?? "";
+          assert.match(diagnostic, /type: write/);
+          assert.equal(diagnostic.includes(`target: ${policyCase.target}`), true);
+          assert.equal(diagnostic.includes(`rule: ${policyCase.rule}`), true);
+          assert.match(diagnostic, /prompted: yes/);
+          assert.match(diagnostic, /choice: abort/);
+          assert.match(diagnostic, /retried: no/);
+          assert.match(diagnostic, /final_outcome: failure/);
+          assert.equal(diagnostic.includes(`action: ${policyCase.action}`), true);
+        }
+      }
+
+      const retryEventsStart = events.length;
+      const retryInitializationsStart = initializedAllowWrites.length;
+      const retryPromptCountStart = promptCount;
+      outcomes.set(nestedCommand, [
+        blockedWriteCommand(unmatchedTarget, true),
+        "printf nested-success",
+      ]);
+      const nestedResult = await runUserBash(handlers, nestedCommand, ctx);
+      assert.equal(nestedResult.result.exitCode, 0);
+      assert.equal(promptCount, retryPromptCountStart + 1);
+      assert.match(promptSnapshots.at(-1) ?? "", /Allow for this session only/);
+      assert.match(promptSnapshots.at(-1) ?? "", /Retry once unsandboxed/);
+      assert.match(nestedResult.output, /retried successfully/);
+      assert.match(sentMessages.at(-1)?.content ?? "", /final_outcome: success/);
+      assert.match(sentMessages.at(-1)?.content ?? "", /retried: yes/);
+      assert.match(sentMessages.at(-1)?.content ?? "", /choice: session/);
+      assert.deepEqual(events.slice(retryEventsStart), [
+        `wrap:${nestedCommand}`,
+        "reset",
+        "initialize",
+        `wrap:${nestedCommand}`,
+      ]);
+      assert.equal(initializedAllowWrites.length, retryInitializationsStart + 1);
+      assert.equal(initializedAllowWrites.at(-1)?.includes(unmatchedTarget), true);
+      assert.equal(promptCount, 8);
+      assert.equal(promptSnapshots.length, promptCount);
+
+      const persisted = JSON.parse(readFileSync(join(root, ".pi", "sandbox.json"), "utf8"));
+      assert.equal(persisted.filesystem.allowWrite.includes(unmatchedTarget), false);
+    } finally {
+      wrapMock.mock.restore();
+      resetMock.mock.restore();
+      managerMock.mock.restore();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("write approval does not retry after sandbox reinitialization fails", async () => {
   const root = makeProjectTempDirectory("write-refresh-failure");
