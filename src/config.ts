@@ -15,7 +15,6 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export type SandboxConfig = Omit<SandboxRuntimeConfig, "network" | "credentials"> & {
   enabled?: boolean;
-  sandboxUserShell?: boolean;
   permissionPromptTimeoutSeconds?: number;
   credentials?: CredentialsConfig;
   network?: NonNullable<SandboxRuntimeConfig["network"]> & {
@@ -40,7 +39,6 @@ export const DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS = 10 * 60;
 
 export const DEFAULT_CONFIG: SandboxConfig = {
   enabled: true,
-  sandboxUserShell: true,
   permissionPromptTimeoutSeconds: DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS,
   network: {
     allowUnauthenticatedSocksProxy: process.platform === "darwin",
@@ -114,10 +112,6 @@ const runtimeConfigScalarKeys = [
 
 const topLevelScalarValidators: Record<string, ScalarValidator> = {
   enabled: {
-    schema: { safeParse: (value) => ({ success: typeof value === "boolean" }) },
-    expected: "a boolean",
-  },
-  sandboxUserShell: {
     schema: { safeParse: (value) => ({ success: typeof value === "boolean" }) },
     expected: "a boolean",
   },
@@ -195,16 +189,21 @@ function validatedSection(
 }
 
 function mergeObjects(base: SandboxConfig, overrides: SandboxConfigFile): SandboxConfig {
+  if (Object.hasOwn(overrides, "sandboxUserShell")) {
+    console.error(
+      "Warning: Ignoring deprecated sandboxUserShell; use explicit per-command approval to bypass manual !/!! sandboxing",
+    );
+  }
   const network = validatedSection(overrides.network, "network", networkScalarValidators);
   const { sshProxy: _ignoredSshProxy, ...safeNetwork } = network;
   const filesystem = validatedSection(overrides.filesystem, "filesystem", {
     disabled: { schema: FilesystemConfigSchema.shape.disabled, expected: "a boolean" },
   });
-  const { credentials: _ignoredCredentials, ...safeOverrides } = validatedSection(
-    overrides,
-    "",
-    topLevelScalarValidators,
-  );
+  const {
+    credentials: _ignoredCredentials,
+    sandboxUserShell: _ignoredSandboxUserShell,
+    ...safeOverrides
+  } = validatedSection(overrides, "", topLevelScalarValidators);
 
   return {
     ...base,

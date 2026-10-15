@@ -4,6 +4,7 @@ import { SandboxManager } from "@carderne/sandbox-runtime";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createBashToolDefinition,
+  createLocalBashOperations,
   isBashToolResult,
   isToolCallEventType,
   SettingsManager,
@@ -68,10 +69,14 @@ import {
 } from "./status.ts";
 import {
   formatSandboxConfiguration,
+  type ManualBypassChoice,
+  type ManualBypassOption,
+  type PermissionChoice,
   type PermissionPromptResult,
   type SshPermissionChoice,
   promptDomainBlock,
   promptReadBlock,
+  promptManualBypass,
   promptSshAuthBlock,
   promptWriteBlock,
   warnIfAllDomainsAllowed,
@@ -457,6 +462,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     choice:
       | Exclude<PermissionPromptResult["action"], "abort">
       | SshPermissionChoice
+      | ManualBypassChoice
       | "abort"
       | "none",
   ): SandboxIncident["configMutation"] {
@@ -491,16 +497,35 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     });
   }
 
+  function manualBypassOption(action: ManualBypassChoice): ManualBypassOption {
+    const commandWarning =
+      "The entire original command runs without sandbox restrictions, not just this target.";
+    return {
+      action,
+      label: action === "run-once-unsandboxed" ? "Run once unsandboxed" : "Retry once unsandboxed",
+      warning:
+        action === "run-once-unsandboxed"
+          ? commandWarning
+          : `${commandWarning} The command may have partly run; retrying repeats side effects.`,
+    };
+  }
+
   async function requestSshAuthAccess(
     ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
     socketPath: string,
-  ): Promise<"abort" | "ssh-session" | "none"> {
-    if (platform === "linux") return "none";
-    const choice = await promptSshAuthBlock(
-      pi,
-      ctx,
-      readConfig(ctx.cwd).permissionPromptTimeoutSeconds,
-    );
+    bypassAction?: ManualBypassChoice,
+  ): Promise<"abort" | "ssh-session" | ManualBypassChoice | "none"> {
+    if (platform === "linux" && !bypassAction) return "none";
+    const timeout = readConfig(ctx.cwd).permissionPromptTimeoutSeconds;
+    const choice = bypassAction
+      ? await promptSshAuthBlock(pi, ctx, timeout, {
+          ...manualBypassOption(bypassAction),
+          allowSession: platform !== "linux",
+        })
+      : await promptSshAuthBlock(pi, ctx, timeout);
+    if (choice.action === "run-once-unsandboxed" || choice.action === "retry-once-unsandboxed") {
+      return bypassAction ? choice.action : "none";
+    }
     if (choice.action !== "ssh-session") {
       return choice.action === "abort" ? "abort" : "none";
     }
@@ -527,7 +552,8 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
     command: string,
     incident: SandboxIncident,
-  ): Promise<"not-needed" | "allowed" | "blocked"> {
+    manual: boolean,
+  ): Promise<"not-needed" | "allowed" | "blocked" | "run-once-unsandboxed"> {
     const config = readConfig(ctx.cwd);
     const sshAuthSock = process.env.SSH_AUTH_SOCK;
     const result = await runSshAuthPreflight({
@@ -536,13 +562,20 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       allowedSockets: effectiveUnixSockets(ctx.cwd),
       allowAllSockets: config.network?.allowAllUnixSockets === true,
       platform,
+      manualBypass: manual,
       requestAccess: async (socketPath) => {
         const diagnostic = sshDiagnostic(socketPath);
         incident.violations = addUniqueDiagnostics(incident.violations, [diagnostic]);
         incident.primaryViolation = selectPrimaryViolation(incident.violations);
         incident.attributed = true;
-        const choice = await promptForDiagnostic(ctx, diagnostic, incident);
-        return choice === "ssh-session";
+        const choice = await promptForDiagnostic(
+          ctx,
+          diagnostic,
+          incident,
+          manual ? "user_bash" : "bash",
+          "run-once-unsandboxed",
+        );
+        return choice === "ssh-session" ? true : choice === "run-once-unsandboxed" ? choice : false;
       },
     });
     if (result === "blocked" && sshAuthSock) {
@@ -554,19 +587,55 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     return result;
   }
 
+  function manualBypassAllowed(
+    diagnostic: SandboxDiagnostic,
+    cwd: string,
+    structuredAmbiguous = false,
+  ): boolean {
+    if (diagnostic.type === "browser-process") return true;
+    if (diagnostic.type === "ambiguous") return structuredAmbiguous;
+    if (
+      diagnostic.type !== "network" &&
+      diagnostic.type !== "read" &&
+      diagnostic.type !== "write"
+    ) {
+      return false;
+    }
+    const target = diagnostic.rawTarget ?? diagnostic.target;
+    if (isSandboxConfigPath(target, cwd)) return false;
+    return diagnostic.type !== "write" || !isMandatoryWritePath(target, cwd);
+  }
+
   async function promptForDiagnostic(
     ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
     diagnostic: SandboxDiagnostic,
     incident: SandboxIncident,
-  ): Promise<"abort" | "session" | "project" | "global" | "ssh-session" | "none"> {
+    source: "bash" | "user_bash",
+    bypassAction: ManualBypassChoice = "retry-once-unsandboxed",
+    allowManualRuntimeBypass = true,
+  ): Promise<
+    "abort" | "session" | "project" | "global" | "ssh-session" | ManualBypassChoice | "none"
+  > {
+    const manual = source === "user_bash";
+    const bypassAllowed =
+      manual &&
+      allowManualRuntimeBypass &&
+      (diagnostic.type === "ssh-auth" ||
+        manualBypassAllowed(
+          diagnostic,
+          ctx.cwd,
+          diagnostic.type === "ambiguous" && allowManualRuntimeBypass,
+        ));
     if (
       !ctx.hasUI ||
-      !diagnostic.promptable ||
+      (!diagnostic.promptable && !bypassAllowed && diagnostic.type !== "ssh-auth") ||
+      (diagnostic.type === "ssh-auth" && !diagnostic.promptable && !manual) ||
       incident.promptCount >= 2 ||
       (diagnostic.type !== "network" &&
         diagnostic.type !== "read" &&
         diagnostic.type !== "write" &&
-        diagnostic.type !== "ssh-auth")
+        diagnostic.type !== "ssh-auth" &&
+        !bypassAllowed)
     ) {
       return "none";
     }
@@ -576,29 +645,148 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     const timeout = readConfig(ctx.cwd).permissionPromptTimeoutSeconds;
     const target = diagnostic.rawTarget ?? diagnostic.target;
     if (diagnostic.type === "ssh-auth") {
-      const choice = await requestSshAuthAccess(ctx, target);
+      const choice = await requestSshAuthAccess(
+        ctx,
+        target,
+        bypassAllowed ? bypassAction : undefined,
+      );
       incident.promptChoice = choice;
       incident.configMutation = mutationForChoice(choice);
+      if (choice === "run-once-unsandboxed" || choice === "retry-once-unsandboxed") {
+        if (!bypassAllowed) return "none";
+        diagnostic.action = `approved manual ${choice === "run-once-unsandboxed" ? "run" : "retry"} once unsandboxed`;
+      }
       return choice;
     }
 
-    const choice =
-      diagnostic.type === "network"
-        ? await promptDomainBlock(pi, ctx, target, timeout)
-        : diagnostic.type === "read"
-          ? await promptReadBlock(pi, ctx, target, timeout)
-          : await promptWriteBlock(pi, ctx, target, timeout);
-
+    const bypass = bypassAllowed ? manualBypassOption(bypassAction) : undefined;
+    let choice: PermissionPromptResult<PermissionChoice | ManualBypassChoice>;
+    if (
+      !diagnostic.promptable ||
+      diagnostic.type === "browser-process" ||
+      diagnostic.type === "ambiguous"
+    ) {
+      if (!bypass) return "none";
+      choice = await promptManualBypass(
+        pi,
+        ctx,
+        `${diagnostic.type} blocked by ${diagnostic.rule}: run this manual command once unsandboxed?`,
+        target,
+        timeout,
+        bypass,
+      );
+    } else if (diagnostic.type === "network") {
+      choice = bypass
+        ? await promptDomainBlock(pi, ctx, target, timeout, bypass)
+        : await promptDomainBlock(pi, ctx, target, timeout);
+    } else if (diagnostic.type === "read") {
+      choice = bypass
+        ? await promptReadBlock(pi, ctx, target, timeout, bypass)
+        : await promptReadBlock(pi, ctx, target, timeout);
+    } else if (diagnostic.type === "write") {
+      choice = bypass
+        ? await promptWriteBlock(pi, ctx, target, timeout, bypass)
+        : await promptWriteBlock(pi, ctx, target, timeout);
+    } else {
+      return "none";
+    }
     incident.promptChoice = choice.action;
     incident.configMutation = mutationForChoice(choice.action);
     if (choice.action === "abort") return "abort";
-    const refreshed = await applyChoice(
-      choice.action,
-      diagnostic.type === "network" ? "domain" : diagnostic.type,
-      choice.value,
-      ctx.cwd,
-    );
+    if (choice.action === "run-once-unsandboxed" || choice.action === "retry-once-unsandboxed") {
+      if (!bypassAllowed) return "none";
+      diagnostic.action = `approved manual ${choice.action === "run-once-unsandboxed" ? "run" : "retry"} once unsandboxed`;
+      incident.configMutation = "none";
+      return choice.action;
+    }
+    if (choice.action !== "session" && choice.action !== "project" && choice.action !== "global") {
+      return "none";
+    }
+    const kind =
+      diagnostic.type === "network"
+        ? "domain"
+        : diagnostic.type === "read" || diagnostic.type === "write"
+          ? diagnostic.type
+          : null;
+    if (!kind) return "none";
+    const refreshed = await applyChoice(choice.action, kind, choice.value, ctx.cwd);
     return refreshed ? choice.action : "none";
+  }
+
+  function createManualBypassOperations(
+    ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
+    command: string,
+    cwd: string,
+    expectedGeneration: number,
+    shellPath: string | undefined,
+    incident: SandboxIncident,
+    recordDiagnosticInContext: boolean,
+    retry: boolean,
+  ): ReturnType<typeof createLocalBashOperations> {
+    const localOperations = createLocalBashOperations({ shellPath });
+    let consumed = false;
+    return {
+      async exec(approvedCommand, approvedCwd, execOptions) {
+        if (consumed) throw new Error("Unsandboxed approval has already been consumed.");
+        consumed = true;
+        let currentCwd: string;
+        try {
+          currentCwd = ctx.cwd;
+        } catch {
+          throw new Error("Unsandboxed approval belongs to a stale session.");
+        }
+        if (
+          approvedCommand !== command ||
+          approvedCwd !== cwd ||
+          currentCwd !== cwd ||
+          execOptions.signal?.aborted ||
+          sandboxExecutionBlocked() ||
+          !sandboxReady() ||
+          sessionGeneration !== expectedGeneration ||
+          sandboxRuntimeCwd !== cwd ||
+          isGitUpstreamMutationCommand(command) ||
+          bashCommandMentionsSandboxConfig(command, cwd)
+        ) {
+          throw new Error("Unsandboxed approval is no longer valid for this command and session.");
+        }
+
+        incident.retried = retry;
+        if (incident.primaryViolation) {
+          incident.primaryViolation.action = `unsandboxed ${retry ? "retry" : "run once"} attempt started`;
+        }
+        const attemptLabel = retry
+          ? "\n--- UNSANDBOXED RETRY: the sandboxed command may already have partly run; this repeats side effects ---\n"
+          : "\n--- RUNNING ONCE UNSANDBOXED: approved for this manual command only ---\n";
+        execOptions.onData(Buffer.from(attemptLabel));
+
+        const finish = (): void => {
+          if (incident.primaryViolation) {
+            incident.primaryViolation.action = `unsandboxed ${retry ? "retry" : "run once"} attempt finished`;
+          }
+          const data = getDiagnosticBlockData(incident);
+          const block = renderDiagnosticBlock(incident);
+          if (recordDiagnosticInContext && block) {
+            pi.sendMessage({ customType: "sandbox-diagnostic", content: block, display: false });
+          }
+          if (data) execOptions.onData(Buffer.from(`\n${renderDiagnosticNotice(data)}\n`));
+          storeIncident(incident);
+        };
+
+        try {
+          const result = await localOperations.exec(command, cwd, {
+            ...execOptions,
+            onData: (data) => execOptions.onData(data),
+          });
+          incident.finalOutcome = result.exitCode === 0 ? "success" : "failure";
+          finish();
+          return result;
+        } catch (error) {
+          incident.finalOutcome = "failure";
+          finish();
+          throw error;
+        }
+      },
+    };
   }
 
   function createDiagnosticOperations(
@@ -609,8 +797,10 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     onDetails?: (details: DiagnosticResultDetails | undefined) => void,
     initialIncident?: SandboxIncident,
     expectedGeneration = sessionGeneration,
+    approvedManualCommand?: { command: string; cwd: string },
   ): ReturnType<typeof createSandboxedBashOps> {
     const baseOperations = createSandboxedBashOps(shellPath);
+    let unsandboxedAttemptConsumed = false;
     return {
       async exec(command, cwd, execOptions) {
         if (
@@ -620,12 +810,36 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         ) {
           throw new Error("Sandbox is not ready; command execution remains blocked.");
         }
+        if (unsandboxedAttemptConsumed) {
+          throw new Error("Unsandboxed approval has already been consumed.");
+        }
+        if (
+          source === "user_bash" &&
+          approvedManualCommand &&
+          (command !== approvedManualCommand.command || cwd !== approvedManualCommand.cwd)
+        ) {
+          throw new Error("Manual command approval applies only to the original command and cwd.");
+        }
         const incident = initialIncident ?? incidentFor(source, command);
         let lastPrompted: SandboxDiagnostic | undefined;
         let lastResult: { exitCode: number | null } = { exitCode: 1 };
         let visibleOutput = "";
 
-        const sshPreflight = await runSshPreflight(ctx, command, incident);
+        const manualCommand = source === "user_bash";
+        const sshPreflight = await runSshPreflight(ctx, command, incident, manualCommand);
+        if (sshPreflight === "run-once-unsandboxed" && manualCommand) {
+          unsandboxedAttemptConsumed = true;
+          return createManualBypassOperations(
+            ctx,
+            command,
+            cwd,
+            expectedGeneration,
+            shellPath,
+            incident,
+            recordDiagnosticInContext,
+            false,
+          ).exec(command, cwd, execOptions);
+        }
         if (sshPreflight === "blocked") {
           incident.finalOutcome = "failure";
           const reason =
@@ -713,14 +927,59 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
           incident.finalOutcome = lastResult.exitCode === 0 ? "success" : "failure";
 
           const primary = selectPrimaryViolation(diagnostics);
-          const canRetry =
+          const hasProtectedBypassTarget = diagnostics.some((diagnostic) => {
+            const target = diagnostic.rawTarget ?? diagnostic.target;
+            return (
+              isSandboxConfigPath(target, cwd) ||
+              (diagnostic.type === "write" && isMandatoryWritePath(target, cwd))
+            );
+          });
+          const recognizedFallbackBypass =
+            events.length === 0 &&
+            (primary?.type === "network" ||
+              primary?.type === "read" ||
+              primary?.type === "write");
+          const confirmedManualBypass =
+            !hasProtectedBypassTarget &&
+            (events.length > 0 ||
+              recognizedFallbackBypass ||
+              primary?.type === "browser-process" ||
+              primary?.type === "ssh-auth");
+          const canPromptAgain =
+            lastResult.exitCode !== null &&
             lastResult.exitCode !== 0 &&
-            primary?.promptable === true &&
+            !execOptions.signal?.aborted &&
+            primary !== undefined &&
+            (primary.promptable ||
+              (manualCommand &&
+                confirmedManualBypass &&
+                (primary.type === "ssh-auth" ||
+                  manualBypassAllowed(primary, cwd, events.length > 0)))) &&
             (lastPrompted === undefined || isMateriallyDifferent(lastPrompted, primary)) &&
             incident.promptCount < 2;
-          if (canRetry) {
-            const choice = await promptForDiagnostic(ctx, primary, incident);
+          if (canPromptAgain) {
+            const choice = await promptForDiagnostic(
+              ctx,
+              primary,
+              incident,
+              source,
+              "retry-once-unsandboxed",
+              confirmedManualBypass,
+            );
             lastPrompted = primary;
+            if (choice === "retry-once-unsandboxed" && manualCommand) {
+              unsandboxedAttemptConsumed = true;
+              return createManualBypassOperations(
+                ctx,
+                command,
+                cwd,
+                expectedGeneration,
+                shellPath,
+                incident,
+                recordDiagnosticInContext,
+                true,
+              ).exec(command, cwd, execOptions);
+            }
             if (choice !== "abort" && choice !== "none") {
               incident.retried = true;
               const retryNotice = "\n--- Sandbox permission granted, retrying ---\n";
@@ -1065,18 +1324,30 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     }
     if (sandboxExecutionBlocked()) return sandboxExecutionBlockedResult();
     if (!sandboxRequested() || !sandboxReady()) return;
+    const eventCwd = event.cwd ?? ctx.cwd;
+    if (eventCwd !== ctx.cwd) return sandboxExecutionBlockedResult();
     const expectedGeneration = sessionGeneration;
-    if (sandboxRuntimeCwd !== ctx.cwd) {
+    if (sandboxRuntimeCwd !== eventCwd) {
       const refreshed = await refreshSandbox(ctx.cwd, expectedGeneration);
       if (!refreshed || sessionGeneration !== expectedGeneration || sandboxExecutionBlocked()) {
         return sandboxExecutionBlockedResult();
       }
     }
 
-    const config = readConfig(ctx.cwd);
-    if (config.sandboxUserShell === false) return;
+    const config = readConfig(eventCwd);
     const incident = incidentFor("user_bash", event.command);
     const recordDiagnosticInContext = !event.excludeFromContext;
+    const bypassOperations = (retry: boolean) =>
+      createManualBypassOperations(
+        ctx,
+        event.command,
+        eventCwd,
+        expectedGeneration,
+        userShellPath,
+        incident,
+        recordDiagnosticInContext,
+        retry,
+      );
     for (const domain of extractDomainsFromCommand(event.command)) {
       const domainPolicy = decideDomainPolicy(
         domain,
@@ -1095,6 +1366,16 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         incident.violations = addUniqueDiagnostics(incident.violations, [diagnostic]);
         incident.primaryViolation = selectPrimaryViolation(incident.violations);
         incident.attributed = true;
+        const choice = await promptForDiagnostic(
+          ctx,
+          diagnostic,
+          incident,
+          "user_bash",
+          "run-once-unsandboxed",
+        );
+        if (choice === "run-once-unsandboxed") {
+          return { operations: bypassOperations(false) };
+        }
         incident.finalOutcome = "failure";
         const block = renderDiagnosticBlock(incident);
         const data = getDiagnosticBlockData(incident);
@@ -1123,7 +1404,16 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         incident.violations = addUniqueDiagnostics(incident.violations, [diagnostic]);
         incident.primaryViolation = selectPrimaryViolation(incident.violations);
         incident.attributed = true;
-        const choice = await promptForDiagnostic(ctx, diagnostic, incident);
+        const choice = await promptForDiagnostic(
+          ctx,
+          diagnostic,
+          incident,
+          "user_bash",
+          "run-once-unsandboxed",
+        );
+        if (choice === "run-once-unsandboxed") {
+          return { operations: bypassOperations(false) };
+        }
         if (choice === "abort" || choice === "none") {
           incident.finalOutcome = "failure";
           const block = renderDiagnosticBlock(incident);
@@ -1152,6 +1442,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         undefined,
         incident,
         expectedGeneration,
+        { command: event.command, cwd: eventCwd },
       ),
     };
   });

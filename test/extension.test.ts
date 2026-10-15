@@ -172,6 +172,27 @@ function makeContext(
   } as unknown as ExtensionContext;
 }
 
+function respondToPrompts(ctx: ExtensionContext, key: () => string) {
+  const state = { count: 0, rendered: [] as string[] };
+  (ctx.ui as any).custom = (factory: any) =>
+    new Promise((resolve) => {
+      const component = factory(
+        { requestRender: () => undefined },
+        { fg: (_colour: string, text: string) => text },
+        {},
+        (result: unknown) => resolve(result),
+      );
+      state.count += 1;
+      state.rendered.push(component.render(120).join("\n"));
+      component.handleInput(key());
+    });
+  return state;
+}
+
+function manualDomainCommand(domain: string): string {
+  return `printf '%s' ${shellQuote(`https://${domain}`)}`;
+}
+
 function makeStaleContext(): ExtensionContext {
   return {
     get cwd(): string {
@@ -1883,6 +1904,11 @@ test("blocks every positive Git tracking mutation before Bash execution and pass
     const { pi, handlers, tools } = makePi();
     extension(pi);
     const ctx = makeContext(root, []);
+    let promptCount = 0;
+    (ctx.ui as any).custom = () => {
+      promptCount += 1;
+      throw new Error("hard Git/config guards must not prompt");
+    };
     const handler = handlers.get("tool_call");
     assert.ok(handler);
 
@@ -1915,6 +1941,12 @@ test("blocks every positive Git tracking mutation before Bash execution and pass
       ctx,
     );
     assert.equal(userBash?.result?.exitCode, 1);
+    const configMutation = await handlers.get("user_bash")?.(
+      { command: `printf x > ${join(root, ".pi", "sandbox.json")}` },
+      ctx,
+    );
+    assert.equal(configMutation?.result?.exitCode, 1);
+    assert.equal(promptCount, 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -2005,6 +2037,398 @@ test("bash rendering hides raw metadata and reveals output and truncation only w
   assert.doesNotMatch(expanded, /<sandbox_diagnostic>/);
 });
 
+test("manual domain bypass runs once locally without persisting access", async () => {
+  const root = makeProjectTempDirectory("manual-domain-bypass");
+  mkdirSync(join(root, ".pi"), { recursive: true });
+  writeFileSync(
+    join(root, ".pi", "sandbox.json"),
+    JSON.stringify({ network: { deniedDomains: ["denied.example"] } }),
+  );
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => "printf sandboxed-next");
+
+  try {
+    const { pi, handlers, sentMessages } = makePi();
+    extension(pi);
+    const ctx = makeContext(root, []);
+    const choices = ["u", "u", "esc"];
+    const prompts = respondToPrompts(ctx, () => choices.shift() ?? "esc");
+    await handlers.get("session_start")?.({}, ctx);
+
+    for (const domain of ["denied.example", "unmatched.example"]) {
+      const command = manualDomainCommand(domain);
+      const response = await handlers.get("user_bash")?.({ command, excludeFromContext: true }, ctx);
+      assert.ok(response?.operations, `${domain} should offer a one-time local operation`);
+      if (domain === "denied.example") {
+        assert.match(prompts.rendered[0] ?? "", /Run once unsandboxed/);
+        assert.doesNotMatch(
+          prompts.rendered[0] ?? "",
+          /Allow for this session only|Allow for this project|Allow for all projects/,
+        );
+      }
+      let output = "";
+      const result = await response.operations.exec(command, root, {
+        onData: (data: Buffer) => (output += data.toString()),
+        timeout: 5,
+        env: process.env,
+      });
+      assert.equal(result.exitCode, 0);
+      assert.match(output, /RUNNING ONCE UNSANDBOXED/);
+      assert.match(output, new RegExp(domain.replaceAll(".", "\\.")));
+      assert.equal(wrapMock.mock.callCount(), 0);
+    }
+
+    const repeated = await handlers.get("user_bash")?.(
+      { command: manualDomainCommand("denied.example"), excludeFromContext: true },
+      ctx,
+    );
+    assert.equal(repeated?.operations, undefined);
+    assert.equal(repeated?.result?.exitCode, 1);
+    assert.equal(wrapMock.mock.callCount(), 0);
+
+    const ordinaryCommand = "printf sandboxed-next";
+    const ordinary = await handlers.get("user_bash")?.(
+      { command: ordinaryCommand, excludeFromContext: true },
+      ctx,
+    );
+    assert.ok(ordinary?.operations);
+    let ordinaryOutput = "";
+    const ordinaryResult = await ordinary.operations.exec(ordinaryCommand, root, {
+      onData: (data: Buffer) => (ordinaryOutput += data.toString()),
+      timeout: 5,
+      env: process.env,
+    });
+    assert.equal(ordinaryResult.exitCode, 0);
+    assert.equal(ordinaryOutput, "sandboxed-next");
+    assert.equal(wrapMock.mock.callCount(), 1);
+    assert.equal(prompts.count, 3);
+    assert.deepEqual(sentMessages, []);
+    assert.equal(resetMock.mock.callCount(), 0);
+  } finally {
+    wrapMock.mock.restore();
+    resetMock.mock.restore();
+    managerMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy sandboxUserShell false does not disable the manual shell sandbox", async () => {
+  const root = makeProjectTempDirectory("legacy-manual-shell-sandbox");
+  const config = {
+    ...makePromptTestConfig(),
+    sandboxUserShell: false,
+  } as unknown as SandboxConfig;
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const wrapMock = mock.method(
+    SandboxManager,
+    "wrapWithSandbox",
+    async () => "printf sandboxed-legacy-config",
+  );
+
+  try {
+    const { pi, handlers } = makePi();
+    extension(pi, { configLoader: () => config });
+    const ctx = makeContext(root, []);
+    await handlers.get("session_start")?.({}, ctx);
+
+    const command = "printf original-command";
+    const response = await handlers.get("user_bash")?.({ command }, ctx);
+    assert.ok(response?.operations);
+    let output = "";
+    const result = await response.operations.exec(command, root, {
+      onData: (data: Buffer) => (output += data.toString()),
+      timeout: 5,
+      env: process.env,
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(output, "sandboxed-legacy-config");
+    assert.equal(wrapMock.mock.callCount(), 1);
+  } finally {
+    wrapMock.mock.restore();
+    managerMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Linux SSH preflight offers a local one-time choice without granting socket access", async () => {
+  const root = makeProjectTempDirectory("linux-ssh-manual-bypass");
+  allowSshTestDomain(root);
+  const originalSocket = process.env.SSH_AUTH_SOCK;
+  process.env.SSH_AUTH_SOCK = join(root, "agent.sock");
+  const initialized: unknown[] = [];
+  const managerMock = mock.method(SandboxManager, "initialize", async (config: unknown) => {
+    initialized.push(config);
+  });
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => {
+    throw new Error("manual SSH choice must run locally, not through the wrapper");
+  });
+
+  try {
+    const { pi, handlers } = makePi();
+    extension(pi, { platform: "linux" });
+    const ctx = makeContext(root, []);
+    const prompts = respondToPrompts(ctx, () => "u");
+    await handlers.get("session_start")?.({}, ctx);
+
+    const command = "false && ssh host; printf linux-safe";
+    const response = await handlers.get("user_bash")?.({ command, excludeFromContext: true }, ctx);
+    assert.ok(response?.operations);
+    let output = "";
+    const result = await response.operations.exec(command, root, {
+      onData: (data: Buffer) => (output += data.toString()),
+      timeout: 5,
+      env: process.env,
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.match(output, /RUNNING ONCE UNSANDBOXED/);
+    assert.match(output, /linux-safe/);
+    assert.match(prompts.rendered[0] ?? "", /Run once unsandboxed/);
+    assert.doesNotMatch(prompts.rendered[0] ?? "", /Allow SSH use for this session/);
+    assert.equal(wrapMock.mock.callCount(), 0);
+    assert.equal(initialized.length, 1);
+    assert.deepEqual(
+      (initialized[0] as { network?: { allowUnixSockets?: string[] } }).network?.allowUnixSockets,
+      [],
+    );
+  } finally {
+    wrapMock.mock.restore();
+    managerMock.mock.restore();
+    if (originalSocket === undefined) delete process.env.SSH_AUTH_SOCK;
+    else process.env.SSH_AUTH_SOCK = originalSocket;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runtime sandbox denial retries only the original manual command locally", async () => {
+  const root = makeProjectTempDirectory("manual-runtime-retry");
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const wrapMock = mock.method(
+    SandboxManager,
+    "wrapWithSandbox",
+    async () =>
+      "printf 'partial sandbox output\\n' >&2; printf 'network connection to runtime.example: Operation not permitted\\n' >&2; exit 1",
+  );
+
+  try {
+    const { pi, handlers, sentMessages } = makePi();
+    extension(pi);
+    const ctx = makeContext(root, []);
+    const prompts = respondToPrompts(ctx, () => "u");
+    await handlers.get("session_start")?.({}, ctx);
+
+    const command = "printf runtime-safe";
+    const response = await handlers.get("user_bash")?.({ command, excludeFromContext: true }, ctx);
+    assert.ok(response?.operations);
+    let output = "";
+    const result = await response.operations.exec(command, root, {
+      onData: (data: Buffer) => (output += data.toString()),
+      timeout: 5,
+      env: process.env,
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.match(output, /partial sandbox output/);
+    assert.match(output, /UNSANDBOXED RETRY:.*repeats side effects/);
+    assert.match(output, /runtime-safe/);
+    assert.match(output, /unsandboxed attempt succeeded/);
+    assert.match(prompts.rendered[0] ?? "", /Retry once unsandboxed/);
+    assert.match(prompts.rendered[0] ?? "", /repeats side effects/);
+    assert.equal(prompts.count, 1);
+    assert.equal(wrapMock.mock.callCount(), 1);
+    assert.deepEqual(sentMessages, []);
+
+    const visibleCommand = "printf visible-runtime-safe";
+    const visible = await handlers.get("user_bash")?.({ command: visibleCommand }, ctx);
+    assert.ok(visible?.operations);
+    const visibleResult = await visible.operations.exec(visibleCommand, root, {
+      onData: () => undefined,
+      timeout: 5,
+      env: process.env,
+    });
+    assert.equal(visibleResult.exitCode, 0);
+    assert.equal(prompts.count, 2);
+    assert.match(prompts.rendered[1] ?? "", /Retry once unsandboxed/);
+    assert.equal(wrapMock.mock.callCount(), 2);
+    assert.equal(sentMessages.length, 1);
+    assert.equal(sentMessages[0]?.customType, "sandbox-diagnostic");
+    assert.equal(sentMessages[0]?.display, false);
+  } finally {
+    wrapMock.mock.restore();
+    managerMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("ordinary command failures do not offer a manual bypass", async () => {
+  const root = makeProjectTempDirectory("manual-bypass-ordinary-failure");
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const wrapMock = mock.method(
+    SandboxManager,
+    "wrapWithSandbox",
+    async () => "printf ordinary-failure; exit 7",
+  );
+
+  try {
+    const { pi, handlers } = makePi();
+    extension(pi);
+    const ctx = makeContext(root, []);
+    const prompts = respondToPrompts(ctx, () => "u");
+    await handlers.get("session_start")?.({}, ctx);
+
+    const command = "printf ordinary-command";
+    const response = await handlers.get("user_bash")?.({ command }, ctx);
+    assert.ok(response?.operations);
+    let output = "";
+    const result = await response.operations.exec(command, root, {
+      onData: (data: Buffer) => (output += data.toString()),
+      timeout: 5,
+      env: process.env,
+    });
+
+    assert.equal(result.exitCode, 7);
+    assert.match(output, /ordinary-failure/);
+    assert.doesNotMatch(output, /UNSANDBOXED|RUNNING ONCE/);
+    assert.equal(prompts.count, 0);
+    assert.equal(wrapMock.mock.callCount(), 1);
+  } finally {
+    wrapMock.mock.restore();
+    managerMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("manual bypass operations reject mismatched, reused, aborted, and stale approvals", async () => {
+  const root = makeProjectTempDirectory("manual-bypass-validation");
+  mkdirSync(join(root, ".pi"), { recursive: true });
+  writeFileSync(
+    join(root, ".pi", "sandbox.json"),
+    JSON.stringify({ network: { deniedDomains: ["blocked.example"] } }),
+  );
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => "printf unexpected");
+
+  try {
+    const { pi, handlers } = makePi();
+    extension(pi);
+    const ctx = makeContext(root, []);
+    respondToPrompts(ctx, () => "u");
+    await handlers.get("session_start")?.({}, ctx);
+
+    const getBypass = async (command: string) => {
+      const response = await handlers.get("user_bash")?.(
+        { command, excludeFromContext: true },
+        ctx,
+      );
+      assert.ok(response?.operations);
+      return response.operations;
+    };
+    const execOptions = (signal?: AbortSignal) => ({
+      onData: () => undefined,
+      timeout: 5,
+      env: process.env,
+      signal,
+    });
+
+    const wrongCommand = manualDomainCommand("blocked.example");
+    await assert.rejects(
+      (await getBypass(wrongCommand)).exec(`${wrongCommand} `, root, execOptions()),
+      /Unsandboxed approval is no longer valid for this command and session\./,
+    );
+    await assert.rejects(
+      (await getBypass(wrongCommand)).exec(wrongCommand, `${root}-wrong`, execOptions()),
+      /Unsandboxed approval is no longer valid for this command and session\./,
+    );
+    const abortController = new AbortController();
+    abortController.abort();
+    await assert.rejects(
+      (await getBypass(wrongCommand)).exec(wrongCommand, root, execOptions(abortController.signal)),
+      /no longer valid/,
+    );
+
+    const consumed = await getBypass(wrongCommand);
+    const firstRun = await consumed.exec(wrongCommand, root, execOptions());
+    assert.equal(firstRun.exitCode, 0);
+    await assert.rejects(consumed.exec(wrongCommand, root, execOptions()), /already been consumed/);
+
+    const oldGenerationCommand = manualDomainCommand("blocked.example");
+    const oldGeneration = await getBypass(oldGenerationCommand);
+    await handlers.get("session_start")?.({}, ctx);
+    await assert.rejects(
+      oldGeneration.exec(oldGenerationCommand, root, execOptions()),
+      /no longer valid/,
+    );
+
+    const staleReadinessCommand = manualDomainCommand("blocked.example");
+    const staleReadiness = await getBypass(staleReadinessCommand);
+    await handlers.get("session_shutdown")?.({}, ctx);
+    await assert.rejects(
+      staleReadiness.exec(staleReadinessCommand, root, execOptions()),
+      /no longer valid/,
+    );
+    assert.equal(wrapMock.mock.callCount(), 0);
+  } finally {
+    wrapMock.mock.restore();
+    resetMock.mock.restore();
+    managerMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("manual bypass is unavailable without UI, after cancel, and after prompt timeout", async () => {
+  const root = makeProjectTempDirectory("manual-bypass-no-prompt");
+  const config = makePromptTestConfig();
+  config.network!.deniedDomains = ["blocked.example"];
+  config.permissionPromptTimeoutSeconds = 0.01;
+  const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => "printf unexpected");
+
+  try {
+    const { pi, handlers } = makePi();
+    extension(pi, { configLoader: () => config });
+    const ctx = makeContext(root, []);
+    const prompts = respondToPrompts(ctx, () => "esc");
+    await handlers.get("session_start")?.({}, ctx);
+    const command = manualDomainCommand("blocked.example");
+
+    ctx.hasUI = false;
+    const noUi = await handlers.get("user_bash")?.({ command }, ctx);
+    assert.equal(noUi?.operations, undefined);
+    assert.equal(noUi?.result?.exitCode, 1);
+    assert.equal(prompts.count, 0);
+
+    ctx.hasUI = true;
+    const cancelled = await handlers.get("user_bash")?.({ command }, ctx);
+    assert.equal(cancelled?.operations, undefined);
+    assert.equal(cancelled?.result?.exitCode, 1);
+    assert.equal(prompts.count, 1);
+
+    let timeoutPromptCount = 0;
+    (ctx.ui as any).custom = (factory: any) =>
+      new Promise((resolve) => {
+        factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          (result: unknown) => resolve(result),
+        );
+        timeoutPromptCount += 1;
+      });
+    const timedOut = await handlers.get("user_bash")?.({ command }, ctx);
+    assert.equal(timedOut?.operations, undefined);
+    assert.equal(timedOut?.result?.exitCode, 1);
+    assert.equal(timeoutPromptCount, 1);
+    assert.equal(wrapMock.mock.callCount(), 0);
+  } finally {
+    wrapMock.mock.restore();
+    managerMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("user_bash streams normal output once without diagnostic metadata", async () => {
   const root = makeProjectTempDirectory("user-bash-normal");
   const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
@@ -2090,7 +2514,7 @@ test("Git push refspec does not prompt model Bash or user shell for a head domai
   }
 });
 
-test("denied Git remotes in model Bash and user shell block before SSH-agent approval", async () => {
+test("denied Git remotes offer only manual one-time bypass before SSH-agent approval", async () => {
   const root = makeProjectTempDirectory("ssh-domain-policy");
   mkdirSync(join(root, ".pi"), { recursive: true });
   writeFileSync(
@@ -2118,11 +2542,7 @@ test("denied Git remotes in model Bash and user shell block before SSH-agent app
     const { pi, handlers, sentMessages } = makePi();
     extension(pi, { platform: "darwin" });
     const ctx = makeContext(root, []);
-    let promptCount = 0;
-    (ctx.ui as any).custom = () => {
-      promptCount += 1;
-      throw new Error("denied SSH domain must not prompt for SSH-agent access");
-    };
+    const prompts = respondToPrompts(ctx, () => "esc");
 
     await handlers.get("session_start")?.({}, ctx);
     const command = "git clone -b main git@denied.example:repo.git checkout";
@@ -2132,7 +2552,7 @@ test("denied Git remotes in model Bash and user shell block before SSH-agent app
     );
     assert.equal(modelBash?.block, true);
     assert.match(modelBash?.reason ?? "", /denied\.example/);
-    assert.equal(promptCount, 0);
+    assert.equal(prompts.count, 0);
 
     const response = await handlers.get("user_bash")?.({ command, excludeFromContext: false }, ctx);
 
@@ -2141,6 +2561,7 @@ test("denied Git remotes in model Bash and user shell block before SSH-agent app
     assert.equal(response.operations, undefined);
     assert.match(response.result.output, /denied\.example/);
     assert.match(response.result.output, /deniedDomains/);
+    assert.equal(prompts.count, 1);
 
     const globalOptionCommand = "git -C push clone git@denied.example:team/repo.git";
     const globalOptionModelBash = await handlers.get("tool_call")?.(
@@ -2155,6 +2576,7 @@ test("denied Git remotes in model Bash and user shell block before SSH-agent app
     );
     assert.equal(globalOptionUserBash?.result?.exitCode, 1);
     assert.match(globalOptionUserBash?.result?.output ?? "", /denied\.example/);
+    assert.equal(prompts.count, 2);
 
     const pushResponse = await handlers.get("user_bash")?.(
       {
@@ -2165,7 +2587,7 @@ test("denied Git remotes in model Bash and user shell block before SSH-agent app
     );
     assert.equal(pushResponse?.result?.exitCode, 1);
     assert.match(pushResponse?.result?.output ?? "", /denied\.example/);
-    assert.equal(promptCount, 0);
+    assert.equal(prompts.count, 3);
     assert.equal(resetMock.mock.callCount(), 0);
     assert.equal(wrapMock.mock.callCount(), 0);
     assert.equal(initialized.length, 1);
@@ -2327,6 +2749,7 @@ test("agent Bash retains a blocked SSH preflight for sandbox-debug", async () =>
     const notices: string[] = [];
     const ctx = makeContext(root, notices);
     let promptCount = 0;
+    let renderedPrompt = "";
     (ctx.ui as any).custom = (factory: any) =>
       new Promise((resolve) => {
         const component = factory(
@@ -2336,6 +2759,7 @@ test("agent Bash retains a blocked SSH preflight for sandbox-debug", async () =>
           (result: unknown) => resolve(result),
         );
         promptCount += 1;
+        renderedPrompt = component.render(120).join("\n");
         component.handleInput("esc");
       });
 
@@ -2354,6 +2778,7 @@ test("agent Bash retains a blocked SSH preflight for sandbox-debug", async () =>
       /<sandbox_diagnostic>/,
     );
     assert.equal(promptCount, 1);
+    assert.doesNotMatch(renderedPrompt, /unsandboxed/i);
     assert.equal(wrapMock.mock.callCount(), 0);
     assert.deepEqual(sentMessages, []);
 
@@ -2433,7 +2858,7 @@ test("macOS Git SSH preflight rolls back a failed grant before retrying", async 
   }
 });
 
-test("Linux SSH preflight and lone-command fallback never prompt", async () => {
+test("Linux SSH preflight and fallback require an explicit manual choice", async () => {
   const root = makeProjectTempDirectory("ssh-preflight-linux");
   allowSshTestDomain(root);
   const originalSocket = process.env.SSH_AUTH_SOCK;
@@ -2450,11 +2875,7 @@ test("Linux SSH preflight and lone-command fallback never prompt", async () => {
     extension(pi, { platform: "linux" });
     const notices: string[] = [];
     const ctx = makeContext(root, notices);
-    let promptCount = 0;
-    (ctx.ui as any).custom = () => {
-      promptCount += 1;
-      throw new Error("Linux SSH auth must not prompt");
-    };
+    const prompts = respondToPrompts(ctx, () => "esc");
     await handlers.get("session_start")?.({}, ctx);
 
     const compound = await handlers.get("user_bash")?.(
@@ -2485,15 +2906,15 @@ test("Linux SSH preflight and lone-command fallback never prompt", async () => {
     });
     assert.equal(fallbackBlocked.exitCode, 1);
     assert.equal(wrapped, 1);
-    assert.equal(promptCount, 0);
-    assert.match(output, /SSH auth; blocked or failed/);
+    assert.equal(prompts.count, 2);
+    assert.match(output, /SSH auth; left blocked/);
     assert.equal(output.match(/\[sandbox:/g)?.length, 1);
     assert.doesNotMatch(output, /allowAllUnixSockets|<sandbox_diagnostic>/);
     assert.equal(sentMessages.length, 0);
 
     await commands.get("sandbox-debug")?.("", ctx);
     const debug = notices.at(-1) ?? "";
-    assert.equal(debug.includes("prompted: no"), true);
+    assert.equal(debug.includes("prompted: yes"), true);
     assert.match(debug, /path-scoped SSH-agent access is unavailable on Linux/);
   } finally {
     wrapMock.mock.restore();

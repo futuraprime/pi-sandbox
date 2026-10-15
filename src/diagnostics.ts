@@ -303,6 +303,8 @@ export type SandboxPromptChoice =
   | "project"
   | "global"
   | "ssh-session"
+  | "run-once-unsandboxed"
+  | "retry-once-unsandboxed"
   | "none";
 
 export interface SandboxDiagnostic {
@@ -450,6 +452,8 @@ const promptChoices = new Set<SandboxPromptChoice>([
   "project",
   "global",
   "ssh-session",
+  "run-once-unsandboxed",
+  "retry-once-unsandboxed",
   "none",
 ]);
 
@@ -541,6 +545,10 @@ function diagnosticChoiceLabel(choice: SandboxPromptChoice): string {
       return "allowed for all projects";
     case "abort":
       return "left blocked";
+    case "run-once-unsandboxed":
+      return "ran once unsandboxed";
+    case "retry-once-unsandboxed":
+      return "retried once unsandboxed";
     case "none":
       return "not approved";
   }
@@ -549,14 +557,20 @@ function diagnosticChoiceLabel(choice: SandboxPromptChoice): string {
 export function renderDiagnosticNotice(data: SandboxDiagnosticBlockData): string {
   const parts = [diagnosticTypeLabel(data.type)];
   if (data.prompted) parts.push(diagnosticChoiceLabel(data.choice));
+  const unsandboxedChoice =
+    data.choice === "run-once-unsandboxed" || data.choice === "retry-once-unsandboxed";
   parts.push(
-    data.retried
+    unsandboxedChoice
       ? data.finalOutcome === "success"
-        ? "retried successfully"
-        : "retried but still failed"
-      : data.finalOutcome === "success"
-        ? "completed"
-        : "blocked or failed",
+        ? "unsandboxed attempt succeeded"
+        : "unsandboxed attempt failed"
+      : data.retried
+        ? data.finalOutcome === "success"
+          ? "retried successfully"
+          : "retried but still failed"
+        : data.finalOutcome === "success"
+          ? "completed"
+          : "blocked or failed",
   );
   return `[sandbox: ${parts.join("; ")} — /sandbox-debug for details]`;
 }
@@ -838,9 +852,10 @@ export async function runSshAuthPreflight(options: {
   sshAuthSock?: string;
   allowedSockets: string[];
   allowAllSockets: boolean;
-  requestAccess: (socketPath: string) => Promise<boolean>;
+  requestAccess: (socketPath: string) => Promise<boolean | "run-once-unsandboxed">;
   platform?: NodeJS.Platform;
-}): Promise<"not-needed" | "allowed" | "blocked"> {
+  manualBypass?: boolean;
+}): Promise<"not-needed" | "allowed" | "blocked" | "run-once-unsandboxed"> {
   const {
     command,
     sshAuthSock,
@@ -848,14 +863,20 @@ export async function runSshAuthPreflight(options: {
     allowAllSockets,
     requestAccess,
     platform = process.platform,
+    manualBypass = false,
   } = options;
   if (!sshAuthSock || !shouldPreflightSshAuth(command) || allowAllSockets) return "not-needed";
-  if (platform === "linux") return "blocked";
-  if (allowedSockets.some((allowedSocket) => socketPathMatches(allowedSocket, sshAuthSock))) {
+  if (platform === "linux" && !manualBypass) return "blocked";
+  if (
+    platform !== "linux" &&
+    allowedSockets.some((allowedSocket) => socketPathMatches(allowedSocket, sshAuthSock))
+  ) {
     return "not-needed";
   }
   try {
-    return (await requestAccess(sshAuthSock)) ? "allowed" : "blocked";
+    const access = await requestAccess(sshAuthSock);
+    if (access === "run-once-unsandboxed") return manualBypass ? access : "blocked";
+    return access ? "allowed" : "blocked";
   } catch {
     return "blocked";
   }

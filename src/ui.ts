@@ -14,7 +14,8 @@ import { type SessionAllowances } from "./sandbox-runtime.ts";
 
 export type PermissionChoice = "abort" | "session" | "project" | "global";
 export type SshPermissionChoice = "abort" | "ssh-session";
-type PromptAction = PermissionChoice | SshPermissionChoice;
+export type ManualBypassChoice = "run-once-unsandboxed" | "retry-once-unsandboxed";
+type PromptAction = PermissionChoice | SshPermissionChoice | ManualBypassChoice;
 
 export interface PermissionPromptResult<Action extends PromptAction = PermissionChoice> {
   action: Action;
@@ -27,6 +28,7 @@ interface PromptOption<Action extends PromptAction = PromptAction> {
   action: Action;
   confirm?: boolean;
   hint?: string;
+  warning?: string;
 }
 
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
@@ -120,7 +122,10 @@ export async function showPermissionPrompt<Action extends PromptAction = Permiss
 
     const selectedOption = (): PromptOption<Action> => options[selectedIndex] ?? options[0]!;
     const isAllowOption = (option: PromptOption<Action>): boolean =>
-      option.action !== "abort" && option.action !== "ssh-session";
+      option.action !== "abort" &&
+      option.action !== "ssh-session" &&
+      option.action !== "run-once-unsandboxed" &&
+      option.action !== "retry-once-unsandboxed";
     const updateFocus = (): void => {
       input.focused = componentFocused && editing;
     };
@@ -150,7 +155,11 @@ export async function showPermissionPrompt<Action extends PromptAction = Permiss
       return false;
     };
     const resolve = (action: Action): void => {
-      if (action === "abort") {
+      if (
+        action === "abort" ||
+        action === "run-once-unsandboxed" ||
+        action === "retry-once-unsandboxed"
+      ) {
         finish({ action, value: originalValue });
         return;
       }
@@ -232,6 +241,33 @@ export async function showPermissionPrompt<Action extends PromptAction = Permiss
             label += `  ${theme.fg("warning", "→ press Enter to confirm")}`;
           }
           lines.push(truncateToWidth(`${prefix}${keyHint} ${label}`, width));
+          if (option.warning) {
+            const warningPrefix = "      ⚠ ";
+            const warningWidth = Math.max(1, width - visibleWidth(warningPrefix));
+            let warningLine = "";
+            for (const word of option.warning.split(/\s+/)) {
+              const next = warningLine ? `${warningLine} ${word}` : word;
+              if (warningLine && visibleWidth(next) > warningWidth) {
+                lines.push(
+                  truncateToWidth(
+                    `${theme.fg("warning", warningPrefix)}${theme.fg("warning", warningLine)}`,
+                    width,
+                  ),
+                );
+                warningLine = word;
+              } else {
+                warningLine = next;
+              }
+            }
+            if (warningLine) {
+              lines.push(
+                truncateToWidth(
+                  `${theme.fg("warning", warningPrefix)}${theme.fg("warning", warningLine)}`,
+                  width,
+                ),
+              );
+            }
+          }
           if (editing && isSelected && error) {
             lines.push(truncateToWidth(theme.fg("error", `   ✗ ${error}`), width));
           }
@@ -314,6 +350,19 @@ export async function showPermissionPrompt<Action extends PromptAction = Permiss
   return result ?? ({ action: "abort", value: originalValue } as PermissionPromptResult<Action>);
 }
 
+export interface ManualBypassOption {
+  action: ManualBypassChoice;
+  label: string;
+  warning?: string;
+}
+
+function permissionOptionsWithManualBypass(
+  cwd: string,
+  bypass: ManualBypassOption | undefined,
+): PromptOption<PermissionChoice | ManualBypassChoice>[] {
+  return [...permissionOptions(cwd), ...(bypass ? [{ ...bypass, key: "u" }] : [])];
+}
+
 const validRule = (value: string, matches: boolean, target: string): string | null => {
   if (value.length === 0) return "Rule cannot be empty.";
   return matches ? null : `Rule must match the blocked ${target}.`;
@@ -345,7 +394,21 @@ export function promptDomainBlock(
   ctx: ExtensionContext,
   domain: string,
   timeoutSeconds?: number,
-): Promise<PermissionPromptResult> {
+): Promise<PermissionPromptResult>;
+export function promptDomainBlock(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  domain: string,
+  timeoutSeconds: number | undefined,
+  bypass: ManualBypassOption,
+): Promise<PermissionPromptResult<PermissionChoice | ManualBypassChoice>>;
+export function promptDomainBlock(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  domain: string,
+  timeoutSeconds?: number,
+  bypass?: ManualBypassOption,
+): Promise<PermissionPromptResult<PermissionChoice | ManualBypassChoice>> {
   return showPermissionPrompt(
     pi,
     ctx,
@@ -360,6 +423,7 @@ export function promptDomainBlock(
         `domain "${domain}"`,
       ),
     timeoutSeconds,
+    permissionOptionsWithManualBypass(ctx.cwd, bypass),
   );
 }
 
@@ -368,7 +432,21 @@ export function promptReadBlock(
   ctx: ExtensionContext,
   path: string,
   timeoutSeconds?: number,
-): Promise<PermissionPromptResult> {
+): Promise<PermissionPromptResult>;
+export function promptReadBlock(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  path: string,
+  timeoutSeconds: number | undefined,
+  bypass: ManualBypassOption,
+): Promise<PermissionPromptResult<PermissionChoice | ManualBypassChoice>>;
+export function promptReadBlock(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  path: string,
+  timeoutSeconds?: number,
+  bypass?: ManualBypassOption,
+): Promise<PermissionPromptResult<PermissionChoice | ManualBypassChoice>> {
   return showPermissionPrompt(
     pi,
     ctx,
@@ -383,7 +461,7 @@ export function promptReadBlock(
         `path "${path}"`,
       ),
     timeoutSeconds,
-    undefined,
+    permissionOptionsWithManualBypass(ctx.cwd, bypass),
     projectRelativePromptValue(path, ctx.cwd),
   );
 }
@@ -393,7 +471,21 @@ export function promptWriteBlock(
   ctx: ExtensionContext,
   path: string,
   timeoutSeconds?: number,
-): Promise<PermissionPromptResult> {
+): Promise<PermissionPromptResult>;
+export function promptWriteBlock(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  path: string,
+  timeoutSeconds: number | undefined,
+  bypass: ManualBypassOption,
+): Promise<PermissionPromptResult<PermissionChoice | ManualBypassChoice>>;
+export function promptWriteBlock(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  path: string,
+  timeoutSeconds?: number,
+  bypass?: ManualBypassOption,
+): Promise<PermissionPromptResult<PermissionChoice | ManualBypassChoice>> {
   return showPermissionPrompt(
     pi,
     ctx,
@@ -408,7 +500,7 @@ export function promptWriteBlock(
         `path "${path}"`,
       ),
     timeoutSeconds,
-    undefined,
+    permissionOptionsWithManualBypass(ctx.cwd, bypass),
     projectRelativePromptValue(path, ctx.cwd),
   );
 }
@@ -417,16 +509,57 @@ export function promptSshAuthBlock(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   timeoutSeconds?: number,
-): Promise<PermissionPromptResult<SshPermissionChoice>> {
-  return showPermissionPrompt<SshPermissionChoice>(
+): Promise<PermissionPromptResult<SshPermissionChoice>>;
+export function promptSshAuthBlock(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  timeoutSeconds: number | undefined,
+  options: ManualBypassOption & { allowSession?: boolean },
+): Promise<PermissionPromptResult<SshPermissionChoice | ManualBypassChoice>>;
+export function promptSshAuthBlock(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  timeoutSeconds?: number,
+  options?: ManualBypassOption & { allowSession?: boolean },
+): Promise<PermissionPromptResult<SshPermissionChoice | ManualBypassChoice>> {
+  return showPermissionPrompt<SshPermissionChoice | ManualBypassChoice>(
     pi,
     ctx,
-    "🔐 SSH auth blocked: allow SSH use for this session?",
+    options?.allowSession === false
+      ? "🔐 SSH auth blocked: run this manual command once unsandboxed?"
+      : options
+        ? "🔐 SSH auth blocked: allow SSH use for this session or bypass once?"
+        : "🔐 SSH auth blocked: allow SSH use for this session?",
     "SSH agent",
     () => null,
     timeoutSeconds,
     [
-      { label: "Allow SSH use for this session", key: "s", action: "ssh-session" },
+      ...(options?.allowSession === false
+        ? []
+        : [{ label: "Allow SSH use for this session", key: "s", action: "ssh-session" as const }]),
+      ...(options ? [{ ...options, key: "u" }] : []),
+      { label: "Abort (keep blocked)", key: "esc", action: "abort" },
+    ],
+  );
+}
+
+export function promptManualBypass(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  title: string,
+  target: string,
+  timeoutSeconds: number | undefined,
+  bypass: ManualBypassOption,
+): Promise<PermissionPromptResult<ManualBypassChoice | "abort">> {
+  return showPermissionPrompt<ManualBypassChoice | "abort">(
+    pi,
+    ctx,
+    title,
+    target,
+    () => null,
+    timeoutSeconds,
+    [
+      { ...bypass, key: "u" },
       { label: "Abort (keep blocked)", key: "esc", action: "abort" },
     ],
   );

@@ -679,7 +679,6 @@ async function runWorker(
   const env = process.env;
   const config: SandboxConfig = {
     enabled: true,
-    sandboxUserShell: false,
     allowBrowserProcess: mode === "enabled",
     allowPty: false,
     network: { allowedDomains: [], deniedDomains: [], allowUnauthenticatedSocksProxy: false },

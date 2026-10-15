@@ -40,7 +40,7 @@ test("omitted settings use their defaults without enabling generic SSH proxying"
 
   assert.equal(DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS, 600);
   assert.equal(merged.permissionPromptTimeoutSeconds, DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS);
-  assert.equal(merged.sandboxUserShell, true);
+  assert.equal("sandboxUserShell" in merged, false);
   assert.equal("sshProxy" in (merged.network ?? {}), false);
 
   const legacyConfig = JSON.parse('{"network":{"sshProxy":true}}') as SandboxConfigFile;
@@ -140,25 +140,41 @@ test("characterizes cumulative defaults, global, and project array semantics", (
   ]);
 });
 
+test("mergeConfigLayers warns and ignores deprecated sandboxUserShell from either layer", () => {
+  const warnings: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => warnings.push(String(args[0]));
+  try {
+    const global = { sandboxUserShell: false } as unknown as SandboxConfigFile;
+    const project = { sandboxUserShell: true } as unknown as SandboxConfigFile;
+    const merged = mergeConfigLayers(DEFAULT_CONFIG, global, project);
+
+    assert.equal("sandboxUserShell" in merged, false);
+    assert.equal(warnings.length, 2);
+    assert.ok(
+      warnings.every((warning) => /deprecated sandboxUserShell.*per-command approval/.test(warning)),
+    );
+  } finally {
+    console.error = originalError;
+  }
+});
+
 test("mergeConfigLayers applies local scalar precedence and cumulative empty arrays", () => {
   const merged = mergeConfigLayers(
     DEFAULT_CONFIG,
     {
       enabled: false,
-      sandboxUserShell: false,
       permissionPromptTimeoutSeconds: 30,
       filesystem: { allowWrite: [] },
     },
     {
       enabled: true,
-      sandboxUserShell: true,
       permissionPromptTimeoutSeconds: 0,
       allowBrowserProcess: true,
     },
   );
 
   assert.equal(merged.enabled, true);
-  assert.equal(merged.sandboxUserShell, true);
   assert.equal(merged.permissionPromptTimeoutSeconds, 0);
   assert.equal(merged.allowBrowserProcess, true);
   assert.deepEqual(merged.filesystem?.allowWrite, DEFAULT_CONFIG.filesystem?.allowWrite);
@@ -170,7 +186,6 @@ test("mergeConfigLayers ignores invalid scalar overrides and retains inherited s
   const defaults: SandboxConfig = {
     ...DEFAULT_CONFIG,
     enabled: false,
-    sandboxUserShell: false,
     permissionPromptTimeoutSeconds: 45,
     enableWeakerNestedSandbox: false,
     enableWeakerNetworkIsolation: false,
@@ -219,18 +234,6 @@ test("mergeConfigLayers ignores invalid scalar overrides and retains inherited s
       name: "enabled",
       override: { enabled: null },
       select: (config) => config.enabled,
-      inherited: false,
-    },
-    {
-      name: "sandboxUserShell",
-      override: { sandboxUserShell: [] },
-      select: (config) => config.sandboxUserShell,
-      inherited: false,
-    },
-    {
-      name: "sandboxUserShell",
-      override: { sandboxUserShell: 0 },
-      select: (config) => config.sandboxUserShell,
       inherited: false,
     },
     {
@@ -458,7 +461,6 @@ test("mergeConfigLayers preserves valid scalar precedence, false and finite time
   };
   const projectConfig: SandboxConfigFile = {
     enabled: true,
-    sandboxUserShell: false,
     permissionPromptTimeoutSeconds: -2,
     mandatoryDenySearchDepth: 1,
     allowBrowserProcess: false,
@@ -470,7 +472,6 @@ test("mergeConfigLayers preserves valid scalar precedence, false and finite time
   const merged = mergeConfigLayers(defaults, globalConfig, projectConfig);
 
   assert.equal(merged.enabled, true);
-  assert.equal(merged.sandboxUserShell, false);
   assert.equal(merged.permissionPromptTimeoutSeconds, -2);
   assert.equal(
     mergeConfigLayers(defaults, {}, { permissionPromptTimeoutSeconds: 0 })

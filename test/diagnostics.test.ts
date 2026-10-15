@@ -209,6 +209,31 @@ test("fails closed for Linux SSH preflight and fallback diagnostics", async () =
     "blocked",
   );
   assert.equal(requested, false);
+  assert.equal(
+    await runSshAuthPreflight({
+      command: "ssh host; echo done",
+      sshAuthSock: "/tmp/agent.sock",
+      allowedSockets: ["/tmp/agent.sock"],
+      allowAllSockets: false,
+      platform: "linux",
+      requestAccess: async () => {
+        assert.fail("scoped Linux sockets must not skip the agent's fail-closed boundary");
+      },
+    }),
+    "blocked",
+  );
+  assert.equal(
+    await runSshAuthPreflight({
+      command: "ssh host; echo done",
+      sshAuthSock: "/tmp/agent.sock",
+      allowedSockets: [],
+      allowAllSockets: false,
+      platform: "linux",
+      manualBypass: true,
+      requestAccess: async () => "run-once-unsandboxed",
+    }),
+    "run-once-unsandboxed",
+  );
   const diagnostic = makeSshAgentFallbackDiagnostic(
     "/tmp/agent.sock",
     "ssh host",
@@ -375,6 +400,27 @@ test("renders and strictly parses final diagnostic metadata", () => {
     parseDiagnosticBlock(block.replace("other_violations: 1", "other_violations: -1")),
     null,
   );
+});
+
+test("diagnostics round-trip explicit manual unsandboxed choices", () => {
+  for (const choice of ["run-once-unsandboxed", "retry-once-unsandboxed"] as const) {
+    const block = renderDiagnosticBlock(
+      makeIncident({
+        promptShown: true,
+        promptChoice: choice,
+        retried: true,
+        finalOutcome: "success",
+        primaryViolation: makeDiagnostic({
+          action: `manual command ${choice === "run-once-unsandboxed" ? "ran" : "retried"} once unsandboxed`,
+        }),
+      }),
+    );
+    const parsed = parseDiagnosticBlock(`output\n${block}`);
+    assert.equal(parsed?.data.choice, choice);
+    assert.equal(parsed?.data.finalOutcome, "success");
+    assert.match(parsed ? renderDiagnosticNotice(parsed.data) : "", /unsandboxed attempt succeeded/);
+    assert.match(parsed?.data.action ?? "", /once unsandboxed/);
+  }
 });
 
 test("attributes browser and SSH-agent fallback output without broadening access", () => {
