@@ -2238,7 +2238,7 @@ test("runtime sandbox denial retries only the original manual command locally", 
     assert.match(prompts.rendered[0] ?? "", /repeats side effects/);
     assert.equal(prompts.count, 1);
     assert.equal(wrapMock.mock.callCount(), 1);
-    assert.deepEqual(sentMessages, []);
+    assert.equal(sentMessages.length, 0);
 
     const visibleCommand = "printf visible-runtime-safe";
     const visible = await handlers.get("user_bash")?.({ command: visibleCommand }, ctx);
