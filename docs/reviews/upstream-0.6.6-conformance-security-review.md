@@ -39,7 +39,7 @@ The branch substantially implements the proposal, but it should not be treated a
 | --- | --- | --- |
 | C-1 | **Addressed for the guarded supported macOS Bash path; not a universal runtime-semantics fix.** The adapter re-emits ordinary read denies after grants, preserving shared specificity precedence while retaining directory metadata for traversal and denying file data/listings outside strictly more-specific grants. Equal-specificity denies remain denied; a narrower explicit grant may override `denyRead: ["/"]`; the pinned literal-root permission remains. Credential-file denies stay hard. Unsupported required profiles block Bash. | `src/macos-write-specificity.ts`, `src/sandbox-runtime.ts`; unit and real Seatbelt tests in `test/sandbox-runtime.test.ts` and `test/sandbox-macos-filesystem.test.ts`. The adapter compares the generated read section to pinned `@carderne/sandbox-runtime` 0.0.72 before modification. |
 | C-2 | **Addressed for the guarded supported macOS Bash path; not a universal runtime-semantics fix.** The guarded profile adapter preserves specificity-aware precedence for eligible ordinary write denies while retaining equal-specificity deny precedence. Evidence and limits follow. | `src/macos-write-specificity.ts`; pinned `macos-sandbox-utils.js` `generateWriteRules`; macOS Seatbelt regression tests. |
-| C-3 | **Scalars are not validated.** Only arrays and credentials are validated; for example `"enabled": "false"` (a string) is truthy. The proposal requires malformed values to be ignored with a warning. | `src/config.ts` `mergeObjects`. |
+| C-3 | **Implemented; full verification pending.** Recognized scalar overrides are validated before each global/project merge; invalid values warn and are ignored, preserving inherited values. Valid `false` and finite nonpositive prompt timeouts remain supported. | `src/config.ts` `validatedSection` / `mergeObjects`; `test/config.test.ts`; inventory and evidence below. |
 | C-4 | **`sandboxUserShell` has shipped and can be set from project config**, although the proposal lists it for separate review and it remains an open question. | `src/config.ts`; `src/extension.ts` `user_bash` handler. |
 | C-5 | **Parts of the proposal are stale.** The Verification section still lists "all six `/sandbox` rule types"; the Slice 4 text says `/sandbox-allow` was removed. | Proposal. |
 | C-6 | **Release gates remain open** by the proposal's own status: GitHub Actions, fresh bare-macOS acceptance, and integration into downstream `main`. | Proposal status. |
@@ -61,6 +61,34 @@ For ordinary `denyRead` patterns, the final Seatbelt rules deny `file-read*` on 
 Focused real Seatbelt evidence on the current Darwin host: `test/sandbox-macos-filesystem.test.ts` verifies ordinary and literal/glob precedence, equal-specificity denials, denied file reads and directory listings, successful metadata/realpath traversal through a denied directory, masked-credential source denial, and `denyRead: ["/"]` with an allowed narrower file, denied sibling, and root realpath. `test/sandbox-runtime.test.ts` covers profile/provenance failure, idempotence, root matcher exceptions, hard credential rules, and the production Bash fail-closed path. The separate existing credential tests verify fake file-material non-disclosure and host-scoped masked environment substitution.
 
 Limits: this is only for the verified generated macOS Bash profile; it does not alter direct-tool policy or add an adapter on other platforms. Runtime 0.0.72's whole-file `mode: "mask"` remains deny-only on macOS (fake file delivery is Linux-only), and no Linux file-mask substitute is introduced here. User-run verification from this checkout: `pnpm check` succeeded; `pnpm lint` reported 0 warnings/errors; `pnpm test` reported 206 total, 203 passed, 0 failed and 3 deliberate credential-CLI opt-in skips, including both real macOS C-1 Seatbelt regressions and the C-2 regression; `pnpm ci:fmt` passed. The parent session's earlier attempt was blocked before TypeScript ran by a lockfile-read permission error; the successful user-run checks provide the final verification evidence.
+
+### C-3 remediation inventory and verification
+
+Implementation: `dce9add`, isolated on `fix/c3-scalar-config-validation` from `dce9926`. Configuration flows through `readConfigFile` → `mergeConfigLayers` → `mergeObjects`; validation belongs before each override spread, not after inheritance has been lost. Defaults are trusted typed input. Recognized `undefined` overrides are treated as absent without warning.
+
+The inventory follows `SandboxConfig` and the exported schemas in pinned `@carderne/sandbox-runtime` 0.0.72 (`dist/sandbox/sandbox-config.js`):
+
+| Settings | Accepted values |
+| --- | --- |
+| `enabled`, `sandboxUserShell` | Booleans only. |
+| `permissionPromptTimeoutSeconds` | Finite numbers; zero/negative values retain the existing timer-disabled meaning. |
+| `enableWeakerNestedSandbox`, `enableWeakerNetworkIsolation`, `allowAppleEvents`, `allowPty`, `allowBrowserProcess` | Runtime-schema booleans. |
+| `mandatoryDenySearchDepth` | Integer 1–10. |
+| `bwrapPath`, `socatPath` | Nonempty absolute binary paths. |
+| `network.strictAllowlist`, `allowAllUnixSockets`, `allowLocalBinding`, `allowUnauthenticatedSocksProxy` | Booleans. |
+| `network.httpProxyPort`, `socksProxyPort` | Integers 1–65535. |
+| `filesystem.disabled` | Boolean. |
+| `network.filterRequest` | Function for programmatic callers; JSON values cannot supply a callback. |
+| `network.mitmProxy` | Runtime object schema: nonempty `socketPath`, nonempty valid `domains` list. |
+| `network.tlsTerminate` | Runtime object schema: optional paired nonempty `caCertPath`/`caKeyPath`, optional `excludeDomains` and `extraCaCertPaths` arrays. |
+| `network.parentProxy` | Runtime object schema: optional URL strings `http`/`https`, optional string `noProxy`. |
+| `ripgrep` | Runtime object schema: string `command`, optional string-array `args` and string `argv0`. |
+| `seccomp` | Runtime object schema: optional strings `applyPath`/`argv0`. |
+| `windows` | Runtime object schema: optional 1–20-character `sandboxUser`, UUID `sublayerGuid`/`wfpSublayerGuid`, ordered inclusive `proxyPortRange` within 1–65535 with width ≤64, and `srtWin.path` as an optional nonempty string. |
+
+Nested runtime options retain their existing atomic replacement semantics: an invalid object override is ignored as a whole, while a valid object replaces its inherited object. Schema parsing is used for validation only, not coercion or rewriting. Existing cumulative policy arrays, `ignoreViolations`, credential validation, unknown-key behavior, and `sshProxy` stripping are unchanged. This inventories the declared configuration surface; it does not start forwarding currently unused runtime options or alter project trust, C-4, or other security findings.
+
+Verification evidence: the implementation agent observed failing scalar regressions before the fix, then passed `pnpm exec tsx --test test/config.test.ts` (23/23), `pnpm check`, and the formatting check after the final refinements. Tests cover invalid global/default and project/inherited fallback, JSON loading, valid false/zero/negative timeout values, port bounds, callback preservation, atomic object replacement, and nonmutation. The agent's `pnpm test -- test/config.test.ts` attempt expanded to the full suite and failed in the existing runtime output-drain test (`missing stdout token 1`); no assertion was weakened. The coordinating session's required `pnpm check && pnpm lint && pnpm test && pnpm ci:fmt` attempt failed before execution with `ERR_PNPM_LOCKFILE_READ_FILE` / `Operation not permitted`. `git diff --check` passed. Full user-run verification remains required; no full-suite pass or release acceptance is claimed.
 
 ## 2. Sandbox holes
 

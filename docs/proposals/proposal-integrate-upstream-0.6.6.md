@@ -2,7 +2,7 @@
 
 - **Status:** In progress — slices 1–9.5 and the Slice 10a audit are complete; the private-fork ownership/release decision has been applied. O-01 is implemented. The approved Slice 10b cleanup unit retains C-13 write-implies-effective-read behavior and removes the rejected O-06 shortcut while retaining explicit sandbox commands. Local verification passed on rerun (full suite 165 passed, 0 failed/skipped/todo; check, lint, format, and diff check passed). The upstream-update rehearsal is complete ([record](../integration/upstream-0.6.6-update-rehearsal.md)); local frozen-install/CI-equivalent checks passed at `499939e0bd8d23bb5814f90eb43d4e18062aa316` ([verification](../integration/upstream-0.6.6-frozen-verification.md)); GitHub Actions and fresh bare-macOS release acceptance remain open.
 - **Date:** 2026-09-03
-- **Updated:** 2026-09-30
+- **Updated:** 2026-10-01
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
 - **Slice 6c assessment:** [sandbox-runtime 0.0.70/0.0.72 assessment](../integration/upstream-0.6.6-slice-6c-assessment.md)
@@ -364,6 +364,8 @@ O-03 is resolved against adopting upstream's generic ordinary-SSH proxy. The dow
 **Pre-Slice-10 review:** [upstream 0.6.6 integration review](../reviews/upstream-0.6.6-integration-review.md) confirms upstream and downstream features are correctly combined through Slice 9, records the clean typecheck/lint/format state and 157 pass / 2 environment-only fail / 1 deferred-todo test result, and lists the Slice 10 caveats (sandbox-nested test skips, adapter fragility, mocked platform evidence, stale docs). Slice 9.5 was added after that review to resolve the generic-SSH mismatch before final reconciliation.
 
 **Conformance and security review (2026-09-30):** [conformance and sandbox security review](../reviews/upstream-0.6.6-conformance-security-review.md) finds the branch substantially conforms, but records preflight/runtime glob mismatches and three critical sandbox holes (writable Git hooks/config and `.pi` extensions, a case-variant config-protection bypass, and unchecked non-core tools) that should be resolved before release.
+
+**C-3 follow-up (2026-10-01):** `dce9add` adds pre-merge scalar validation with warning/ignore fallback, preserving valid scalar precedence and cumulative arrays. The [conformance review](../reviews/upstream-0.6.6-conformance-security-review.md#c-3-remediation-inventory-and-verification) records the supported-setting inventory and bounded verification: 23 focused configuration tests passed in the implementation agent; its full-suite attempt hit the existing output-drain timing failure, and the coordinating session's required pnpm checks were blocked before execution by lockfile permissions. Full user-run verification is pending. Project trust, the separate `sandboxUserShell` decision, and release gates are unchanged.
 
 ### Slice 10: Parity, cleanup, and update rehearsal
 
