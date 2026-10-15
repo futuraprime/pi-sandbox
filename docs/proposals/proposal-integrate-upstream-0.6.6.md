@@ -2,7 +2,7 @@
 
 - **Status:** In progress — slices 1–9.5 and the Slice 10a audit are complete; the private-fork ownership/release decision has been applied. O-01 is implemented. The approved Slice 10b cleanup unit retains C-13 write-implies-effective-read behavior and removes the rejected O-06 shortcut while retaining explicit sandbox commands. Local verification passed on rerun (full suite 165 passed, 0 failed/skipped/todo; check, lint, format, and diff check passed). The upstream-update rehearsal is complete ([record](../integration/upstream-0.6.6-update-rehearsal.md)); local frozen-install/CI-equivalent checks passed at `499939e0bd8d23bb5814f90eb43d4e18062aa316` ([verification](../integration/upstream-0.6.6-frozen-verification.md)); GitHub Actions and fresh bare-macOS release acceptance remain open.
 - **Date:** 2026-09-03
-- **Updated:** 2026-10-01
+- **Updated:** 2026-10-15
 - **Slice 1 ledger:** [feature ledger and test map](../integration/upstream-0.6.6-feature-ledger.md)
 - **Slice 2 checkpoint:** [upstream baseline and downstream parity checklist](../integration/upstream-0.6.6-slice-2-checklist.md)
 - **Slice 6c assessment:** [sandbox-runtime 0.0.70/0.0.72 assessment](../integration/upstream-0.6.6-slice-6c-assessment.md)
@@ -258,14 +258,14 @@ Plan the migration as nine expected `/execute`-sized slices, plus one conditiona
 
 ### Slice 4: `/sandbox`, protected persistence, and configuration protection
 
-- Port the six-rule `/sandbox` editor and route all sanctioned writes through one protected persistence seam.
+- Original Slice 4 scope: port the then-planned six-rule `/sandbox` editor and route sanctioned writes through one protected persistence seam; the former editor was later superseded by the approved O-01 command split.
 - Block direct tool and Bash mutation of project and global sandbox configuration through `getAgentDir()`-aware paths.
 - Verify canonical duplicate detection, project-relative storage, unrelated configuration preservation, and sandbox reinitialisation.
 - Avoid retaining upstream and downstream configuration writers as parallel mutation paths.
 
 **Exit condition:** command, persistence, and protection tests pass through the upstream-shaped extension integration points.
 
-**Slice 4 verified:** the six-rule `/sandbox` command and its single persistence adapter are implemented in `src/sandbox-command.ts`. Project mutations preserve unrelated JSON and relative spellings, deduplicate canonical filesystem paths, and refresh an active runtime only after a real change. Canonical project/global config paths are protected at direct write/edit and Bash preflight seams before sandbox-disabled checks and are included in runtime `denyWrite`; `/sandbox-allow` is removed. Focused node:test command, protection, and extension reinitialisation contracts pass. Remaining Bash diagnostic/preflight and runtime-meaning TODOs stay assigned to later slices.
+**Historical Slice 4 checkpoint (superseded by the approved O-01 command split):** at that stage, the six-rule `/sandbox` editor and its single persistence adapter were implemented in `src/sandbox-command.ts`, and `/sandbox-allow` was removed. Project mutations preserved unrelated JSON and relative spellings, deduplicated canonical filesystem paths, and refreshed an active runtime only after a real change. Canonical project/global config paths were protected at direct write/edit and Bash preflight seams before sandbox-disabled checks and included in runtime `denyWrite`; focused node:test command, protection, and extension reinitialisation contracts passed. The current command contract is the approved Slice 10 split documented under Configuration commands and reflected in the C-5 reconciliation below. Remaining Bash diagnostic/preflight and runtime-meaning TODOs stayed assigned to later slices.
 
 ### Slice 5: Diagnostics, Git/worktree, and status modules
 
@@ -342,7 +342,7 @@ Slice 9 is complete and is divided into the prompt/UI contract work and the life
 
 **Slice 9b verified:** [`upstream-0.6.6-slice-9b-checkpoint.md`](../integration/upstream-0.6.6-slice-9b-checkpoint.md) records the focused extension/status/runtime evidence, including fail-closed replacement failure, exact-equivalence restoration, persisted-but-blocked policy, explicit recovery, stale completion protection, serialized cleanup, and status presentation. The full nested SandboxManager orchestration remains constrained by the active outer sandbox mux socket policy; no permission broadening was used.
 
-Keep optional `/sandbox-allow`, SSH proxy, `sandboxUserShell`, and toggle decisions outside Slice 9 unless separately approved.
+At the Slice 9 checkpoint, optional `/sandbox-allow`, SSH proxy, `sandboxUserShell`, and toggle decisions remained outside that slice unless separately approved. `/sandbox-allow` was subsequently approved and implemented as part of Slice 10.
 
 **Exit condition:** met for Slice 9. Prompt, UI, lifecycle, and extension-seam tests pass without weakening configuration protection or policy precedence. Slice 9.5 is complete; Slice 10 parity, cleanup, and update rehearsal remain open.
 
@@ -432,7 +432,7 @@ Add or retain focused tests for:
 - equal-specificity deny precedence and more-specific allow exceptions;
 - project-relative persistence and global/session absolute persistence;
 - canonical duplicate detection without rewriting project-relative values;
-- all six `/sandbox` rule types;
+- `/sandbox` remaining display-only and `/sandbox-allow domain|read|write <target>` opening the editable positive-grant prompt across session, project, and global scopes;
 - edited prompt rules matching the blocked target;
 - prompt timeout aborting without persistence;
 - protected config files remaining inaccessible to direct tools and Bash mutation;
@@ -452,12 +452,13 @@ Run formatting, linting, TypeScript checking, and unit tests. Run platform-speci
 
 ## Open questions
 
-- **Resolved for Slice 10b:** adopt the upstream command split: `/sandbox` becomes display-only and `/sandbox-allow domain|read|write <target>` uses the editable session/project/global permission prompt. Remove the six-rule editor only after replacement persistence, refresh, validation, and configuration-protection coverage passes.
+- **Resolved and implemented for Slice 10b:** `/sandbox` is display-only and `/sandbox-allow domain|read|write <target>` uses the editable session/project/global permission prompt. The old six-rule editor was removed after replacement persistence, refresh, validation, and configuration-protection coverage passed; deny changes remain manual configuration changes only.
 - **Resolved in the approved Slice 10b cleanup unit (2026-09-30):** retain C-13: configured and session write allowances also grant effective read access on those same paths; this formalizes existing behavior without adding policy/runtime behavior or changing read/write deny specificity. Reject O-06 and remove the `Alt+S` toggle; explicit `/sandbox-enable` and `/sandbox-disable` commands remain.
 - Should users be able to remove inherited rules through a separate explicit command, while keeping empty-array composition cumulative?
 - **Resolved for Slice 9.5:** reject upstream's generic ordinary-SSH proxy and implement only a narrowly scoped Git-over-SSH transport, retaining domain filtering, secure host verification, exact session-only SSH-agent approval, and no broad Unix-socket access. Require a real disposable-remote push acceptance test on bare macOS.
 - **Resolved in Slices 6d–9.5:** stock sandbox-runtime 0.0.72 needed the bounded consumer-side Chromium adapter; the exact runtime is approved with that adapter. Slice 9.5 resolved the extension's isolated-known-hosts limitation with an explicit trust path and strict host-key checking, verified against disposable SSH fixtures.
 - Credential policy composition was resolved in Slice 8 as global-only initially; revisit only through an explicit trust review and composition contract.
+- **C-5 documentation-only reconciliation (2026-10-15):** corrected the stale Slice 4 and verification descriptions to distinguish the historical six-rule editor from the current approved `/sandbox` and `/sandbox-allow` contract. Source/test evidence and the explicit no-new-test limitation are recorded in the [conformance review](../reviews/upstream-0.6.6-conformance-security-review.md#1-proposal-conformance). No runtime changes, other finding closures, or release-gate closures are implied.
 - **Resolved for C-4 (2026-10-01):** reject config-controlled and session-wide user-shell bypass. Keep manual `!`/`!!` commands sandboxed when enabled; permit explicit one-command unsandboxed approval at recognized preflight blocks or attributed runtime failures, warning that retry can repeat side effects. Preserve agent Bash enforcement, hard guards, and existing grant choices where applicable. Implementation and regression coverage are on `fix/c4-manual-shell-command-bypass`. Final user-run verification outside the sandbox at `892e722` passed TypeScript, lint, full tests (221 total, 218 passed, 0 failed, 3 intentional credential-CLI skips), and formatting. The user also confirmed expected preflight/runtime prompt appearance in interactive smoke tests and accepted retaining ordinary scoped grants alongside the one-command bypass. Other interactive outcomes are covered by automated tests rather than a separately reported manual replay; unrelated release gates remain pending. See the [C-4 record](../reviews/upstream-0.6.6-conformance-security-review.md#c-4-per-command-manual-shell-approval).
 - **Resolved for Slice 10:** retain pnpm and `node:test`/`tsx` (O-07); verify frozen installation and CI with the final private package metadata. No registry or automatic release workflow.
 
