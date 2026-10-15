@@ -20,6 +20,7 @@ import assert from "node:assert/strict";
 import { DEFAULT_CONFIG, type SandboxConfig } from "../src/config.ts";
 import { renderDiagnosticBlockData, type SandboxDiagnosticBlockData } from "../src/diagnostics.ts";
 import extension from "../src/extension.ts";
+import { extractDomainsFromCommand } from "../src/policy.ts";
 import { getVolumeCaseSensitivity } from "../src/path-security.ts";
 import {
   gitUpstreamMutationCommands,
@@ -184,13 +185,21 @@ function respondToPrompts(ctx: ExtensionContext, key: () => string) {
       );
       state.count += 1;
       state.rendered.push(component.render(120).join("\n"));
-      component.handleInput(key());
+      try {
+        component.handleInput(key());
+      } finally {
+        component.dispose?.();
+      }
     });
   return state;
 }
 
 function manualDomainCommand(domain: string): string {
-  return `printf '%s' ${shellQuote(`https://${domain}`)}`;
+  const command = `false && curl https://${domain}; printf '%s' ${shellQuote(
+    `https://${domain}`,
+  )}`;
+  assert.deepEqual(extractDomainsFromCommand(command), [domain]);
+  return command;
 }
 
 function makeStaleContext(): ExtensionContext {
@@ -2037,7 +2046,10 @@ test("bash rendering hides raw metadata and reveals output and truncation only w
   assert.doesNotMatch(expanded, /<sandbox_diagnostic>/);
 });
 
-test("manual domain bypass runs once locally without persisting access", async () => {
+test(
+  "manual domain bypass runs once locally without persisting access",
+  { timeout: 15_000 },
+  async () => {
   const root = makeProjectTempDirectory("manual-domain-bypass");
   mkdirSync(join(root, ".pi"), { recursive: true });
   writeFileSync(
@@ -2046,7 +2058,7 @@ test("manual domain bypass runs once locally without persisting access", async (
   );
   const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
   const resetMock = mock.method(SandboxManager, "reset", async () => undefined);
-  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => "printf sandboxed-next");
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => "printf next-command");
 
   try {
     const { pi, handlers, sentMessages } = makePi();
@@ -2087,7 +2099,7 @@ test("manual domain bypass runs once locally without persisting access", async (
     assert.equal(repeated?.result?.exitCode, 1);
     assert.equal(wrapMock.mock.callCount(), 0);
 
-    const ordinaryCommand = "printf sandboxed-next";
+    const ordinaryCommand = "printf next-command";
     const ordinary = await handlers.get("user_bash")?.(
       { command: ordinaryCommand, excludeFromContext: true },
       ctx,
@@ -2100,7 +2112,7 @@ test("manual domain bypass runs once locally without persisting access", async (
       env: process.env,
     });
     assert.equal(ordinaryResult.exitCode, 0);
-    assert.equal(ordinaryOutput, "sandboxed-next");
+    assert.equal(ordinaryOutput, "next-command");
     assert.equal(wrapMock.mock.callCount(), 1);
     assert.equal(prompts.count, 3);
     assert.deepEqual(sentMessages, []);
@@ -2113,7 +2125,10 @@ test("manual domain bypass runs once locally without persisting access", async (
   }
 });
 
-test("legacy sandboxUserShell false does not disable the manual shell sandbox", async () => {
+test(
+  "legacy sandboxUserShell false does not disable the manual shell sandbox",
+  { timeout: 15_000 },
+  async () => {
   const root = makeProjectTempDirectory("legacy-manual-shell-sandbox");
   const config = {
     ...makePromptTestConfig(),
@@ -2123,7 +2138,7 @@ test("legacy sandboxUserShell false does not disable the manual shell sandbox", 
   const wrapMock = mock.method(
     SandboxManager,
     "wrapWithSandbox",
-    async () => "printf sandboxed-legacy-config",
+    async () => "printf legacy-config",
   );
 
   try {
@@ -2143,7 +2158,7 @@ test("legacy sandboxUserShell false does not disable the manual shell sandbox", 
     });
 
     assert.equal(result.exitCode, 0);
-    assert.equal(output, "sandboxed-legacy-config");
+    assert.equal(output, "legacy-config");
     assert.equal(wrapMock.mock.callCount(), 1);
   } finally {
     wrapMock.mock.restore();
@@ -2152,7 +2167,10 @@ test("legacy sandboxUserShell false does not disable the manual shell sandbox", 
   }
 });
 
-test("Linux SSH preflight offers a local one-time choice without granting socket access", async () => {
+test(
+  "Linux SSH preflight offers a local one-time choice without granting socket access",
+  { timeout: 15_000 },
+  async () => {
   const root = makeProjectTempDirectory("linux-ssh-manual-bypass");
   allowSshTestDomain(root);
   const originalSocket = process.env.SSH_AUTH_SOCK;
@@ -2202,7 +2220,10 @@ test("Linux SSH preflight offers a local one-time choice without granting socket
   }
 });
 
-test("runtime sandbox denial retries only the original manual command locally", async () => {
+test(
+  "runtime sandbox denial retries only the original manual command locally",
+  { timeout: 15_000 },
+  async () => {
   const root = makeProjectTempDirectory("manual-runtime-retry");
   const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
   const wrapMock = mock.method(
@@ -2262,7 +2283,10 @@ test("runtime sandbox denial retries only the original manual command locally", 
   }
 });
 
-test("ordinary command failures do not offer a manual bypass", async () => {
+test(
+  "ordinary command failures do not offer a manual bypass",
+  { timeout: 15_000 },
+  async () => {
   const root = makeProjectTempDirectory("manual-bypass-ordinary-failure");
   const managerMock = mock.method(SandboxManager, "initialize", async () => undefined);
   const wrapMock = mock.method(
@@ -2300,7 +2324,10 @@ test("ordinary command failures do not offer a manual bypass", async () => {
   }
 });
 
-test("manual bypass operations reject mismatched, reused, aborted, and stale approvals", async () => {
+test(
+  "manual bypass operations reject mismatched, reused, aborted, and stale approvals",
+  { timeout: 15_000 },
+  async () => {
   const root = makeProjectTempDirectory("manual-bypass-validation");
   mkdirSync(join(root, ".pi"), { recursive: true });
   writeFileSync(
@@ -2315,7 +2342,7 @@ test("manual bypass operations reject mismatched, reused, aborted, and stale app
     const { pi, handlers } = makePi();
     extension(pi);
     const ctx = makeContext(root, []);
-    respondToPrompts(ctx, () => "u");
+    const prompts = respondToPrompts(ctx, () => "u");
     await handlers.get("session_start")?.({}, ctx);
 
     const getBypass = async (command: string) => {
@@ -2369,6 +2396,8 @@ test("manual bypass operations reject mismatched, reused, aborted, and stale app
       staleReadiness.exec(staleReadinessCommand, root, execOptions()),
       /no longer valid/,
     );
+    assert.equal(prompts.count, 6);
+    assert.ok(prompts.rendered.every((prompt) => /Run once unsandboxed/.test(prompt)));
     assert.equal(wrapMock.mock.callCount(), 0);
   } finally {
     wrapMock.mock.restore();
@@ -2378,7 +2407,10 @@ test("manual bypass operations reject mismatched, reused, aborted, and stale app
   }
 });
 
-test("manual bypass is unavailable without UI, after cancel, and after prompt timeout", async () => {
+test(
+  "manual bypass is unavailable without UI, after cancel, and after prompt timeout",
+  { timeout: 15_000 },
+  async () => {
   const root = makeProjectTempDirectory("manual-bypass-no-prompt");
   const config = makePromptTestConfig();
   config.network!.deniedDomains = ["blocked.example"];
@@ -3045,7 +3077,10 @@ test("session starts retain allowances until shutdown clears them", async () => 
   }
 });
 
-test("Bash write diagnostics apply shared specificity to direct and nested commands", async () => {
+test(
+  "Bash write diagnostics apply shared specificity to direct and nested commands",
+  { timeout: 15_000 },
+  async () => {
   const root = makeProjectTempDirectory("write-policy-matrix");
   const outsideBase = join(dirname(root), basename(root));
   const defaultTarget = join(root, "default", "output.txt");
@@ -3103,6 +3138,7 @@ test("Bash write diagnostics apply shared specificity to direct and nested comma
     const ctx = makeContext(root, []);
     await handlers.get("session_start")?.({}, ctx);
     let promptCount = 0;
+    const promptSnapshots: string[] = [];
     (ctx.ui as any).custom = (factory: any) =>
       new Promise((resolve) => {
         const component = factory(
@@ -3111,20 +3147,44 @@ test("Bash write diagnostics apply shared specificity to direct and nested comma
           {},
           (result: unknown) => resolve(result),
         );
+        const prompt = component.render(120).join("\n");
+        promptSnapshots.push(prompt);
         promptCount += 1;
-        component.handleInput("s");
+        try {
+          if (/Allow for this session only/.test(prompt)) {
+            component.handleInput("s");
+          } else {
+            assert.match(prompt, /Retry once unsandboxed/);
+            assert.doesNotMatch(
+              prompt,
+              /Allow for this session only|Allow for this project|Allow for all projects/,
+            );
+            component.handleInput("esc");
+          }
+        } finally {
+          component.dispose?.();
+        }
       });
 
     const defaultCommand = `printf x > ${defaultTarget}`;
     outcomes.set(defaultCommand, [blockedWriteCommand(defaultTarget)]);
+    const defaultEventsStart = events.length;
     const defaultResult = await runUserBash(handlers, defaultCommand, ctx);
     assert.equal(defaultResult.result.exitCode, 1);
-    assert.equal(promptCount, 0);
+    assert.equal(promptCount, 1);
+    assert.match(promptSnapshots[0] ?? "", /Retry once unsandboxed/);
+    assert.doesNotMatch(
+      promptSnapshots[0] ?? "",
+      /Allow for this session only|Allow for this project|Allow for all projects/,
+    );
+    assert.deepEqual(events.slice(defaultEventsStart), [`wrap:${defaultCommand}`]);
     assert.equal(attempts.get(defaultCommand), 1);
+    assert.equal(resetMock.mock.callCount(), 0);
     assert.match(sentMessages.at(-1)?.content ?? "", /type: write/);
     assert.equal(sentMessages.at(-1)?.content.includes(`target: ${defaultTarget}`), true);
     assert.match(sentMessages.at(-1)?.content ?? "", /rule: allowWrite/);
-    assert.match(sentMessages.at(-1)?.content ?? "", /prompted: no/);
+    assert.match(sentMessages.at(-1)?.content ?? "", /prompted: yes/);
+    assert.match(sentMessages.at(-1)?.content ?? "", /choice: abort/);
     assert.match(sentMessages.at(-1)?.content ?? "", /retried: no/);
     assert.match(sentMessages.at(-1)?.content ?? "", /final_outcome: failure/);
     assert.match(sentMessages.at(-1)?.content ?? "", /action: write access allowed/);
@@ -3163,20 +3223,31 @@ test("Bash write diagnostics apply shared specificity to direct and nested comma
         const command = `printf x > ${policyCase.target}`;
         const executedCommand = nested ? `bash -c ${shellQuote(command)}` : command;
         outcomes.set(executedCommand, [blockedWriteCommand(policyCase.target, nested)]);
-        const promptCountBefore: number = promptCount;
-        assert.equal(promptCountBefore, 0);
+        const promptCountBefore = promptCount;
+        const eventsStart = events.length;
+        const resetsBefore = resetMock.mock.callCount();
+        const initializationsBefore = initializedAllowWrites.length;
         const response = await runUserBash(handlers, executedCommand, ctx);
         assert.equal(response.result.exitCode, 1);
-        assert.equal(promptCount, promptCountBefore);
+        assert.equal(promptCount, promptCountBefore + 1);
+        const prompt = promptSnapshots.at(-1) ?? "";
+        assert.match(prompt, /Retry once unsandboxed/);
+        assert.doesNotMatch(
+          prompt,
+          /Allow for this session only|Allow for this project|Allow for all projects/,
+        );
         assert.equal(attempts.get(executedCommand), 1);
+        assert.equal(resetMock.mock.callCount(), resetsBefore);
+        assert.equal(initializedAllowWrites.length, initializationsBefore);
+        assert.deepEqual(events.slice(eventsStart), [`wrap:${executedCommand}`]);
         assert.equal(response.output.includes("retrying"), false);
 
         const diagnostic = sentMessages.at(-1)?.content ?? "";
         assert.match(diagnostic, /type: write/);
         assert.equal(diagnostic.includes(`target: ${policyCase.target}`), true);
         assert.equal(diagnostic.includes(`rule: ${policyCase.rule}`), true);
-        assert.match(diagnostic, /prompted: no/);
-        assert.match(diagnostic, /choice: none/);
+        assert.match(diagnostic, /prompted: yes/);
+        assert.match(diagnostic, /choice: abort/);
         assert.match(diagnostic, /retried: no/);
         assert.match(diagnostic, /final_outcome: failure/);
         assert.equal(diagnostic.includes(`action: ${policyCase.action}`), true);
@@ -3185,13 +3256,16 @@ test("Bash write diagnostics apply shared specificity to direct and nested comma
 
     const retryEventsStart = events.length;
     const retryInitializationsStart = initializedAllowWrites.length;
+    const retryPromptCountStart = promptCount;
     outcomes.set(nestedCommand, [
       blockedWriteCommand(unmatchedTarget, true),
       "printf nested-success",
     ]);
     const nestedResult = await runUserBash(handlers, nestedCommand, ctx);
     assert.equal(nestedResult.result.exitCode, 0);
-    assert.equal(promptCount, 1);
+    assert.equal(promptCount, retryPromptCountStart + 1);
+    assert.match(promptSnapshots.at(-1) ?? "", /Allow for this session only/);
+    assert.match(promptSnapshots.at(-1) ?? "", /Retry once unsandboxed/);
     assert.match(nestedResult.output, /retried successfully/);
     assert.match(sentMessages.at(-1)?.content ?? "", /final_outcome: success/);
     assert.match(sentMessages.at(-1)?.content ?? "", /retried: yes/);
@@ -3204,6 +3278,8 @@ test("Bash write diagnostics apply shared specificity to direct and nested comma
     ]);
     assert.equal(initializedAllowWrites.length, retryInitializationsStart + 1);
     assert.equal(initializedAllowWrites.at(-1)?.includes(unmatchedTarget), true);
+    assert.equal(promptCount, 8);
+    assert.equal(promptSnapshots.length, promptCount);
 
     const persisted = JSON.parse(readFileSync(join(root, ".pi", "sandbox.json"), "utf8"));
     assert.equal(persisted.filesystem.allowWrite.includes(unmatchedTarget), false);
