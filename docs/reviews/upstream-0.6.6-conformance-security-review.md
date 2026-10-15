@@ -19,7 +19,10 @@ The branch substantially implements the proposal, but it should not be treated a
 - **Remaining S-1 limits:** the pinned Linux runtime ignores write-deny globs, so nested paths without concrete runtime denies remain unprotected there. Arbitrary `core.hooksPath` destinations are not automatically protected. This is not a cross-platform or all-configurations closeout of S-1.
 - **S-2 — addressed and validated.** Security-specific path checks detect volume case sensitivity using read-only existing-ancestor probes, protect missing project/global configuration files and case variants of project/nested `.pi/` paths, and block direct `write`/`edit` before approval. Indeterminate sensitivity fails closed; known case-sensitive volumes retain case-distinct paths. General path/glob matching is unchanged. User-run `pnpm run all` passed formatting, lint, TypeScript, and all **189 tests**, with no skips, including the macOS missing-target write/edit regression and unknown-sensitivity fallback tests.
 - **S-3 remains open and remediation is deferred at the user's request.** Selective enforcement that preserves search/web tool utility is captured in the [extension-tool policy boundary proposal](../proposals/proposal-extension-tool-policy-boundary.md); no implementation is authorized. The original findings below describe the reviewed baseline. S-1 was committed as `22aab0b`; S-2 is recorded in the commit containing this status update.
-- **S-4 remains open.** Conditional credential-use trade-offs are captured in the [conditional credential boundary proposal](../proposals/proposal-conditional-credential-boundary.md); this draft does not authorize implementation or live-credential testing.
+- **S-4 — deferred at the user's request (2026-10-15)** to future work under the [conditional credential boundary proposal](../proposals/proposal-conditional-credential-boundary.md). The core exposure is inherited from downstream `main` (`757f058`), not introduced by this integration: broad default reads including `~/.config`, inherited command environment, and allowed GitHub destinations are present in both baselines. This source comparison is not live-credential verification. Deferral does not resolve the risk or authorize implementation or live-credential testing.
+- **S-5 — accepted intended fork behavior (user clarification, 2026-10-15), not an open remediation item.** Project configuration may override global settings and weaken policy without a separate project-trust gate. This authority is an intended goal of the fork; do not restrict it or add a trust gate as a security fix without a new explicit decision. Global-only credential declarations remain a separate boundary. The original review analysis below is historical risk context, not an approved remediation requirement.
+- **S-6 — deferred at the user's request (2026-10-15)** to the [Git and SSH authority boundary stub proposal](../proposals/proposal-git-ssh-authority-boundary.md). Session-wide SSH-agent authority and destructive local Git history access are inherited risks; the integration narrows some linked-worktree permissions. The stub records the problem without selecting a solution. Deferral does not resolve the risk or authorize implementation.
+- **S-7 — deferred at the user's request (2026-10-15)** to the [browser compatibility permission boundary stub proposal](../proposals/proposal-browser-permission-boundary.md). Browser permissions are opt-in and apply across sandboxed commands when enabled. The exposure is at least partly inherited from downstream `main`; no regression has been established, but complete permission equivalence against its pinned runtime dependency remains unverified. Deferral does not resolve the risk or authorize implementation.
 
 ## 1. Proposal conformance
 
@@ -133,7 +136,7 @@ The Bash-side runtime protection is not affected: a test creating `.BASHRC` agai
 
 *Remediation:* deny known credential stores by default, and deny or mask sensitive environment variables by default (or pass an explicit environment allowlist).
 
-**S-5. Project configuration can weaken policy, and is loaded regardless of project trust.** Most-local-wins scalars, and `network: { ...config.network }` in `buildRuntimeConfig`, let a project `.pi/sandbox.json` set:
+**S-5. Project configuration can weaken policy, and is loaded regardless of project trust — accepted intended behavior.** The following describes the original reviewed baseline; `sandboxUserShell` was subsequently retired under C-4. Most-local-wins scalars, and `network: { ...config.network }` in `buildRuntimeConfig`, let a project `.pi/sandbox.json` set:
 
 - `filesystem.disabled`, `enabled: false` or `sandboxUserShell: false`;
 - `network.allowAllUnixSockets`;
@@ -143,7 +146,7 @@ The Bash-side runtime protection is not affected: a test creating `.BASHRC` agai
 
 This contradicts the "project configuration is untrusted" rationale applied to credentials, voids the "an empty array cannot weaken policy" guarantee, and makes S-2 much more severe. pi-sandbox reads `.pi/sandbox.json` whether or not the user trusted the project.
 
-*Remediation:* allow project configuration to set only keys that add to or narrow policy, or require project trust before honouring weakening keys.
+*Original remediation suggestion — not adopted:* restrict project configuration to non-weakening settings or require project trust. The user reaffirmed that project authority to weaken policy is an intended fork goal; S-5 is not pending remediation.
 
 ### Medium — Git blast radius
 
@@ -168,5 +171,5 @@ This contradicts the "project configuration is untrusted" rationale applied to c
 
 1. Fix S-1, S-2 and S-3 before treating the branch as release-ready.
 2. Glob-semantics slice 1 aligns direct matching and canonicalization with the pinned converter. C-1 and C-2 have guarded supported macOS Bash profile corrections documented above; neither is a universal runtime-semantics change.
-3. Tighten defaults and configuration trust (S-4, S-5, S-7); these give the largest reduction in blast radius.
-4. Add push restrictions (S-6), then update the stale proposal sections (C-5).
+3. S-4 and S-7 are deferred to their linked proposals. S-5's project-configuration authority is accepted intended behavior, not remediation work.
+4. S-6 is deferred to its linked stub proposal; no push-restriction design is selected. C-5 documentation reconciliation is complete.
