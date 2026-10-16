@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -17,13 +17,19 @@ import {
   classifyProbeCompilation,
   classifyResourceProbe,
   validateNestedSandboxProbeExecutable,
+  capture,
   captureGeneratedProfile,
   isChromiumLaunchCommand,
   chromiumLaunchArgs,
   extractInlineSandboxProfile,
   ownedChromiumPids,
+  PROCESS_LIST_MAX_BUFFER,
+  readWorkerResultFile,
+  runBoundedFile,
   reportAsMarkdown,
   truncateOutput,
+  writeWorkerResultFile,
+  MAX_WORKER_RESULT_BYTES,
 } from "../scripts/chromium-acceptance.ts";
 
 test("acceptance host guard requires bare Darwin", () => {
@@ -332,6 +338,96 @@ test("generated SBPL capture handles shell apostrophe quoting and omits wrapper 
   assert.doesNotMatch(JSON.stringify(capture), /proxy-secret|private-wrapper|HTTP_PROXY/);
 });
 
+test("worker result file preserves large generated profiles independently of diagnostic capture", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "pi-worker-result-test-"));
+  const resultPath = join(fixture, "worker-result.json");
+  try {
+    const profile = `(version 1)\n(deny default)\n${Array.from(
+      { length: 7_000 },
+      (_, index) => `(allow file-read* (literal "/fixture/resource-${index}"))\n`,
+    ).join("")}`;
+    const wrapped = `/usr/bin/sandbox-exec -p '${profile}' /bin/bash`;
+    const generatedSeatbeltProfile = captureGeneratedProfile(
+      wrapped,
+      "enabled",
+      (command) => command,
+    );
+    const result = {
+      mode: "enabled" as const,
+      chromiumVersion: {
+        command: "Chromium --version",
+        exitCode: 0,
+        stdout: "Chromium 154",
+        stderr: "",
+        outputTruncated: false,
+      },
+      browser: {
+        command: "Chromium --dump-dom",
+        exitCode: 0,
+        stdout: "<html></html>",
+        stderr: "DevTools listening on ws://127.0.0.1:1234/devtools/browser/id",
+        outputTruncated: false,
+      },
+      probes: [],
+      gates: [{ name: "generated-profile-capture", passed: true, verdict: "captured" }],
+      lifecycle: { initialize: "passed", reset: "passed" },
+      generatedSeatbeltProfile,
+    };
+    const diagnostics = capture(256 * 1024);
+    diagnostics.append("stderr", "large diagnostic output ".repeat(20_000));
+    assert.equal(diagnostics.truncated(), true);
+    assert.equal(diagnostics.stderr().length, 256 * 1024);
+    assert.ok(Buffer.byteLength(JSON.stringify(result)) > 256 * 1024);
+
+    writeWorkerResultFile(resultPath, result);
+    assert.equal(statSync(resultPath).mode & 0o777, 0o600);
+    assert.throws(
+      () => readWorkerResultFile(resultPath, "disabled"),
+      /worker result mode does not match request/,
+    );
+    const symlinkPath = join(fixture, "worker-result-link.json");
+    symlinkSync(resultPath, symlinkPath);
+    assert.throws(
+      () => readWorkerResultFile(symlinkPath, "enabled"),
+      /worker result file is not a regular file/,
+    );
+    const captured = readWorkerResultFile(resultPath, "enabled");
+    assert.deepEqual(captured.generatedSeatbeltProfile, generatedSeatbeltProfile);
+    assert.equal(captured.browser?.stdout, "<html></html>");
+    assert.equal(captured.generatedSeatbeltProfile?.content.length, profile.length);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test("worker result files reject missing, malformed, invalid, and oversized data clearly", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "pi-worker-result-invalid-test-"));
+  const resultPath = join(fixture, "worker-result.json");
+  try {
+    assert.throws(
+      () => readWorkerResultFile(resultPath, "enabled"),
+      /worker result file is missing/,
+    );
+
+    writeFileSync(resultPath, "{invalid json");
+    assert.throws(
+      () => readWorkerResultFile(resultPath, "enabled"),
+      /worker result JSON is malformed/,
+    );
+
+    writeFileSync(resultPath, "{}", { flag: "w" });
+    assert.throws(
+      () => readWorkerResultFile(resultPath, "enabled"),
+      /worker result shape is invalid/,
+    );
+
+    writeFileSync(resultPath, Buffer.alloc(MAX_WORKER_RESULT_BYTES + 1), { flag: "w" });
+    assert.throws(() => readWorkerResultFile(resultPath, "enabled"), /exceeds the 8 MiB limit/);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
 test("generated SBPL capture fails closed on truncated or malformed shell tokens", () => {
   assert.throws(
     () => extractInlineSandboxProfile("/usr/bin/sandbox-exec -p '(version 1)\n(deny default)"),
@@ -467,6 +563,42 @@ test("escaped-browser cleanup requires the exact Chromium executable and profile
     "  105 /bin/echo --user-data-dir=/tmp/owned-profile",
   ].join("\n");
   assert.deepEqual(ownedChromiumPids(ps, "/tmp/owned-profile", "/Applications/Chromium"), [101]);
+});
+
+test("large process listings are captured from a bounded subprocess without widening ownership", () => {
+  const source = [
+    'const lines = ["  101 /Applications/Chromium --user-data-dir=/tmp/owned-profile --type=renderer"];',
+    "for (let index = 0; index < 12_000; index++) {",
+    '  lines.push("  " + (10_000 + index) + " /usr/bin/unrelated --argument=" + "x".repeat(20));',
+    "}",
+    'process.stdout.write(lines.join("\\n"));',
+  ].join("\n");
+  const listing = runBoundedFile(
+    process.execPath,
+    ["-e", source],
+    process.env,
+    5_000,
+    PROCESS_LIST_MAX_BUFFER,
+  );
+  assert.ok(Buffer.byteLength(listing) > 256 * 1024);
+  assert.deepEqual(
+    ownedChromiumPids(listing, "/tmp/owned-profile", "/Applications/Chromium"),
+    [101],
+  );
+});
+
+test("bounded subprocess capture fails explicitly when output exceeds maxBuffer", () => {
+  assert.throws(
+    () =>
+      runBoundedFile(
+        process.execPath,
+        ["-e", 'process.stdout.write("x".repeat(512 * 1024));'],
+        process.env,
+        5_000,
+        256 * 1024,
+      ),
+    (error: NodeJS.ErrnoException) => error.code === "ENOBUFS",
+  );
 });
 
 test("Markdown report is explicit about model-free scope and verdict", () => {

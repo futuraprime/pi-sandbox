@@ -92,7 +92,8 @@ type AcceptanceReport = {
 
 const CAPTURE_LIMIT = 12_000;
 const WORKER_TIMEOUT_MS = 90_000;
-const RESULT_PREFIX = "PI_CHROMIUM_ACCEPTANCE_RESULT:";
+export const MAX_WORKER_RESULT_BYTES = 8 * 1024 * 1024;
+export const PROCESS_LIST_MAX_BUFFER = 8 * 1024 * 1024;
 
 export function isChromiumLaunchCommand(command: string, launchCommand: string): boolean {
   return command === launchCommand || command === `unset GIT_SSH_COMMAND; ${launchCommand}`;
@@ -321,7 +322,7 @@ function quoteShell(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-function capture(limit = CAPTURE_LIMIT) {
+export function capture(limit = CAPTURE_LIMIT) {
   let stdout = "";
   let stderr = "";
   let truncated = false;
@@ -360,16 +361,17 @@ function sanitizedEnvironment(
   };
 }
 
-function runBoundedFile(
+export function runBoundedFile(
   command: string,
   args: string[],
   env: NodeJS.ProcessEnv,
   timeout = 5_000,
+  maxBuffer = 256 * 1024,
 ): string {
   return execFileSync(command, args, {
     encoding: "utf8",
     timeout,
-    maxBuffer: 256 * 1024,
+    maxBuffer,
     env,
   }).trim();
 }
@@ -804,19 +806,35 @@ async function runWorker(
 }
 
 function workerMain(argv: string[]): void {
-  const [, , , modeValue, fixture, chromium, chromiumReadPath, userTemp, token, nestedProbeArg] =
-    argv;
+  const [
+    ,
+    ,
+    ,
+    modeValue,
+    fixture,
+    chromium,
+    chromiumReadPath,
+    userTemp,
+    token,
+    nestedProbeArg,
+    resultPathArg,
+  ] = argv;
   if (
     (modeValue !== "enabled" && modeValue !== "disabled") ||
     !fixture ||
     !chromium ||
     !chromiumReadPath ||
     !userTemp ||
-    !token
+    !token ||
+    !resultPathArg
   ) {
     throw new Error("Invalid internal worker invocation.");
   }
   const mode = modeValue as Mode;
+  const expectedResultPath = join(realpathSync(fixture), mode, "worker-result.json");
+  if (resultPathArg !== expectedResultPath)
+    throw new Error("Worker result path is not the owned fixture file.");
+  const resultPath = resultPathArg;
   const nestedProbePath = nestedProbeArg || undefined;
   if (
     nestedProbePath &&
@@ -835,12 +853,36 @@ function workerMain(argv: string[]): void {
   };
   if (Buffer.byteLength(tempPaths["darwin-temp-unix-socket"]) >= 100)
     throw new Error("Canonical Darwin temp path is too long for AF_UNIX acceptance probe.");
-  void runWorker(mode, fixture, chromium, chromiumReadPath, tempPaths, nestedProbePath).then(
-    (result) => console.log(`${RESULT_PREFIX}${JSON.stringify(result)}`),
-    (error) =>
-      console.log(
-        `${RESULT_PREFIX}${JSON.stringify({ mode, probes: [], gates: [{ name: "worker", passed: false, verdict: "worker failed" }], lifecycle: { initialize: "failed", reset: "unknown" }, failure: error instanceof Error ? error.message : String(error) } satisfies WorkerResult)}`,
-      ),
+  void runWorker(mode, fixture, chromium, chromiumReadPath, tempPaths, nestedProbePath)
+    .then(
+      (result) => writeWorkerResultFile(resultPath, result),
+      (error) =>
+        writeWorkerResultFile(resultPath, {
+          mode,
+          probes: [],
+          gates: [{ name: "worker", passed: false, verdict: "worker failed" }],
+          lifecycle: { initialize: "failed", reset: "unknown" },
+          failure: error instanceof Error ? error.message : String(error),
+        }),
+    )
+    .catch(() => {
+      process.stderr.write("Chromium acceptance worker could not write its result file.\n");
+      process.exitCode = 1;
+    });
+}
+
+function isExecResult(value: unknown): value is ExecResult {
+  if (!value || typeof value !== "object") return false;
+  const result = value as Partial<ExecResult>;
+  return (
+    typeof result.command === "string" &&
+    (result.exitCode === null || typeof result.exitCode === "number") &&
+    typeof result.stdout === "string" &&
+    typeof result.stderr === "string" &&
+    typeof result.outputTruncated === "boolean" &&
+    (result.outputStream === undefined || typeof result.outputStream === "string") &&
+    (result.timedOut === undefined || typeof result.timedOut === "boolean") &&
+    (result.error === undefined || typeof result.error === "string")
   );
 }
 
@@ -849,14 +891,10 @@ function isWorkerResult(value: unknown): value is WorkerResult {
   const result = value as Partial<WorkerResult>;
   return (
     (result.mode === "enabled" || result.mode === "disabled") &&
+    (result.chromiumVersion === undefined || isExecResult(result.chromiumVersion)) &&
+    (result.browser === undefined || isExecResult(result.browser)) &&
     Array.isArray(result.probes) &&
-    result.probes.every(
-      (probe) =>
-        probe &&
-        typeof probe.command === "string" &&
-        typeof probe.outputTruncated === "boolean" &&
-        (probe.exitCode === null || typeof probe.exitCode === "number"),
-    ) &&
+    result.probes.every(isExecResult) &&
     (!result.nestedSandboxProbe ||
       (typeof result.nestedSandboxProbe.classification === "string" &&
         [
@@ -868,10 +906,7 @@ function isWorkerResult(value: unknown): value is WorkerResult {
           "diagnostic-unavailable",
           "not-run",
         ].includes(result.nestedSandboxProbe.classification) &&
-        typeof result.nestedSandboxProbe.result.command === "string" &&
-        typeof result.nestedSandboxProbe.result.outputTruncated === "boolean" &&
-        (result.nestedSandboxProbe.result.exitCode === null ||
-          typeof result.nestedSandboxProbe.result.exitCode === "number"))) &&
+        isExecResult(result.nestedSandboxProbe.result))) &&
     Array.isArray(result.gates) &&
     result.gates.every(
       (gate) =>
@@ -882,14 +917,56 @@ function isWorkerResult(value: unknown): value is WorkerResult {
     ) &&
     (!result.generatedSeatbeltProfile ||
       (typeof result.generatedSeatbeltProfile.content === "string" &&
+        result.generatedSeatbeltProfile.content.length <= 1_000_000 &&
         typeof result.generatedSeatbeltProfile.sha256 === "string" &&
         typeof result.generatedSeatbeltProfile.captureMethod === "string" &&
         createHash("sha256").update(result.generatedSeatbeltProfile.content).digest("hex") ===
           result.generatedSeatbeltProfile.sha256)) &&
     Boolean(result.lifecycle) &&
     typeof result.lifecycle?.initialize === "string" &&
-    typeof result.lifecycle?.reset === "string"
+    typeof result.lifecycle?.reset === "string" &&
+    (result.failure === undefined || typeof result.failure === "string")
   );
+}
+
+export function writeWorkerResultFile(path: string, result: WorkerResult): void {
+  if (!isWorkerResult(result)) throw new Error("worker result shape is invalid");
+  const serialized = JSON.stringify(result);
+  if (Buffer.byteLength(serialized) > MAX_WORKER_RESULT_BYTES)
+    throw new Error("worker result exceeds the 8 MiB limit");
+  writeFileSync(path, serialized, { encoding: "utf8", mode: 0o600, flag: "wx" });
+}
+
+export function readWorkerResultFile(path: string, expectedMode: Mode): WorkerResult {
+  let metadata: ReturnType<typeof lstatSync>;
+  try {
+    metadata = lstatSync(path);
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT")
+      throw new Error("worker result file is missing");
+    throw new Error("worker result file could not be read");
+  }
+  if (metadata.isSymbolicLink() || !metadata.isFile())
+    throw new Error("worker result file is not a regular file");
+  if (metadata.size > MAX_WORKER_RESULT_BYTES)
+    throw new Error("worker result exceeds the 8 MiB limit");
+  let serialized: string;
+  try {
+    serialized = readFileSync(path, "utf8");
+  } catch {
+    throw new Error("worker result file could not be read");
+  }
+  if (Buffer.byteLength(serialized) > MAX_WORKER_RESULT_BYTES)
+    throw new Error("worker result exceeds the 8 MiB limit");
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(serialized);
+  } catch {
+    throw new Error("worker result JSON is malformed");
+  }
+  if (!isWorkerResult(decoded)) throw new Error("worker result shape is invalid");
+  if (decoded.mode !== expectedMode) throw new Error("worker result mode does not match request");
+  return decoded;
 }
 
 function runWorkerProcess(
@@ -903,6 +980,7 @@ function runWorkerProcess(
   nestedProbePath?: string,
 ): Promise<{ result: WorkerResult; timedOut: boolean; processOutput: string }> {
   const scriptPath = fileURLToPath(import.meta.url);
+  const resultPath = join(realpathSync(fixture), mode, "worker-result.json");
   const child = spawn(
     process.execPath,
     [
@@ -917,6 +995,7 @@ function runWorkerProcess(
       userTemp,
       token,
       nestedProbePath ?? "",
+      resultPath,
     ],
     {
       cwd: resolve(dirname(fileURLToPath(import.meta.url)), ".."),
@@ -942,38 +1021,23 @@ function runWorkerProcess(
       clearTimeout(timer);
       cancelGroupTermination(child);
       activeWorker = undefined;
-      const allOutput = `${output.stdout()}\n${output.stderr()}`;
-      const line = allOutput
-        .split(/\r?\n/)
-        .reverse()
-        .find((value) => value.startsWith(RESULT_PREFIX));
       let result: WorkerResult;
       try {
-        const decoded: unknown = line ? JSON.parse(line.slice(RESULT_PREFIX.length)) : undefined;
-        if (line && !isWorkerResult(decoded)) throw new Error("Invalid worker result shape.");
-        result = line
-          ? (decoded as WorkerResult)
-          : {
-              mode,
-              probes: [],
-              gates: [
-                {
-                  name: "worker-process",
-                  passed: false,
-                  verdict: "bounded worker exited without a result",
-                },
-              ],
-              lifecycle: { initialize: "unknown", reset: "unknown" },
-              failure: `worker exit code ${String(code)}; ${output.stderr()}`,
-            };
-      } catch {
+        result = readWorkerResultFile(resultPath, mode);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
         result = {
           mode,
           probes: [],
           gates: [
-            { name: "worker-process", passed: false, verdict: "worker returned malformed result" },
+            {
+              name: "worker-process",
+              passed: false,
+              verdict: `worker result unavailable: ${reason}`,
+            },
           ],
           lifecycle: { initialize: "unknown", reset: "unknown" },
+          failure: reason,
         };
       }
       if (code !== 0) {
@@ -1083,7 +1147,13 @@ function listChromiumPids(
   env: NodeJS.ProcessEnv,
 ): { pids: number[]; error?: string } {
   try {
-    const listing = runBoundedFile("/bin/ps", ["-axo", "pid=,command="], env, 5_000);
+    const listing = runBoundedFile(
+      "/bin/ps",
+      ["-axo", "pid=,command="],
+      env,
+      5_000,
+      PROCESS_LIST_MAX_BUFFER,
+    );
     return { pids: ownedChromiumPids(listing, profile, chromiumExecutable) };
   } catch (error) {
     return { pids: [], error: error instanceof Error ? error.message : String(error) };
