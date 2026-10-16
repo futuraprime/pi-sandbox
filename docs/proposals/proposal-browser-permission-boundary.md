@@ -2,6 +2,7 @@
 
 - **Created:** 2026-10-15
 - **Status:** draft
+- **Updated:** 2026-10-16
 
 ## Summary
 
@@ -21,6 +22,10 @@ Local downstream `main` (`757f058`) already relied on browser permissions from i
 ## Proposed approach
 
 Undecided. No permission changes, process-isolation design, or implementation plan is proposed in this stub. Future evaluation should distinguish bounded exposure reductions from a complete browser-specific authority boundary.
+
+## Decisions
+
+- **2026-10-16:** the user rules out `allowBrowserProcess` as a route for Chromium support because its grants are too broad for every sandboxed command. Its `(allow mach*)` grant may also permit a LaunchServices escape ([GHSA-5263-whxq-77hp](https://github.com/Homebrew/brew/security/advisories/GHSA-5263-whxq-77hp)); this is untested. It cannot enable own-sandbox Chromium anyway because macOS refuses nested Seatbelt application ([diagnosis](../integration/upstream-0.6.6-chromium-acceptance-harness.md#2026-10-16-nesting-diagnosis)). Whether to remove or restrict the setting is not yet decided. See also the [browser test broker proposal](proposal-sandboxed-browser-test-broker.md).
 
 ## Open questions
 
