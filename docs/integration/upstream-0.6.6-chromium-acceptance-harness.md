@@ -89,6 +89,8 @@ Downstream `main` (`757f058`) pins `@carderne/sandbox-runtime` at `github:futura
 
 The failure on `main` is the same, so the Chromium blocker is **not a regression** from `main`.
 
+**Decision (2026-10-16):** because the failure is not a regression, the user deferred the own-sandbox Chromium acceptance gate. The gate no longer blocks merging this integration. It is neither passed nor waived; real coverage is deferred to the [browser test broker proposal](../proposals/proposal-sandboxed-browser-test-broker.md). The harness and its criteria are unchanged.
+
 ### Decisions (2026-10-16)
 
 - The user rules out `allowBrowserProcess` as a route for Chromium support because its grants are too broad for every sandboxed command. The [browser permission boundary](../proposals/proposal-browser-permission-boundary.md) stub records this decision; no code change is authorized by it.
