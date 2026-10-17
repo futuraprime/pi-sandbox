@@ -80,6 +80,15 @@ Run from a normal macOS Terminal on the same host and Chromium. Disposable homes
 - Direct-host non-exit: version 154 keeps headless browsers alive when `--remote-debugging-port` is present (`chrome/browser/devtools/chrome_devtools_manager_delegate.cc`, lines 194–204), but the browser also failed to exit without that switch. The direct-host timeout cause therefore remains unexplained, and the harness baseline is unchanged.
 - Which of the two Chromium apply paths produced the EPERM was not confirmed.
 
+### Comparison with downstream `main`
+
+Downstream `main` (`757f058`) pins `@carderne/sandbox-runtime` at `github:futuraprime/sandbox-runtime#ff3accf118d91af1c6880738a22f226422a6b15f`.
+
+- **Source check (user-run).** A normal-Terminal `grep` of that fork's installed `dist/sandbox/macos-sandbox-utils.js` found no `no-sandbox` exemption. The only exec rule is an unconditional `(allow process-exec)`, so every child inherits the outer profile. Browser mode in the fork grants the same kinds of resources as this branch's consumer adapter: `kern.hv_vmm_present`, loopback binding, and a browser temp directory.
+- **Live launch (user-run).** Chromium was launched as a sandboxed `!` command in a Pi session using `main`'s extension with `allowBrowserProcess` enabled. Arguments were the same as the diagnostics above, with a disposable `$TMPDIR` profile that was removed afterwards, a 30-second kill, no `--no-sandbox`, and no external URL. Result: `Trace/BPT trap: 5`, exit 133, no DOM, 17 `Failed to initialize sandbox` lines, and the GPU `Goodbye` fatal.
+
+The failure on `main` is the same, so the Chromium blocker is **not a regression** from `main`.
+
 ### Decisions (2026-10-16)
 
 - The user rules out `allowBrowserProcess` as a route for Chromium support because its grants are too broad for every sandboxed command. The [browser permission boundary](../proposals/proposal-browser-permission-boundary.md) stub records this decision; no code change is authorized by it.
