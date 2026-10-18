@@ -285,6 +285,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         sandboxRuntimeCwd = desired.cwd;
         sandboxRuntimeOwnerGeneration = expectedGeneration;
         sandboxLifecycle = { state: "ready", generation: expectedGeneration, policy: desired };
+        if (currentSessionContext) updateStatus(currentSessionContext, "enabled");
         return true;
       } catch (error) {
         if (sessionGeneration !== expectedGeneration) return false;

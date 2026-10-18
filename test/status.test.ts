@@ -97,6 +97,21 @@ test("uses compact lifecycle status states and clears on shutdown", () => {
   assert.equal(getSandboxStatusPresentation("enabled").description, "Sandbox enabled");
 });
 
+test("uses the warning theme role for pending status only", () => {
+  const tones: string[] = [];
+  const theme = {
+    fg: (tone: string, text: string) => {
+      tones.push(tone);
+      return text;
+    },
+  };
+
+  formatSandboxStatus("pending", theme);
+  assert.deepEqual(tones, ["warning"]);
+  formatSandboxStatus("disabled", theme);
+  assert.deepEqual(tones, ["warning", "error"]);
+});
+
 test("collapsed intervention presentation never includes raw diagnostic metadata", () => {
   const diagnosticData = {
     type: "network" as const,

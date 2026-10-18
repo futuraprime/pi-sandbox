@@ -1324,6 +1324,7 @@ test("stale recovery completion cannot replace a newer session lifecycle", async
 
 test("permission prompts persist confirmed scopes without serializing session grants", async () => {
   const root = makeProjectTempDirectory("permission-scope");
+  const statusUpdates: StatusUpdate[] = [];
   const sessionTargetRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-permission-session-"));
   const globalTargetRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-permission-global-"));
   const writeTargetRoot = mkdtempSync(join(tmpdir(), "pi-sandbox-permission-write-"));
@@ -1337,7 +1338,7 @@ test("permission prompts persist confirmed scopes without serializing session gr
     const config = makePromptTestConfig();
     extension(pi, { configLoader: () => config });
     const notices: string[] = [];
-    const ctx = makeContext(root, notices);
+    const ctx = makeContext(root, notices, statusUpdates);
     (ctx.ui as any).custom = <T>(factory: any): Promise<T> =>
       new Promise<T>((resolve) => {
         let component: any;
@@ -1369,6 +1370,10 @@ test("permission prompts persist confirmed scopes without serializing session gr
 
     const sessionTarget = targetFor(sessionTargetRoot);
     assert.equal(await checkRead(sessionTarget, "session"), undefined);
+    assert.deepEqual(
+      statusUpdates.slice(-2).map(({ value }) => value),
+      ["ꗃ", "🔒"],
+    );
     // A second access is allowed by the in-memory grant, not by either config file.
     assert.equal(await checkRead(sessionTarget, "session"), undefined);
     assert.equal(existsSync(join(root, ".pi", "sandbox.json")), false);

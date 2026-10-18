@@ -27,7 +27,7 @@ type DiagnosticTheme = {
   bold: (text: string) => string;
 };
 type StatusTheme = Pick<DiagnosticTheme, "fg">;
-type StatusTone = "accent" | "error";
+type StatusTone = "accent" | "error" | "warning";
 
 interface SandboxStatusPresentation {
   state: SandboxStatusState;
@@ -52,7 +52,7 @@ const STATUS_PRESENTATIONS: Record<SandboxStatusState, SandboxStatusPresentation
   pending: {
     state: "pending",
     text: "ꗃ",
-    tone: "error",
+    tone: "warning",
     description: "Sandbox initialization pending",
   },
   unsupported: {
