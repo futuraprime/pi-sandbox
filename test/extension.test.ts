@@ -545,6 +545,135 @@ test("shutdown does not clear a replacement runtime after deferred reset", async
   }
 });
 
+test("reloaded initialization waits behind prior in-flight init and shutdown reset", async () => {
+  const firstRoot = makeProjectTempDirectory("reload-runtime-handoff-first");
+  const secondRoot = makeProjectTempDirectory("reload-runtime-handoff-second");
+  const initializationStarted = deferred<void>();
+  const initializationFinished = deferred<void>();
+  const firstResetFinished = deferred<void>();
+  const resetCallsFinished = [deferred<void>(), deferred<void>()];
+  let activeRuntimeConfig: Parameters<typeof SandboxManager.initialize>[0] | undefined;
+  let initializationPromise: Promise<void> | undefined;
+  let resetPromise: Promise<void> | undefined;
+  let firstInitialization = true;
+  let initializeCalls = 0;
+  let resetCalls = 0;
+  let firstStart: Promise<unknown> | undefined;
+  let replacementStart: Promise<unknown> | undefined;
+  let firstShutdownQueued = false;
+  let first: ReturnType<typeof makePi> | undefined;
+  let second: ReturnType<typeof makePi> | undefined;
+  let firstContext: ExtensionContext | undefined;
+  let secondContext: ExtensionContext | undefined;
+  const initializeMock = mock.method(
+    SandboxManager,
+    "initialize",
+    async (runtimeConfig: Parameters<typeof SandboxManager.initialize>[0]) => {
+      initializeCalls += 1;
+      // Match SandboxManager.initialize: it waits for resetPromise first, then
+      // shares an in-flight initializationPromise without applying new config.
+      if (resetPromise) await resetPromise;
+      if (initializationPromise) {
+        await initializationPromise;
+        return;
+      }
+      activeRuntimeConfig = runtimeConfig;
+      initializationStarted.resolve(undefined);
+      const pendingInitialization = firstInitialization
+        ? initializationFinished.promise
+        : Promise.resolve();
+      firstInitialization = false;
+      initializationPromise = pendingInitialization;
+      await initializationPromise;
+    },
+  );
+  const resetMock = mock.method(SandboxManager, "reset", async () => {
+    const call = resetCalls++;
+    if (resetPromise) return resetPromise;
+    const pendingInitialization = initializationPromise;
+    resetPromise = (async () => {
+      await pendingInitialization?.catch(() => undefined);
+      activeRuntimeConfig = undefined;
+      initializationPromise = undefined;
+    })().finally(() => {
+      resetPromise = undefined;
+      resetCallsFinished[call]?.resolve(undefined);
+      if (call === 0) firstResetFinished.resolve(undefined);
+    });
+    return resetPromise;
+  });
+
+  try {
+    const firstConfig: SandboxConfig = {
+      ...DEFAULT_CONFIG,
+      filesystem: { ...DEFAULT_CONFIG.filesystem, allowWrite: [join(firstRoot, "first-only")] },
+    };
+    const secondConfig: SandboxConfig = {
+      ...DEFAULT_CONFIG,
+      filesystem: { ...DEFAULT_CONFIG.filesystem, allowWrite: [join(secondRoot, "second-only")] },
+    };
+    first = makePi();
+    extension(first.pi, { configLoader: () => firstConfig });
+    firstContext = makeContext(firstRoot, []);
+    firstStart = first.handlers.get("session_start")?.({}, firstContext);
+    await initializationStarted.promise;
+    assert.ok(activeRuntimeConfig?.filesystem?.allowWrite?.includes(join(firstRoot, "first-only")));
+
+    // Shutdown invalidates the start immediately but queues its reset behind
+    // that still-pending initialization. It must not wait for initialization.
+    const shutdownPromise = first.handlers.get("session_shutdown")?.({}, firstContext);
+    assert.ok(shutdownPromise);
+    assert.equal(
+      await Promise.race([
+        shutdownPromise.then(() => true),
+        new Promise<boolean>((resolve) => setImmediate(() => resolve(false))),
+      ]),
+      true,
+    );
+    firstShutdownQueued = true;
+    assert.equal(resetCalls, 0);
+
+    second = makePi();
+    extension(second.pi, { configLoader: () => secondConfig });
+    secondContext = makeContext(secondRoot, []);
+    replacementStart = second.handlers.get("session_start")?.({}, secondContext);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // With separate extension queues this invokes initialize concurrently and
+    // reuses the prior runtime's initializationPromise, silently ignoring the
+    // replacement config. A process-global transition queue keeps this at 1.
+    assert.equal(initializeCalls, 1);
+    assert.equal(resetCalls, 0);
+
+    initializationFinished.resolve(undefined);
+    await firstStart;
+    await firstResetFinished.promise;
+    await replacementStart;
+
+    assert.ok(
+      activeRuntimeConfig?.filesystem?.allowWrite?.includes(join(secondRoot, "second-only")),
+    );
+    assert.equal(resetCalls, 1);
+  } finally {
+    initializationFinished.resolve(undefined);
+    if (first && firstContext && !firstShutdownQueued) {
+      await first.handlers.get("session_shutdown")?.({}, firstContext);
+      firstShutdownQueued = true;
+    }
+    await Promise.allSettled([firstStart, replacementStart]);
+    if (firstShutdownQueued) await firstResetFinished.promise;
+    if (second && secondContext) {
+      await second.handlers.get("session_shutdown")?.({}, secondContext);
+      await resetCallsFinished[1].promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    initializeMock.mock.restore();
+    resetMock.mock.restore();
+    rmSync(firstRoot, { recursive: true, force: true });
+    rmSync(secondRoot, { recursive: true, force: true });
+  }
+});
+
 test("a stale session_start success cannot overwrite a replacement runtime", async () => {
   const firstRoot = makeProjectTempDirectory("stale-start-replacement-success-first");
   const secondRoot = makeProjectTempDirectory("stale-start-replacement-success-second");

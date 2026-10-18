@@ -135,6 +135,26 @@ function sandboxConfigMutationMessage(cwd: string): string {
   );
 }
 
+const sandboxManagerTransitionKey = Symbol.for("pi-sandbox.sandbox-manager-transition");
+const sandboxManagerTransitions = globalThis as unknown as Record<
+  symbol,
+  Promise<void> | undefined
+>;
+
+async function withSandboxManagerTransition<T>(operation: () => Promise<T>): Promise<T> {
+  const previous = sandboxManagerTransitions[sandboxManagerTransitionKey] ?? Promise.resolve();
+  let release!: () => void;
+  sandboxManagerTransitions[sandboxManagerTransitionKey] = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
 export interface SandboxExtensionOptions {
   /** Injectable platform seam for portable SSH preflight contracts. */
   platform?: NodeJS.Platform;
@@ -180,10 +200,8 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
   // runtime restored while the desired replacement remains unavailable.
   let sandboxRuntimeOwnerGeneration: number | null = null;
   let sandboxRuntimeCwd: string | null = null;
-  // SandboxManager owns process-global runtime state. Serialize every reset /
-  // initialize transaction so an obsolete completion cannot reset or overwrite
-  // a replacement lifecycle that started while the old operation was pending.
-  let sandboxManagerTransition: Promise<void> = Promise.resolve();
+  // SandboxManager owns process-global runtime state. Its transition queue is
+  // shared across extension instances so reload cannot bypass pending cleanup.
   const allowances: SessionAllowances = {
     domains: [],
     readPaths: [],
@@ -241,20 +259,6 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       sandboxLifecycle.state === "shutting-down" ||
       sandboxLifecycle.state === "shutdown"
     );
-  }
-
-  async function withSandboxManagerTransition<T>(operation: () => Promise<T>): Promise<T> {
-    const previous = sandboxManagerTransition;
-    let release!: () => void;
-    sandboxManagerTransition = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
-    }
   }
 
   async function refreshSandbox(
