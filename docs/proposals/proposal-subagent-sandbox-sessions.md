@@ -2,13 +2,13 @@
 
 - **Created:** 2026-10-15
 - **Updated:** 2026-10-19
-- **Status:** draft
+- **Status:** accepted
 
 ## Summary
 
 Protect the standard tool paths of configured `@tintinweb/pi-subagents` children. Require successful sandbox extension loading and binding before those children execute, and replace the sandbox extension's process-wide runtime dependency with independently owned runtime managers. Prefer generic upstream support for required extensions, trusted child initialisation, and extension completion metadata rather than maintaining a runner fork or local package patch.
 
-This is a cooperative integration for configured agents, not unconditional containment of every possible child session or arbitrary extension code. Source inspection supports the approach; concurrent execution and end-to-end protection have not yet been tested. This draft does not authorise implementation or changes to personal agent configuration.
+This is a cooperative integration for configured agents, not unconditional containment of every possible child session or arbitrary extension code. Source inspection supports the approach; concurrent execution and end-to-end protection have not yet been tested. Acceptance and the execution-unit breakdown do not authorise implementation or changes to personal agent configuration.
 
 ## Goals
 
@@ -130,6 +130,122 @@ Establish protection through behavioural tests, not merely successful extension 
 - Configuration omission and explicit sandbox-disable behaviour are demonstrated as boundary cases, not counted as protected execution. Children without a required-extension declaration remain outside the startup guarantee.
 
 Use focused lifecycle tests plus end-to-end tests against the installed runner, with real OS-level tests on supported platforms. Distinguish macOS verification from Linux verification; passing one does not establish the other.
+
+## Implementation units
+
+Each unchecked unit is a separate execution request, not permission to start it. Units 1–9 are repository-owned work that can proceed without runner changes. Units 10–17 depend on available, verified upstream capabilities; they do not authorise implementing those capabilities in an installed package, submitting the upstream request, or adopting a patch/fork. Unit 18 prepares rollout instructions only; applying personal configuration remains separately opt-in.
+
+For code units, use red/green focused tests, then `pnpm run ci:fmt`, `pnpm run lint`, `pnpm run check`, and `pnpm test`. Run individual existing test files with `pnpm exec tsx --test test/<file>.test.ts`; new integration fixtures belong under `test/`, not alongside proposals. Record OS, dependency versions, commands, skips, and results in normal integration documentation. Mocks establish lifecycle contracts, not OS protection.
+
+Assumptions still requiring evidence: the pinned runtime factory isolates relevant platform state and cleanup; upstream APIs can supply the specified startup, trusted-initialisation, resume/lifetime, and metadata contracts; and supported macOS/Linux hosts are available for verification. No exact upstream API, version upgrade, stable installation identity, or readiness signal is assumed. If these assumptions fail, record the blocker and seek approval rather than introducing compatibility scaffolding or weakening the agreed boundary.
+
+- [ ] **Unit 1: Establish the independent-runtime contract**
+  - **Deliverable:** a bounded audit of `createSandboxManager()` in pinned runtime 0.0.72 and its use by `src/extension.ts`, `src/sandbox-runtime.ts`, and `src/macos-write-specificity.ts`.
+  - **Dependencies:** accessible pinned dependency sources; no runner capability required.
+  - **Acceptance:** identify manager-owned versus process-global policy, proxies, monitoring, environment changes, adapter provenance, and cleanup; establish factory/config identity and partial-initialisation reset semantics. Record any blocker to safe concurrent owners before changing production ownership.
+  - **Verification:** source references and focused factory-contract tests using two managers with distinct configurations. Run `test/sandbox-runtime.test.ts`; record what remains OS-dependent. See Session-owned runtimes.
+
+- [ ] **Unit 2: Give sandbox lifecycles independent managers**
+  - **Deliverable:** owner-local lifecycle serialisation and manager routing in the extension and Bash/runtime helpers, replacing the singleton and process-global transition queue together.
+  - **Dependencies:** Unit 1 establishes a usable factory contract.
+  - **Acceptance:** initialisation, policy replacement, wrapping, proxy queries, diagnostics, reset, and command cleanup use the same owning manager. A failed or reset owner cannot reset a parent/sibling; existing disable/unsupported behaviour and fail-closed failure states remain. Active-command overlap is addressed by Units 3–4, not claimed complete here.
+  - **Verification:** owner-aware cases in `test/extension.test.ts` and `test/sandbox-runtime.test.ts` cover two instances, failed initialisation, partial cleanup, and replacement. Inspect production paths for remaining singleton operations; retain existing macOS profile-adapter regressions.
+
+- [ ] **Unit 3: Drain owned Bash attempts before policy refresh**
+  - **Deliverable:** per-owner command leases from wrapping through execution and cleanup, integrated with policy refresh.
+  - **Dependencies:** Unit 2.
+  - **Acceptance:** refresh blocks new attempts and drains only its owner's active attempts before replacement; failed replacement stays blocked. Permission prompting occurs after release, and retries reacquire the refreshed runtime without deadlock. Cleanup releases ownership on wrapping, spawn, execution, and cleanup failures.
+  - **Verification:** deterministic barriers in `test/extension.test.ts` and `test/sandbox-runtime.test.ts` prove refresh ordering, unaffected sibling progress, and permission-triggered retry. Do not use elapsed time alone as proof of draining.
+
+- [ ] **Unit 4: Cancel and await tracked commands on teardown**
+  - **Deliverable:** owner-local cancellation and awaited command cleanup before runtime destruction on shutdown, session replacement, or reload.
+  - **Dependencies:** Unit 3.
+  - **Acceptance:** prevent new attempts immediately; cancel tracked attempts, attempt process-group termination, await completion/cleanup, and only then reset. Handle cancellation while wrapping, before spawn, during execution, and during pending initialisation. Stale generations cannot regain readiness or release a replacement's resources. No guarantee of complete descendant termination is added.
+  - **Verification:** lifecycle overlap tests in `test/extension.test.ts`; abort, timeout, failed-spawn, cleanup, and descendant/output-drain cases in `test/sandbox-runtime.test.ts`. Assert reset ordering and absence of leaked tracked attempts, while preserving the documented surviving-descendant limitation.
+
+- [ ] **Unit 5: Preserve evidence sources in Bash diagnostics**
+  - **Deliverable:** explicit evidence-source classification for runtime-observed violations and output-inferred Bash diagnostics, with bounded per-run collection.
+  - **Dependencies:** Unit 2 for owner-local violation stores.
+  - **Acceptance:** `createDiagnosticOperations()` and diagnostic parsing retain source labels; command-controlled output never becomes a runtime-observed block. Existing visible diagnostics and ordinary tool results remain usable. Collection is request data only and never creates grants or retries; model suggestions are not extension-observed evidence.
+  - **Verification:** `test/diagnostics.test.ts` and `test/extension.test.ts` cover runtime events, forged diagnostic-looking output, malformed records, limits/truncation, and record reset. See Completion-time access requests.
+
+- [ ] **Unit 6: Record direct-tool and pre-execution denials**
+  - **Deliverable:** direct policy-denial records from covered tool handlers and Bash preflight paths, using Unit 5's collection and evidence labels.
+  - **Dependencies:** Unit 5.
+  - **Acceptance:** denied reads, writes, edits, literal-domain preflight, mandatory protections, and headless permission aborts retain specific target/access context when known. Unavailable-runtime errors do not invent path/domain denials. Records cannot authorise access, erase ordinary results, or persist grants.
+  - **Verification:** focused `test/extension.test.ts` cases exercise each denial path; `test/ui.test.ts` establishes prompt-free headless rejection. Verify output-inferred diagnostics stay distinguishable from direct policy denials.
+
+- [ ] **Unit 7: Define by-value grant snapshot semantics**
+  - **Deliverable:** validated, independently owned snapshots of approved allowance values, without runner transport yet.
+  - **Dependencies:** Unit 2; existing `SessionAllowances`, `cloneAllowances()`, `resolveAllowances()`, and policy helpers are the starting points, not a new parallel policy engine.
+  - **Acceptance:** snapshots copy approved domains, canonical path patterns, and supported socket allowances, never managers, disable state, bypass approvals, credentials, or transcript authority. Parent/sibling mutation is isolated; relative grants retain their approved target across different working directories. Existing specificity rules and mandatory protections remain unchanged. No untrusted public grant-injection interface is added.
+  - **Verification:** `test/policy.test.ts`, `test/sandbox-runtime.test.ts`, and focused snapshot tests cover mutation isolation, different working directories, more-specific allows, deny ties, mandatory protection, malformed input, and excluded authority. Trusted delivery remains unimplemented until Unit 11.
+
+- [ ] **Unit 8: Verify independent runtimes on macOS**
+  - **Deliverable:** real macOS multi-owner enforcement and resource-lifecycle evidence without the child runner.
+  - **Dependencies:** Units 3–4; supported macOS host and runtime facilities.
+  - **Acceptance:** overlapping owners retain distinct filesystem/domain policies and proxies; refresh, failure, and teardown of one do not disrupt another. Test tracked cancellation/cleanup and demonstrate surviving backgrounded/detached descendants as a limitation, cleaning up test descendants explicitly.
+  - **Verification:** extend appropriate cases in `test/sandbox-macos-filesystem.test.ts`, `test/sandbox-protection.test.ts`, and `test/sandbox-runtime.test.ts`; use local network fixtures for distinct allow/deny checks. Record real enforcement and resource-cleanup results separately from profile-generation tests.
+
+- [ ] **Unit 9: Verify independent runtimes on Linux**
+  - **Deliverable:** Linux counterpart to Unit 8, including platform-specific isolation and cleanup evidence.
+  - **Dependencies:** Units 3–4; supported Linux host with the required sandbox facilities. Unit 8 is not Linux evidence.
+  - **Acceptance:** distinct filesystem/domain policies, independent proxies, owner-local refresh/failure/teardown, and tracked cancellation behave under real overlap. Record Linux-specific unsupported features and descendant limitations without silently counting skips as passing protection.
+  - **Verification:** real Linux cases in `test/sandbox-protection.test.ts` and `test/sandbox-runtime.test.ts`, with local network fixtures and explicit descendant cleanup. Record host prerequisites, enforcement outcomes, and released resources.
+
+- [ ] **Unit 10: Establish the runner startup-gate handoff**
+  - **Deliverable:** a repository integration fixture and compatibility evidence for an available upstream required-extension contract; add only the sandbox lifecycle adaptation proven necessary by that contract.
+  - **Dependencies:** Units 2–4; upstream required-extension support with canonical loader identity, fatal startup errors, and partial-startup cleanup. Availability and any required installation/version change need separate approval; the current allowlist is insufficient.
+  - **Acceptance:** required sandbox loading/binding finishes before prompts/tools, and sandbox initialisation failures leave covered tools blocked. Callback-reported errors are handled, not just thrown exceptions. Decide whether readiness acknowledgement is necessary from evidence, not speculation; unavailable upstream support leaves this unit blocked.
+  - **Verification:** deterministic fixture sessions exercise missing, load-failing, bind-failing, and `session_start`-failing extensions; assert no first prompt/tool call and cleanup of partial resources. Record exact runner/Pi versions and contract references. See Required-extension startup gate and the linked upstream request.
+
+- [ ] **Unit 11: Deliver trusted snapshots before child initialisation**
+  - **Deliverable:** sandbox consumer integration with the available upstream trusted child-initialisation hook.
+  - **Dependencies:** Units 7 and 10; upstream supplies actual spawning-session association, pre-binding delivery, queued-spawn snapshots, and nested/root lifetime association.
+  - **Acceptance:** capture approved values at the spawn request, including queued requests; install them before sandbox initialisation. Nested spawns derive from their immediate parent, not model-claimed identifiers. Missing required participants, malformed payloads, hook errors, or cancellation fail closed without falling back to an uninitialised child.
+  - **Verification:** deterministic parent/child fixture tests cover concurrent and queued starts, late parent approvals, nested copies, mutation isolation, and attempts to inject authority through model arguments or persisted history. No personal agent configuration changes.
+
+- [ ] **Unit 12: Invalidate inherited state across shutdown and resume**
+  - **Deliverable:** consumer lifetime handling for root shutdown/replacement and both persisted and in-memory child resume.
+  - **Dependencies:** Units 4 and 11; upstream must expose trustworthy lifetime invalidation and pre-execution resume refresh, including cooperation beyond its bounded shutdown wait.
+  - **Acceptance:** stale queued/nested starts cannot execute; further covered tool execution cannot use expired inherited state. Resume replaces stale grants with a fresh current-spawner snapshot before execution. Tracked commands remain owned through cancellation/cleanup after runner timeout; surviving descendants remain the explicit exception, not a claimed termination guarantee.
+  - **Verification:** fixture tests use barriers around queue admission, initialisation, resume, root replacement, and delayed cleanup exceeding the runner timeout. Check fresh grants, stale-start rejection, reset ordering, and unaffected siblings; do not accept `dispose()` calls alone as evidence.
+
+- [ ] **Unit 13: Export completion records through upstream metadata**
+  - **Deliverable:** sandbox consumer adapter for the available generic extension completion-metadata channel.
+  - **Dependencies:** Units 5–6 and 10; upstream provides producer-associated metadata, collection before disposal, and foreground/background/retrieval transport with limits and per-run reset.
+  - **Acceptance:** normal results and model structured output remain intact; evidence-source labels and producer association survive each path. Bounded/truncated, malformed, cancellation, and partial-failure records cannot grant access or erase results. Resume cannot expose stale records; agent suggestions remain suggestions even if collected.
+  - **Verification:** deterministic fixture tests for foreground completion, background events/result retrieval, nested ownership scoping, cancellation, malformed payloads, limits, and resume reset. No model-authored JSON is accepted as proof of extension provenance.
+
+- [ ] **Unit 14: Verify startup failures through real runner entry points**
+  - **Deliverable:** behavioural startup-gate acceptance against the actual supported runner, beyond local mocks.
+  - **Dependencies:** Unit 10; approved access to a supported runner installation or isolated verification environment.
+  - **Acceptance:** missing paths/packages, loader/binding/startup failures, conflicting `isolated: true`, and allowlist conflicts fail before prompts or tools with actionable errors and partial-resource cleanup. Exercise foreground, background, RPC, and nested entry points exposed by that runner; optional-extension behaviour remains compatible.
+  - **Verification:** fixture extensions and deterministic prompt/tool sentinels through actual runner APIs; collect error and cleanup evidence for every entry point. Configuration omission and explicit disable are documented boundary cases, not passing protected execution.
+
+- [ ] **Unit 15: Verify actual child tool dispatch and headless policy**
+  - **Deliverable:** end-to-end standard-tool enforcement and tool-scope evidence in actual configured test children.
+  - **Dependencies:** Units 8–10 and 14 for protected claims on both platforms; each platform's acceptance may be recorded independently while the other remains blocked.
+  - **Acceptance:** allowed operations succeed and denied read/write/edit/Bash filesystem/network operations fail. The selected Bash implementation is sandboxed after tool scoping; direct handlers remain bound, and extension-contributed tools do not widen the intended agent scope. Permission requests reject promptly without UI, grants, or persistence.
+  - **Verification:** runner-driven fixture commands/tool calls on macOS and Linux with distinct parent/child policies and explicit dispatch checks. Exercise sandbox initialisation/refresh failure and confirm parent/sibling continuity. Search, MCP, web, and arbitrary extension code remain outside the protection claim.
+
+- [ ] **Unit 16: Verify trusted child lifetime and grant isolation end to end**
+  - **Deliverable:** actual-runner acceptance for spawn snapshots, nested/queued launches, resume, and originating-session lifetime.
+  - **Dependencies:** Units 11–12 and 15.
+  - **Acceptance:** approved grants arrive before initialisation by value; later approvals affect only later spawn requests. Nested snapshots preserve isolation; model/history data cannot create authority. Root replacement blocks stale launches and invalidates state; persisted and in-memory resume use current authority. Tracked cancellation/cleanup survives the runner timeout without disrupting other owners.
+  - **Verification:** barrier-controlled runner scenarios for each transition, including a queued spawn before approval and a delayed teardown. Repeat relevant OS-sensitive cases on both platforms and explicitly demonstrate the surviving-descendant limitation with fixture cleanup.
+
+- [ ] **Unit 17: Verify report → approve → retry end to end**
+  - **Deliverable:** actual-runner evidence for provenance-labelled completion reports and the existing manual approval workflow.
+  - **Dependencies:** Units 13, 15, and 16; interactive parent UI available for the manual `/sandbox-allow` check.
+  - **Acceptance:** direct and runtime-observed blocks, forged output inferences, and agent suggestions remain distinct through foreground/background/retrieval paths. Normal results survive. A user-approved session allowance followed by a fresh spawn enables only the approved operation; existing children remain unchanged. Reports alone never approve, persist, or retry work.
+  - **Verification:** deterministic report fixtures plus a recorded manual `/sandbox-allow` session-approval check; inspect grant/config state before reporting, after reporting, after approval, and after retry. Include malformed requests and cancelled/partial results.
+
+- [ ] **Unit 18: Prepare the opt-in rollout handoff**
+  - **Deliverable:** installation/configuration instructions and an evidence checklist for Explore, implementer, plan-executor, and subsequently enabled nested agents.
+  - **Dependencies:** Units 8–9 and 14–17 verified; stable installed sandbox identity and actual runner configuration syntax established.
+  - **Acceptance:** document explicit `isolated: false`, sandbox-only extension allowlisting, required-extension enforcement, preserved agent settings/tool scopes, manual approval/retry, and rollback to the prior configuration. State uncovered custom-tool and surviving-descendant limitations. No personal configuration is edited; applying rollout requires separate user approval.
+  - **Verification:** validate example configuration with the verified loader/config parser and repeat startup/tool-scope checks in isolated fixtures. Cross-check instructions against recorded versions and macOS/Linux evidence; leave rollout blocked if any prerequisite is unverified.
 
 ## Non-goals
 
