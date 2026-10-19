@@ -14,12 +14,16 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test, { mock } from "node:test";
 
-import { SandboxManager } from "@carderne/sandbox-runtime";
+import {
+  createSandboxManager,
+  SandboxManager,
+  type SandboxRuntimeConfig,
+} from "@carderne/sandbox-runtime";
 import assert from "node:assert/strict";
 
 import { DEFAULT_CONFIG, type SandboxConfig } from "../src/config.ts";
 import { renderDiagnosticBlockData, type SandboxDiagnosticBlockData } from "../src/diagnostics.ts";
-import extension from "../src/extension.ts";
+import registerExtension, { type SandboxExtensionOptions } from "../src/extension.ts";
 import { getVolumeCaseSensitivity } from "../src/path-security.ts";
 import { extractDomainsFromCommand } from "../src/policy.ts";
 import {
@@ -73,6 +77,13 @@ function makePi(options: { noSandbox?: boolean } = {}) {
     events: { emit: () => undefined },
   } as unknown as ExtensionAPI;
   return { pi, commands, handlers, tools, shortcuts, sentMessages };
+}
+
+function extension(pi: ExtensionAPI, options: SandboxExtensionOptions = {}): void {
+  registerExtension(pi, {
+    ...options,
+    managerFactory: options.managerFactory ?? (() => SandboxManager),
+  });
 }
 
 function makeProjectTempDirectory(prefix: string): string {
@@ -327,6 +338,88 @@ test("extension reports unsupported status without initializing", async () => {
   }
 });
 
+test("extension manager owners isolate failed initialisation, replacement, and shutdown", async () => {
+  const failedRoot = makeProjectTempDirectory("owner-failed-init");
+  const siblingRoot = makeProjectTempDirectory("owner-sibling-init");
+  const replacementRoot = makeProjectTempDirectory("owner-sibling-replacement");
+  const managerEvents: string[][] = [];
+  const managerConfigs: Array<SandboxRuntimeConfig | undefined> = [];
+  const firstInitializationStarted = deferred<void>();
+  const finishFirstInitialization = deferred<void>();
+  const managers = [createSandboxManager(), createSandboxManager()];
+  let factoryCalls = 0;
+  for (const [index, manager] of managers.entries()) {
+    const events: string[] = [];
+    managerEvents.push(events);
+    mock.method(manager, "initialize", async (config: SandboxRuntimeConfig) => {
+      managerConfigs[index] = config;
+      events.push("initialize");
+      if (index === 0) {
+        firstInitializationStarted.resolve(undefined);
+        await finishFirstInitialization.promise;
+        throw new Error("partial initialisation failure");
+      }
+    });
+    mock.method(manager, "reset", async () => {
+      events.push("reset");
+    });
+  }
+  const singletonInitialize = mock.method(SandboxManager, "initialize", async () => {
+    throw new Error("extension used the process-wide manager");
+  });
+  const singletonReset = mock.method(SandboxManager, "reset", async () => undefined);
+  const failedNotices: string[] = [];
+  const siblingNotices: string[] = [];
+  const failedContext = makeContext(failedRoot, failedNotices);
+  const siblingContext = makeContext(siblingRoot, siblingNotices);
+  const replacementContext = makeContext(replacementRoot, []);
+
+  try {
+    const failedExtension = makePi();
+    const siblingExtension = makePi();
+    const managerFactory = () => managers[factoryCalls++]!;
+    extension(failedExtension.pi, { managerFactory });
+    extension(siblingExtension.pi, { managerFactory });
+
+    const failedStart = failedExtension.handlers.get("session_start")?.({}, failedContext);
+    await firstInitializationStarted.promise;
+    await siblingExtension.handlers.get("session_start")?.({}, siblingContext);
+    assert.equal(factoryCalls, 2);
+    assert.deepEqual(managerEvents[0], ["initialize"]);
+    assert.deepEqual(managerEvents[1], ["initialize"]);
+    assert.notStrictEqual(managerConfigs[0], managerConfigs[1]);
+    assert.notDeepEqual(
+      managerConfigs[0]?.filesystem?.denyWrite,
+      managerConfigs[1]?.filesystem?.denyWrite,
+    );
+
+    finishFirstInitialization.resolve(undefined);
+    await failedStart;
+    assert.deepEqual(managerEvents[0], ["initialize", "reset"]);
+    assert.match(failedNotices.join("\n"), /partial initialisation failure/);
+    assert.deepEqual(siblingNotices, []);
+
+    await siblingExtension.handlers.get("session_start")?.({}, replacementContext);
+    assert.deepEqual(managerEvents[1], ["initialize", "reset", "initialize"]);
+    assert.deepEqual(managerEvents[0], ["initialize", "reset"]);
+
+    await failedExtension.handlers.get("session_shutdown")?.({}, failedContext);
+    assert.deepEqual(managerEvents[0], ["initialize", "reset", "reset"]);
+    assert.deepEqual(managerEvents[1], ["initialize", "reset", "initialize"]);
+
+    await siblingExtension.handlers.get("session_shutdown")?.({}, replacementContext);
+    assert.deepEqual(managerEvents[1], ["initialize", "reset", "initialize", "reset"]);
+    assert.equal(singletonInitialize.mock.callCount(), 0);
+    assert.equal(singletonReset.mock.callCount(), 0);
+  } finally {
+    finishFirstInitialization.resolve(undefined);
+    mock.restoreAll();
+    rmSync(failedRoot, { recursive: true, force: true });
+    rmSync(siblingRoot, { recursive: true, force: true });
+    rmSync(replacementRoot, { recursive: true, force: true });
+  }
+});
+
 test("extension reports an initialization error after pending status", async () => {
   const root = makeProjectTempDirectory("extension-status-error");
   const statusUpdates: StatusUpdate[] = [];
@@ -477,7 +570,7 @@ test("shutdown invalidates a stale session_start failure without changing status
     assert.deepEqual(statusUpdates, statusAfterShutdown);
     assert.deepEqual(notices, noticesAfterShutdown);
     assert.equal(sentMessages.length, 0);
-    assert.equal(resetCalls.length, 1);
+    assert.equal(resetCalls.length, 2);
   } finally {
     managerMock.mock.restore();
     resetMock.mock.restore();
@@ -539,135 +632,6 @@ test("shutdown does not clear a replacement runtime after deferred reset", async
     assert.equal(resetCalls, 3);
   } finally {
     managerMock.mock.restore();
-    resetMock.mock.restore();
-    rmSync(firstRoot, { recursive: true, force: true });
-    rmSync(secondRoot, { recursive: true, force: true });
-  }
-});
-
-test("reloaded initialization waits behind prior in-flight init and shutdown reset", async () => {
-  const firstRoot = makeProjectTempDirectory("reload-runtime-handoff-first");
-  const secondRoot = makeProjectTempDirectory("reload-runtime-handoff-second");
-  const initializationStarted = deferred<void>();
-  const initializationFinished = deferred<void>();
-  const firstResetFinished = deferred<void>();
-  const resetCallsFinished = [deferred<void>(), deferred<void>()];
-  let activeRuntimeConfig: Parameters<typeof SandboxManager.initialize>[0] | undefined;
-  let initializationPromise: Promise<void> | undefined;
-  let resetPromise: Promise<void> | undefined;
-  let firstInitialization = true;
-  let initializeCalls = 0;
-  let resetCalls = 0;
-  let firstStart: Promise<unknown> | undefined;
-  let replacementStart: Promise<unknown> | undefined;
-  let firstShutdownQueued = false;
-  let first: ReturnType<typeof makePi> | undefined;
-  let second: ReturnType<typeof makePi> | undefined;
-  let firstContext: ExtensionContext | undefined;
-  let secondContext: ExtensionContext | undefined;
-  const initializeMock = mock.method(
-    SandboxManager,
-    "initialize",
-    async (runtimeConfig: Parameters<typeof SandboxManager.initialize>[0]) => {
-      initializeCalls += 1;
-      // Match SandboxManager.initialize: it waits for resetPromise first, then
-      // shares an in-flight initializationPromise without applying new config.
-      if (resetPromise) await resetPromise;
-      if (initializationPromise) {
-        await initializationPromise;
-        return;
-      }
-      activeRuntimeConfig = runtimeConfig;
-      initializationStarted.resolve(undefined);
-      const pendingInitialization = firstInitialization
-        ? initializationFinished.promise
-        : Promise.resolve();
-      firstInitialization = false;
-      initializationPromise = pendingInitialization;
-      await initializationPromise;
-    },
-  );
-  const resetMock = mock.method(SandboxManager, "reset", async () => {
-    const call = resetCalls++;
-    if (resetPromise) return resetPromise;
-    const pendingInitialization = initializationPromise;
-    resetPromise = (async () => {
-      await pendingInitialization?.catch(() => undefined);
-      activeRuntimeConfig = undefined;
-      initializationPromise = undefined;
-    })().finally(() => {
-      resetPromise = undefined;
-      resetCallsFinished[call]?.resolve(undefined);
-      if (call === 0) firstResetFinished.resolve(undefined);
-    });
-    return resetPromise;
-  });
-
-  try {
-    const firstConfig: SandboxConfig = {
-      ...DEFAULT_CONFIG,
-      filesystem: { ...DEFAULT_CONFIG.filesystem, allowWrite: [join(firstRoot, "first-only")] },
-    };
-    const secondConfig: SandboxConfig = {
-      ...DEFAULT_CONFIG,
-      filesystem: { ...DEFAULT_CONFIG.filesystem, allowWrite: [join(secondRoot, "second-only")] },
-    };
-    first = makePi();
-    extension(first.pi, { configLoader: () => firstConfig });
-    firstContext = makeContext(firstRoot, []);
-    firstStart = first.handlers.get("session_start")?.({}, firstContext);
-    await initializationStarted.promise;
-    assert.ok(activeRuntimeConfig?.filesystem?.allowWrite?.includes(join(firstRoot, "first-only")));
-
-    // Shutdown invalidates the start immediately but queues its reset behind
-    // that still-pending initialization. It must not wait for initialization.
-    const shutdownPromise = first.handlers.get("session_shutdown")?.({}, firstContext);
-    assert.ok(shutdownPromise);
-    assert.equal(
-      await Promise.race([
-        shutdownPromise.then(() => true),
-        new Promise<boolean>((resolve) => setImmediate(() => resolve(false))),
-      ]),
-      true,
-    );
-    firstShutdownQueued = true;
-    assert.equal(resetCalls, 0);
-
-    second = makePi();
-    extension(second.pi, { configLoader: () => secondConfig });
-    secondContext = makeContext(secondRoot, []);
-    replacementStart = second.handlers.get("session_start")?.({}, secondContext);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-
-    // With separate extension queues this invokes initialize concurrently and
-    // reuses the prior runtime's initializationPromise, silently ignoring the
-    // replacement config. A process-global transition queue keeps this at 1.
-    assert.equal(initializeCalls, 1);
-    assert.equal(resetCalls, 0);
-
-    initializationFinished.resolve(undefined);
-    await firstStart;
-    await firstResetFinished.promise;
-    await replacementStart;
-
-    assert.ok(
-      activeRuntimeConfig?.filesystem?.allowWrite?.includes(join(secondRoot, "second-only")),
-    );
-    assert.equal(resetCalls, 1);
-  } finally {
-    initializationFinished.resolve(undefined);
-    if (first && firstContext && !firstShutdownQueued) {
-      await first.handlers.get("session_shutdown")?.({}, firstContext);
-      firstShutdownQueued = true;
-    }
-    await Promise.allSettled([firstStart, replacementStart]);
-    if (firstShutdownQueued) await firstResetFinished.promise;
-    if (second && secondContext) {
-      await second.handlers.get("session_shutdown")?.({}, secondContext);
-      await resetCallsFinished[1].promise;
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-    initializeMock.mock.restore();
     resetMock.mock.restore();
     rmSync(firstRoot, { recursive: true, force: true });
     rmSync(secondRoot, { recursive: true, force: true });
@@ -816,7 +780,7 @@ test("a stale session_start failure cannot overwrite a replacement runtime", asy
     assert.deepEqual(statusUpdates, statusAfterReplacement);
     assert.deepEqual(notices, noticesAfterReplacement);
     assert.deepEqual(sentMessages, messagesAfterReplacement);
-    assert.equal(resetCalls.length, 1);
+    assert.equal(resetCalls.length, 2);
   } finally {
     managerMock.mock.restore();
     resetMock.mock.restore();
@@ -1047,7 +1011,7 @@ test("/sandbox-allow reports when a failed refresh rolls back a session grant", 
     await commands.get("sandbox-allow")?.("read /tmp/rolled-back", ctx);
 
     assert.equal(initializeCount, 3);
-    assert.equal(resetMock.mock.callCount(), 1);
+    assert.equal(resetMock.mock.callCount(), 3);
     assert.match(notices.at(-1) ?? "", /Session permission was rolled back/i);
     assert.doesNotMatch(notices.at(-1) ?? "", /permission was persisted/i);
     assert.equal(existsSync(join(root, ".pi", "sandbox.json")), false);
@@ -1170,7 +1134,7 @@ test("equivalent prior runtime restoration remains executable", async () => {
     // approval writer still exercises the replacement lifecycle.
     await commands.get("sandbox-allow")?.(`read ${join(root, "equivalent")}`, ctx);
     assert.equal(initializeCount, 3);
-    assert.equal(resetMock.mock.callCount(), 1);
+    assert.equal(resetMock.mock.callCount(), 3);
 
     const bash = tools.get("bash");
     assert.ok(bash);
@@ -1184,6 +1148,84 @@ test("equivalent prior runtime restoration remains executable", async () => {
     assert.equal(wrapMock.mock.callCount(), 1);
     assert.match((result.content[0] as { text: string }).text, /restored/);
   } finally {
+    wrapMock.mock.restore();
+    initializeMock.mock.restore();
+    resetMock.mock.restore();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("failed initialization cleanup requires a successful reset before restoration", async () => {
+  const root = makeProjectTempDirectory("failed-cleanup-restoration");
+  const notices: string[] = [];
+  const errors: string[] = [];
+  let initializeCount = 0;
+  let resetCount = 0;
+  const initializeMock = mock.method(SandboxManager, "initialize", async () => {
+    initializeCount += 1;
+    if (initializeCount === 2) throw new Error("original replacement failure");
+  });
+  const resetMock = mock.method(SandboxManager, "reset", async () => {
+    resetCount += 1;
+    if (resetCount === 2) throw new Error("partial initialization cleanup failure");
+    if (resetCount === 3) throw new Error("restoration reset boundary failure");
+  });
+  const wrapMock = mock.method(SandboxManager, "wrapWithSandbox", async () => "printf recovered");
+  const errorMock = mock.method(console, "error", (...messages: any[]) => {
+    errors.push(messages.join(" "));
+  });
+
+  try {
+    const { pi, commands, handlers, tools } = makePi();
+    extension(pi, { configLoader: () => makePromptTestConfig() });
+    const ctx = makeContext(root, notices);
+    (ctx.ui as any).custom = <T>(factory: any): Promise<T> =>
+      new Promise<T>((resolve) => {
+        const component = factory(
+          { requestRender: () => undefined },
+          { fg: (_colour: string, text: string) => text },
+          {},
+          resolve,
+        );
+        component.handleInput("P");
+        component.handleInput("\r");
+      });
+    await handlers.get("session_start")?.({}, ctx);
+    await commands.get("sandbox-allow")?.(`read ${join(root, "equivalent")}`, ctx);
+
+    // The failed initialize's cleanup reset and the explicit restoration
+    // boundary both fail, so the equivalent prior policy is not reinitialized.
+    assert.equal(initializeCount, 2);
+    assert.equal(resetCount, 3);
+    assert.ok(errors.some((message) => message.includes("original replacement failure")));
+    const bash = tools.get("bash");
+    assert.ok(bash);
+    await assert.rejects(
+      bash.execute(
+        "blocked-after-cleanup-failure",
+        { command: "printf local" },
+        undefined,
+        undefined,
+        ctx,
+      ),
+      /command execution remains blocked/,
+    );
+    assert.equal(wrapMock.mock.callCount(), 0);
+
+    await commands.get("sandbox-enable")?.("", ctx);
+    assert.equal(initializeCount, 3);
+    assert.equal(resetCount, 4);
+    const ready = await bash.execute(
+      "recovered-after-cleanup-failure",
+      { command: "printf local" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(wrapMock.mock.callCount(), 1);
+    assert.match((ready.content[0] as { text: string }).text, /recovered/);
+  } finally {
+    errorMock.mock.restore();
     wrapMock.mock.restore();
     initializeMock.mock.restore();
     resetMock.mock.restore();
@@ -1222,7 +1264,7 @@ test("policy-different restoration stays unavailable until explicit recovery", a
     await commands.get("sandbox-allow")?.(`read ${join(root, "new-policy")}`, ctx);
 
     assert.equal(initializeCount, 3); // desired failure, then prior restoration
-    assert.equal(resetMock.mock.callCount(), 1);
+    assert.equal(resetMock.mock.callCount(), 3);
     assert.equal(
       statusUpdates.some(({ value }) => value === "ꗃ"),
       true,
@@ -1244,7 +1286,7 @@ test("policy-different restoration stays unavailable until explicit recovery", a
 
     await commands.get("sandbox-enable")?.("", ctx);
     assert.equal(initializeCount, 4);
-    assert.equal(resetMock.mock.callCount(), 2);
+    assert.equal(resetMock.mock.callCount(), 4);
     assert.match(notices.at(-1) ?? "", /Sandbox enabled/);
     const ready = await bash.execute(
       "recovered-unavailable",
@@ -1300,7 +1342,7 @@ test("stale recovery completion cannot replace a newer session lifecycle", async
     await replacement;
 
     assert.equal(initializeCount, 3);
-    assert.equal(resetMock.mock.callCount(), 2);
+    assert.equal(resetMock.mock.callCount(), 3);
     assert.deepEqual(statusUpdates.at(-1), { key: "sandbox", value: "🔒" });
     const bash = tools.get("bash");
     assert.ok(bash);
@@ -3042,7 +3084,7 @@ test("macOS Git SSH preflight rolls back a failed grant before retrying", async 
     assert.equal(second?.operations, undefined);
     assert.equal(promptCount, 1);
     assert.equal(initializeCount, 3);
-    assert.equal(resetMock.mock.callCount(), 1);
+    assert.equal(resetMock.mock.callCount(), 3);
   } finally {
     wrapMock.mock.restore();
     managerMock.mock.restore();
@@ -3509,7 +3551,7 @@ test("write approval does not retry after sandbox reinitialization fails", async
     assert.equal(promptCount, 1);
     assert.equal(wrapCount, 1);
     assert.equal(initializeCount, 3);
-    assert.equal(resetMock.mock.callCount(), 1);
+    assert.equal(resetMock.mock.callCount(), 4);
     assert.match(output, /blocked or failed/);
     assert.doesNotMatch(output, /retried successfully/);
     assert.match(sentMessages.at(-1)?.content ?? "", /retried: no/);
@@ -3524,7 +3566,7 @@ test("write approval does not retry after sandbox reinitialization fails", async
     assert.equal(secondResponse?.operations, undefined);
     assert.equal(promptCount, 1);
     assert.equal(wrapCount, 1);
-    assert.equal(resetMock.mock.callCount(), 1);
+    assert.equal(resetMock.mock.callCount(), 4);
     assert.equal(existsSync(join(root, ".pi", "sandbox.json")), false);
   } finally {
     wrapMock.mock.restore();

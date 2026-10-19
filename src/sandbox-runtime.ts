@@ -4,8 +4,8 @@ import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  SandboxManager,
   type CredentialsConfig,
+  type ISandboxManager,
   type SandboxAskCallback,
   type SandboxRuntimeConfig,
 } from "@carderne/sandbox-runtime";
@@ -252,25 +252,38 @@ export function buildRuntimeConfig(
 }
 
 export async function initializeSandbox(
+  manager: ISandboxManager,
   config: SandboxConfig,
   allowances?: SessionAllowances,
   cwd = process.cwd(),
 ): Promise<void> {
   const runtimeConfig = buildRuntimeConfig(config, allowances, process.platform, cwd);
   const effective = resolveAllowances(config, allowances, cwd);
-  await SandboxManager.initialize(
-    runtimeConfig,
-    createNetworkAskCallback(effective.domains, config.network?.deniedDomains ?? []),
-  );
+  try {
+    await manager.initialize(
+      runtimeConfig,
+      createNetworkAskCallback(effective.domains, config.network?.deniedDomains ?? []),
+    );
+  } catch (error) {
+    try {
+      await manager.reset();
+    } catch (cleanupError) {
+      console.error(
+        `Warning: Failed to clean up sandbox after initialization error: ${cleanupError}`,
+      );
+    }
+    throw error;
+  }
 }
 
 export async function reinitializeSandbox(
+  manager: ISandboxManager,
   config: SandboxConfig,
   allowances: SessionAllowances,
   cwd = process.cwd(),
 ): Promise<void> {
-  await SandboxManager.reset();
-  await initializeSandbox(config, allowances, cwd);
+  await manager.reset();
+  await initializeSandbox(manager, config, allowances, cwd);
 }
 
 export function supportsNodeEnvProxy(version: string): boolean {
@@ -483,7 +496,10 @@ function gitSshEnvironmentPrefix(
   return "export GIT_SSH_COMMAND=/usr/bin/false; ";
 }
 
-export function createSandboxedBashOps(shellPath?: string): BashOperations {
+export function createSandboxedBashOps(
+  manager: ISandboxManager,
+  shellPath?: string,
+): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout, env }) {
       if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
@@ -491,7 +507,7 @@ export function createSandboxedBashOps(shellPath?: string): BashOperations {
       const { shell, args } = getShellConfig(shellPath);
       const socksProxyPort =
         process.platform === "darwin" && usesGitSshTransport(command)
-          ? SandboxManager.getSocksProxyPort()
+          ? manager.getSocksProxyPort()
           : undefined;
       const home = env === undefined ? process.env.HOME : env.HOME;
       const commandToWrap = `${gitSshEnvironmentPrefix(command, process.platform, socksProxyPort, home)}${command}`;
@@ -513,8 +529,8 @@ export function createSandboxedBashOps(shellPath?: string): BashOperations {
       };
 
       try {
-        const runtimeConfig = SandboxManager.getConfig();
-        const generatedCommand = await SandboxManager.wrapWithSandbox(commandToWrap, shell);
+        const runtimeConfig = manager.getConfig();
+        const generatedCommand = await manager.wrapWithSandbox(commandToWrap, shell);
         // Track wrapper-owned resources before profile validation can reject the
         // generated command, so cleanup still runs on a fail-closed adapter error.
         cleanupRequired = generatedCommand !== commandToWrap;
@@ -567,7 +583,7 @@ export function createSandboxedBashOps(shellPath?: string): BashOperations {
         if (child) signal?.removeEventListener("abort", killProcessGroup);
         if (cleanupRequired) {
           try {
-            SandboxManager.cleanupAfterCommand();
+            manager.cleanupAfterCommand();
           } catch (cleanupError) {
             // Never replace the command's original failure with cleanup noise.
             if (!executionFailed) {

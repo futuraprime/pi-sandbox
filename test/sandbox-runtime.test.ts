@@ -5,7 +5,11 @@ import { dirname, join } from "node:path";
 import test, { mock, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { SandboxManager, type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
+import {
+  createSandboxManager,
+  SandboxManager,
+  type SandboxRuntimeConfig,
+} from "@carderne/sandbox-runtime";
 import { wrapCommandWithSandboxMacOS } from "@carderne/sandbox-runtime/dist/sandbox/macos-sandbox-utils.js";
 import {
   getDefaultWritePaths,
@@ -36,6 +40,17 @@ import {
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+  return { promise, resolve };
 }
 
 function generatedMacosWrapper(
@@ -199,7 +214,7 @@ function createExecTestContext(
 
   return {
     cwd,
-    exec: createSandboxedBashOps().exec,
+    exec: createSandboxedBashOps(SandboxManager).exec,
     cleanupCount: () => cleanupCount,
     trackBackgroundProcess: (pidPath: string) => backgroundPidPaths.push(pidPath),
   };
@@ -924,7 +939,7 @@ test(
 
     const command = "printf production-adapter-test";
     const commandToWrap = `unset GIT_SSH_COMMAND; ${command}`;
-    const result = await createSandboxedBashOps(shellPath).exec(command, cwd, {
+    const result = await createSandboxedBashOps(SandboxManager, shellPath).exec(command, cwd, {
       onData: () => {},
       env: { ...process.env, PI_SANDBOX_WRAPPED_CAPTURE: capturePath },
     });
@@ -1003,7 +1018,7 @@ test(
     const cleanup = mock.method(SandboxManager, "cleanupAfterCommand", () => {});
 
     await assert.rejects(
-      createSandboxedBashOps(shellPath).exec("printf must-not-run", cwd, {
+      createSandboxedBashOps(SandboxManager, shellPath).exec("printf must-not-run", cwd, {
         onData: () => {},
         env: { ...process.env },
       }),
@@ -1068,6 +1083,78 @@ test("buildRuntimeConfig preserves allowPty at the runtime seam", () => {
   }
 });
 
+test("initializeSandbox awaits partial cleanup on the owning manager", async (t) => {
+  const owner = createSandboxManager();
+  const sibling = createSandboxManager();
+  const cleanupStarted = deferred<void>();
+  const finishCleanup = deferred<void>();
+  const cleanupCalls: string[] = [];
+  mock.method(owner, "initialize", async () => {
+    throw new Error("partial initialization");
+  });
+  mock.method(owner, "reset", async () => {
+    cleanupCalls.push("owner");
+    cleanupStarted.resolve(undefined);
+    await finishCleanup.promise;
+    throw new Error("partial cleanup failure");
+  });
+  mock.method(sibling, "initialize", async () => {});
+  mock.method(sibling, "reset", async () => {
+    cleanupCalls.push("sibling");
+  });
+  t.after(() => mock.restoreAll());
+
+  const failedInitialization = initializeSandbox(owner, DEFAULT_CONFIG);
+  await cleanupStarted.promise;
+  await initializeSandbox(sibling, DEFAULT_CONFIG);
+  assert.deepEqual(cleanupCalls, ["owner"]);
+
+  finishCleanup.resolve(undefined);
+  await assert.rejects(failedInitialization, /partial initialization/);
+  assert.deepEqual(cleanupCalls, ["owner"]);
+});
+
+test("Bash runtime queries, wrapping, and cleanup stay with their owner", async (t) => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-runtime-owners-"));
+  const owners = [createSandboxManager(), createSandboxManager()];
+  const wrappedCommands: string[][] = [[], []];
+  const cleanups = [0, 0];
+  t.after(() => {
+    mock.restoreAll();
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  owners.forEach((owner, index) => {
+    mock.method(owner, "getConfig", () => undefined);
+    mock.method(owner, "getSocksProxyPort", () => (index === 0 ? 32101 : 32102));
+    mock.method(owner, "wrapWithSandbox", async (command: string) => {
+      wrappedCommands[index]!.push(command);
+      return `printf owner-${index + 1}`;
+    });
+    mock.method(owner, "cleanupAfterCommand", () => {
+      cleanups[index] += 1;
+    });
+  });
+
+  const outputs: string[] = [];
+  for (const [index, owner] of owners.entries()) {
+    await createSandboxedBashOps(owner).exec("git push git@example.com:org/repo", cwd, {
+      onData: (data) => outputs.push(data.toString()),
+      env: { ...process.env },
+    });
+    assert.equal(cleanups[index], 1);
+    if (process.platform === "darwin") {
+      assert.match(wrappedCommands[index]![0]!, new RegExp(`localhost:${32101 + index}`));
+    }
+  }
+
+  assert.deepEqual(outputs.join(""), "owner-1owner-2");
+  assert.equal(wrappedCommands[0]!.length, 1);
+  assert.equal(wrappedCommands[1]!.length, 1);
+  assert.equal(cleanups[0], 1);
+  assert.equal(cleanups[1], 1);
+});
+
 test("initializeSandbox passes allowPty unchanged to SandboxManager", async (t) => {
   const observed: Array<boolean | undefined> = [];
   mock.method(SandboxManager, "initialize", async (runtime: SandboxRuntimeConfig) => {
@@ -1076,7 +1163,7 @@ test("initializeSandbox passes allowPty unchanged to SandboxManager", async (t) 
   t.after(() => mock.restoreAll());
 
   for (const allowPty of [true, false, undefined]) {
-    await initializeSandbox({ ...DEFAULT_CONFIG, allowPty });
+    await initializeSandbox(SandboxManager, { ...DEFAULT_CONFIG, allowPty });
   }
 
   assert.deepEqual(observed, [true, false, undefined]);
@@ -1366,7 +1453,7 @@ test(
     t.after(() => rmSync(fixtureDir, { recursive: true, force: true }));
     const shellPath = join(fixtureDir, "non-executable-shell");
     writeFileSync(shellPath, "#!/bin/sh\n", { mode: 0o600 });
-    const exec = createSandboxedBashOps(shellPath).exec;
+    const exec = createSandboxedBashOps(SandboxManager, shellPath).exec;
 
     await assert.rejects(exec("true", cwd, { onData: () => {} }), (error) => {
       assert.equal((error as NodeJS.ErrnoException).code, "EACCES");

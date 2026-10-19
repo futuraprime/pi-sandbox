@@ -669,7 +669,8 @@ async function runWorker(
   tempPaths: Record<string, string>,
   nestedProbePath?: string,
 ): Promise<WorkerResult> {
-  const { SandboxManager } = await import("@carderne/sandbox-runtime");
+  const { createSandboxManager } = await import("@carderne/sandbox-runtime");
+  const sandboxManager = createSandboxManager();
   const { augmentMacosBrowserProfile, initializeSandbox, createSandboxedBashOps } =
     await import("../src/sandbox-runtime.ts");
   const dir = join(fixture, mode);
@@ -704,9 +705,9 @@ async function runWorker(
   };
   let profileCaptureError: string | undefined;
   try {
-    await initializeSandbox(config, allowances, dir);
+    await initializeSandbox(sandboxManager, config, allowances, dir);
     result.lifecycle.initialize = "passed";
-    const ops = createSandboxedBashOps("/bin/bash");
+    const ops = createSandboxedBashOps(sandboxManager, "/bin/bash");
     result.chromiumVersion = await runSandboxCommand(
       ops,
       `${quoteShell(chromium)} --version`,
@@ -726,10 +727,10 @@ async function runWorker(
     });
 
     const launchCommand = chromiumLaunchCommand(chromium, profile);
-    const originalWrap = SandboxManager.wrapWithSandbox;
+    const originalWrap = sandboxManager.wrapWithSandbox;
     let profileCaptureSeen = false;
-    SandboxManager.wrapWithSandbox = async function (command, ...args) {
-      const wrapped = await originalWrap.call(SandboxManager, command, ...args);
+    sandboxManager.wrapWithSandbox = async function (command, ...args) {
+      const wrapped = await originalWrap.call(sandboxManager, command, ...args);
       if (!profileCaptureSeen && isChromiumLaunchCommand(command, launchCommand)) {
         profileCaptureSeen = true;
         try {
@@ -747,7 +748,7 @@ async function runWorker(
     try {
       result.browser = await runSandboxCommand(ops, launchCommand, dir, env, 30, controller.signal);
     } finally {
-      SandboxManager.wrapWithSandbox = originalWrap;
+      sandboxManager.wrapWithSandbox = originalWrap;
     }
     result.gates.push(classifyBrowser(mode, result.browser));
     for (const [name, path] of Object.entries(tempPaths)) {
@@ -789,7 +790,7 @@ async function runWorker(
       });
     }
     try {
-      await SandboxManager.reset();
+      await sandboxManager.reset();
       result.lifecycle.reset = "passed";
     } catch (error) {
       result.lifecycle.reset = `failed: ${error instanceof Error ? error.message : String(error)}`;

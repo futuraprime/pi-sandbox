@@ -1,6 +1,6 @@
 import { isAbsolute, relative } from "node:path";
 
-import { SandboxManager } from "@carderne/sandbox-runtime";
+import { createSandboxManager, type ISandboxManager } from "@carderne/sandbox-runtime";
 import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createBashToolDefinition,
@@ -135,36 +135,28 @@ function sandboxConfigMutationMessage(cwd: string): string {
   );
 }
 
-const sandboxManagerTransitionKey = Symbol.for("pi-sandbox.sandbox-manager-transition");
-const sandboxManagerTransitions = globalThis as unknown as Record<
-  symbol,
-  Promise<void> | undefined
->;
-
-async function withSandboxManagerTransition<T>(operation: () => Promise<T>): Promise<T> {
-  const previous = sandboxManagerTransitions[sandboxManagerTransitionKey] ?? Promise.resolve();
-  let release!: () => void;
-  sandboxManagerTransitions[sandboxManagerTransitionKey] = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  await previous;
-  try {
-    return await operation();
-  } finally {
-    release();
-  }
-}
-
 export interface SandboxExtensionOptions {
   /** Injectable platform seam for portable SSH preflight contracts. */
   platform?: NodeJS.Platform;
   /** Injectable configuration seam for isolated policy and prompt contracts. */
   configLoader?: (cwd: string) => SandboxConfig;
+  /** Injectable manager factory for lifecycle contracts. */
+  managerFactory?: () => ISandboxManager;
 }
 
 export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}) {
   const platform = options.platform ?? process.platform;
   const readConfig = options.configLoader ?? loadConfig;
+  const sandboxManager = (options.managerFactory ?? createSandboxManager)();
+  let sandboxManagerTransitions: Promise<void> = Promise.resolve();
+  const withSandboxManagerTransition = <T>(operation: () => Promise<T>): Promise<T> => {
+    const pending = sandboxManagerTransitions.then(operation);
+    sandboxManagerTransitions = pending.then(
+      () => undefined,
+      () => undefined,
+    );
+    return pending;
+  };
   pi.registerFlag("no-sandbox", {
     description: "Disable OS-level sandboxing for bash commands",
     type: "boolean",
@@ -200,8 +192,6 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
   // runtime restored while the desired replacement remains unavailable.
   let sandboxRuntimeOwnerGeneration: number | null = null;
   let sandboxRuntimeCwd: string | null = null;
-  // SandboxManager owns process-global runtime state. Its transition queue is
-  // shared across extension instances so reload cannot bypass pending cleanup.
   const allowances: SessionAllowances = {
     domains: [],
     readPaths: [],
@@ -277,10 +267,10 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       let resetCompleted = false;
 
       try {
-        await SandboxManager.reset();
+        await sandboxManager.reset();
         resetCompleted = true;
         if (sessionGeneration !== expectedGeneration) return false;
-        await initializeSandbox(desired.config, desired.allowances, desired.cwd);
+        await initializeSandbox(sandboxManager, desired.config, desired.allowances, desired.cwd);
         if (sessionGeneration !== expectedGeneration) return false;
         sandboxRuntimeCwd = desired.cwd;
         sandboxRuntimeOwnerGeneration = expectedGeneration;
@@ -296,7 +286,11 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         let restored = false;
         try {
           if (!resetCompleted) throw new Error("sandbox reset did not complete");
-          await initializeSandbox(prior.config, prior.allowances, prior.cwd);
+          // initializeSandbox attempts cleanup after a failed initialize, but its
+          // cleanup is best-effort. Establish a successful reset boundary before
+          // allowing the prior runtime to become executable again.
+          await sandboxManager.reset();
+          await initializeSandbox(sandboxManager, prior.config, prior.allowances, prior.cwd);
           restored = true;
         } catch (restoreError) {
           console.error(`Warning: Failed to restore the prior sandbox runtime: ${restoreError}`);
@@ -804,7 +798,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     expectedGeneration = sessionGeneration,
     approvedManualCommand?: { command: string; cwd: string },
   ): ReturnType<typeof createSandboxedBashOps> {
-    const baseOperations = createSandboxedBashOps(shellPath);
+    const baseOperations = createSandboxedBashOps(sandboxManager, shellPath);
     let unsandboxedAttemptConsumed = false;
     return {
       async exec(command, cwd, execOptions) {
@@ -890,7 +884,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
             throw new Error("Sandbox is not ready; command execution remains blocked.");
           }
           let output = "";
-          const store = SandboxManager.getSandboxViolationStore();
+          const store = sandboxManager.getSandboxViolationStore();
           const beforeCount = store.getViolationsForCommand(command).length;
           lastResult = await baseOperations.exec(command, cwd, {
             ...execOptions,
@@ -903,7 +897,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
 
           let annotatedOutput = output;
           try {
-            annotatedOutput = SandboxManager.annotateStderrWithSandboxFailures(command, output);
+            annotatedOutput = sandboxManager.annotateStderrWithSandboxFailures(command, output);
           } catch {
             // Some runtime versions do not annotate until a log monitor is active.
           }
@@ -1117,10 +1111,10 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
         // not establish an owned runtime, preventing a partially initialized
         // manager from being mistaken for a ready one.
         if (needsReset) {
-          await SandboxManager.reset();
+          await sandboxManager.reset();
           if (sessionGeneration !== expectedGeneration) return false;
         }
-        await initializeSandbox(desired.config, desired.allowances, desired.cwd);
+        await initializeSandbox(sandboxManager, desired.config, desired.allowances, desired.cwd);
         if (
           sessionGeneration !== expectedGeneration ||
           (ownership !== undefined && !ownsSessionStart(ownership))
@@ -1179,7 +1173,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       try {
         // Reset even when initialize did not finish: a queued late start may
         // have created a manager runtime without ever acquiring ownership.
-        await SandboxManager.reset();
+        await sandboxManager.reset();
       } catch {
         // Ignore cleanup errors.
       }
@@ -1206,7 +1200,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
     sandboxLifecycle = { state: "shutting-down", generation: expectedGeneration - 1 };
     await withSandboxManagerTransition(async () => {
       try {
-        await SandboxManager.reset();
+        await sandboxManager.reset();
       } catch {
         // A replacement session still starts fail-closed and may retry reset
         // during recovery; cleanup errors are not user-executable fallbacks.
@@ -1647,7 +1641,7 @@ export default function (pi: ExtensionAPI, options: SandboxExtensionOptions = {}
       // session queues after this cleanup boundary.
       void withSandboxManagerTransition(async () => {
         try {
-          await SandboxManager.reset();
+          await sandboxManager.reset();
         } catch {
           // Ignore cleanup errors.
         }

@@ -357,7 +357,7 @@ test("macOS C-1 read precedence follows path specificity through Seatbelt", asyn
       `process.stdout.write(${JSON.stringify(marker)} + JSON.stringify(results));`,
     ].join("\n");
     const output: Buffer[] = [];
-    const result = await createSandboxedBashOps().exec(
+    const result = await createSandboxedBashOps(SandboxManager).exec(
       `${shellQuote(process.execPath)} -e ${shellQuote(probeSource)}`,
       scratch,
       {
@@ -479,7 +479,7 @@ test("macOS C-1 root read deny permits only narrower grants through Seatbelt", a
       `process.stdout.write(${JSON.stringify(marker)} + JSON.stringify(results));`,
     ].join("\n");
     const output: Buffer[] = [];
-    const result = await createSandboxedBashOps().exec(
+    const result = await createSandboxedBashOps(SandboxManager).exec(
       `${shellQuote(process.execPath)} -e ${shellQuote(probeSource)}`,
       scratch,
       {
@@ -701,7 +701,7 @@ test("macOS C-2 write precedence follows path specificity through the OS sandbox
     };
     let exitCode: number | null;
     try {
-      ({ exitCode } = await createSandboxedBashOps().exec(
+      ({ exitCode } = await createSandboxedBashOps(SandboxManager).exec(
         `${shellQuote(process.execPath)} -e ${shellQuote(probeSource)}`,
         scratch,
         {
