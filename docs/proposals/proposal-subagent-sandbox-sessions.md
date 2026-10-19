@@ -144,6 +144,7 @@ Assumptions still requiring evidence: the pinned runtime factory isolates releva
   - **Dependencies:** accessible pinned dependency sources; no runner capability required.
   - **Acceptance:** identify manager-owned versus process-global policy, proxies, monitoring, environment changes, adapter provenance, and cleanup; establish factory/config identity and partial-initialisation reset semantics. Record any blocker to safe concurrent owners before changing production ownership.
   - **Verification:** source references and focused factory-contract tests using two managers with distinct configurations. Run `test/sandbox-runtime.test.ts`; record what remains OS-dependent. See Session-owned runtimes.
+  - **Progress:** [audit and verification record](../integration/subagent-sandbox-runtime-audit.md) and `test/sandbox-manager-factory.test.ts` added. Subagent observed 2 factory and 39 runtime tests passing; coordinator verified source/tests and passed formatting, lint, and type checks. Independent test reruns and full regression verification remain blocked by tsx IPC socket permissions. Shared macOS monitoring tags, retained reset state, Linux mount cleanup, and config/provenance identity require care in Unit 2; real OS concurrency remains unverified.
 
 - [ ] **Unit 2: Give sandbox lifecycles independent managers**
   - **Deliverable:** owner-local lifecycle serialisation and manager routing in the extension and Bash/runtime helpers, replacing the singleton and process-global transition queue together.
