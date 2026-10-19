@@ -8,7 +8,7 @@
     "pi-extension"
   ],
   "type": "module",
-  "packageManager": "pnpm@10.34.3",
+  "packageManager": "pnpm@12.11.2",
   "pi": {
     "extensions": [
       "./index.ts"
