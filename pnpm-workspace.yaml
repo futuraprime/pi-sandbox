@@ -1,2 +1,6 @@
 minimumReleaseAgeExclude:
   - "@carderne/sandbox-runtime"
+
+overrides:
+  minimatch: ">=10.2.1"
+  lodash-es: ">=4.18.1"
