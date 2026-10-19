@@ -1,7 +1,7 @@
 # Sandbox protection for subagent sessions
 
 - **Created:** 2026-10-15
-- **Updated:** 2026-10-18
+- **Updated:** 2026-10-19
 - **Status:** draft
 
 ## Summary
@@ -64,9 +64,9 @@ Personal configuration changes are a separate opt-in rollout, not edits to be ma
 
 ### Permissions and failure behaviour
 
-Headless children use configured policy plus a snapshot of approved parent session grants taken at spawn. Copy grant values into independently owned child state; do not share a mutable allowance collection or runtime manager. Inheritance transfers approved allowances, not a sandbox-disable state or a one-command unsandboxed bypass, and does not override explicit denies or mandatory protections.
+Headless children use configured policy plus a snapshot of approved parent session grants taken at spawn. Copy grant values into independently owned child state; do not share a mutable allowance collection or runtime manager. Inheritance transfers approved allowances, not a sandbox-disable state or a one-command unsandboxed bypass. Inherited allowances use the existing specificity-aware policy rules without extra precedence: a strictly more-specific allow may override a broader ordinary deny, denies win ties, and mandatory protections always win.
 
-Later parent approvals do not update running children. A newly spawned child, including a retry after approval, receives a fresh snapshot. Nested children follow the same snapshot rule from their spawning session. Inherited grants remain in memory, are never persisted automatically, and must not survive the originating main session.
+Later parent approvals do not update running children. A newly spawned child, including a retry after approval, receives a fresh snapshot. Nested children follow the same snapshot rule from their spawning session. Inherited grants remain in memory and are never persisted automatically. Ending the originating main session invalidates inherited grant state for further child execution; surviving subprocess descendants are subject to the lifetime limitation below.
 
 Prefer a generic upstream trusted child-initialisation hook at session construction, before extension binding. The sandbox integration supplies a by-value snapshot from the actual spawning session's approved allowance state and associates it with the originating main session's lifetime. Do not take authority from model-call arguments, prompt text, child-asserted parent identifiers, or persisted conversation history. Handle nested spawns, queued starts, and resumed children explicitly; existing callbacks do not yet establish this contract.
 
@@ -78,9 +78,9 @@ Once loaded and enabled on a supported platform, sandbox initialisation or polic
 
 Use a report → approve → retry workflow rather than live child-to-parent permission forwarding. When a child finishes, its result may include blocked or incomplete work and structured requests for specific additional paths or domains, the requested access kind, and a reason. Preserve the normal result even when requests are present.
 
-Distinguish sandbox-recorded blocks from agent-suggested access. Both are untrusted request data, not authorisation or instructions to grant access. Completion reporting must not grant access, persist configuration, or automatically retry work.
+Label each report's evidence source: direct policy denial, runtime-observed violation, output-inferred diagnostic, or agent suggestion. An extension-produced report establishes its producer, not that a denial necessarily occurred; command-controlled output must not be promoted to an observed block. All categories are untrusted request data, not authorisation or instructions to grant access. Completion reporting must not grant access, persist configuration, or automatically retry work.
 
-Agent-suggested requests can initially travel in the normal completion text without new runner transport. Reliably recorded blocks need a separate generic extension completion-metadata channel, preferably contributed upstream, carried alongside the normal result through foreground completion, background completion, and result retrieval. Capture records from the sandbox integration rather than treating model-authored structured output as proof of a recorded block. The sandbox must record direct-tool denials as well as relevant Bash denials.
+Agent-suggested requests can initially travel in the normal completion text without new runner transport. Reliably recorded blocks need a separate generic extension completion-metadata channel, preferably contributed upstream, carried alongside the normal result through foreground completion, background completion, and result retrieval. Capture records from the sandbox integration rather than treating model-authored structured output as proof of a recorded block. The sandbox must record direct-tool denials as well as relevant Bash denials, retaining evidence-source labels through collection and every result path. Existing diagnostics inferred from command output remain labelled inferences even when collected by the extension.
 
 For initial approval, the main agent explains the requests and the user invokes `/sandbox-allow` for the specific target, choosing session scope when temporary access is wanted. Only explicit user approval creates a grant. A session approval updates the main session's allowances; a newly spawned child can then inherit the updated snapshot and retry. Other active children remain unchanged. No dedicated approval tool or automatic popup is required initially; verify this manual flow end to end.
 
@@ -88,7 +88,9 @@ For initial approval, the main agent explains the requests and the user invokes 
 
 Prefer three generic upstream capabilities: required-extension enforcement, trusted child initialisation, and extension completion metadata. The [local upstream design request](../integration/subagent-runner-upstream-request.md) records the proposed contracts and acceptance evidence; it has not been submitted. Keep sandbox policy, grant validation, block recording, and user approval in this repository's integration rather than adding sandbox-specific runner behaviour. Exact APIs and upstream acceptance remain dependencies; no installed-package changes are authorised.
 
-Reuse the runner's existing parent-shutdown cancellation and child extension teardown where verified. Ending or replacing the originating main session stops its children and expires inherited grants, including authority held by queued or nested launches. Resuming an old child never restores grants from its transcript; it receives a fresh snapshot from the current spawning session before execution. In-memory resume must also replace stale inherited grant state. Verify that active sandboxed commands actually stop and resources remain owned until cleanup completes, including when the runner's three-second child-shutdown timeout expires. Do not equate a disposed session with a terminated process. The exact lifetime association and timeout handling remain implementation questions requiring behavioural verification.
+Reuse the runner's existing parent-shutdown cancellation and child extension teardown where verified. Ending or replacing the originating main session cancels its child tasks, invalidates inherited grant state for further tool execution, and prevents stale queued or nested launches. Resuming an old child never restores grants from its transcript; it receives a fresh snapshot from the current spawning session before execution. In-memory resume must also replace stale inherited grant state. Verify cancellation and completion of tracked sandboxed commands, with resources remaining owned until their cleanup completes, including when the runner's three-second child-shutdown timeout expires. Do not equate session disposal with tracked-command completion. The exact lifetime association and timeout handling remain implementation questions requiring behavioural verification.
+
+The lifetime guarantee covers tracked command attempts, not every subprocess descendant. The current Bash wrapper can finish after its shell exits while descendants remain alive. Cancellation of tracked commands must attempt process-group termination, but does not guarantee termination of detached or otherwise surviving descendants. Such descendants may retain filesystem access or other authority acquired under inherited grants after the originating session ends; invalidating in-memory grant state does not revoke that authority. Complete descendant termination is not a rollout prerequisite. Tests must demonstrate and document this limitation rather than claim that all inherited authority expires at shutdown.
 
 ### Required-extension startup gate
 
@@ -112,14 +114,14 @@ Establish protection through behavioural tests, not merely successful extension 
 
 - Parent and concurrent children use different filesystem/domain policies without unintended cross-session access or mutable grant leakage.
 - Newly spawned children receive approved parent session grants by value; later grants affect only later spawns, child-local mutations do not affect parents or siblings, and nested snapshots preserve the same isolation.
-- Inherited grants cannot override explicit denies or mandatory protections, transfer a disable/bypass approval, persist automatically, or survive the originating main session.
-- Completion reports preserve normal results and distinguish recorded blocks from suggested access; missing, malformed, or malicious requests never grant access. User approval followed by a new spawn enables the specific approved operation without changing existing children.
+- Inherited grants preserve existing specificity-aware precedence: strictly more-specific allows may override broader ordinary denies, denies win ties, and mandatory protections always win. They cannot transfer a disable/bypass approval or persist automatically; originating-session shutdown invalidates inherited grant state for further tool execution, subject to the documented descendant limitation.
+- Completion reports preserve normal results and distinguish direct policy denials, runtime-observed violations, output-inferred diagnostics, and agent suggestions; command-controlled diagnostic output is never relabelled as an observed block. Missing, malformed, or malicious requests never grant access. User approval followed by a new spawn enables the specific approved operation without changing existing children.
 - Allowed standard-tool operations succeed; denied reads, writes, edits, and Bash filesystem/network operations fail in actual child sessions.
 - The dispatched Bash tool is sandboxed even after the runner applies its tool scope.
 - Headless permission requests abort promptly without granting or persisting access.
 - Policy refresh blocks new attempts and drains active commands only in the affected session; shutdown or replacement cancels and awaits its commands before runtime reset. Permission-triggered retries cannot deadlock on command ownership.
 - Child shutdown, reload, failed initialisation, and policy refresh do not disrupt a parent or sibling, including overlapping commands.
-- Parent shutdown or replacement invalidates inherited authority, prevents stale queued/nested starts, and stops active sandboxed commands even across the runner's child-shutdown timeout; session disposal alone is not a passing result.
+- Parent shutdown or replacement invalidates inherited grant state for further execution, prevents stale queued/nested starts, and cancels and awaits tracked sandboxed commands and their cleanup even across the runner's child-shutdown timeout; session disposal alone is not a passing result. Backgrounded and detached-process tests demonstrate the distinction between tracked-command completion and surviving descendants, including authority that may remain after shutdown.
 - Trusted snapshots arrive before child sandbox initialisation; model-supplied grant data and persisted session history cannot manufacture authority. Extension-recorded completion metadata survives foreground/background result paths separately from model suggestions.
 - The manual `/sandbox-allow` session-approval flow followed by a fresh child spawn grants only approved access, without a dedicated approval tool.
 - Independent proxies and temporary runtime resources are cleaned up by their owner.
@@ -136,11 +138,12 @@ Use focused lifecycle tests plus end-to-end tests against the installed runner, 
 - Extending filesystem policy to `grep`, `find`, `ls`, MCP, web tools, or other custom tools as an incidental change. These remain outside the current standard-tool boundary; see [Extension-tool policy boundary](proposal-extension-tool-policy-boundary.md).
 - Treating worktree isolation as a security boundary.
 - Live grant synchronisation to running children, interactive permission forwarding, or automatic approval/retry based on child completion requests.
+- Guaranteed termination of every subprocess descendant or revocation of authority retained by surviving descendants after a tracked command or originating session ends.
 
 ## Risks and open questions
 
 - Do independent runtime managers isolate all relevant state under real concurrent macOS/Linux execution, including monitoring and cleanup?
-- How should command ownership and cancellation be implemented so draining, permission-triggered retries, and teardown remain deadlock-free, including the runner's bounded shutdown?
+- How should command ownership and cancellation be implemented so draining, permission-triggered retries, and teardown remain deadlock-free, including the runner's bounded shutdown? Tracked-command completion does not establish descendant termination; surviving descendants may retain inherited access after shutdown.
 - Which stable sandbox extension identity/path should personal agent configuration use, and does the runner preserve the intended built-in overrides and tool restrictions?
 - What generic required-extension API and error-attribution rules should be contributed upstream, and does the startup handoff need an explicit readiness signal? Rollout requires verified fail-closed loading and binding; best-effort loading is not an accepted substitute.
 - What exact generic APIs should carry trusted initialisation snapshots and extension completion metadata? Verify nested, queued, and resumed execution plus originating-session lifetime handling; source inspection identifies the required seams but does not establish their behaviour. Upstream acceptance remains a rollout dependency unless a separately approved patch/fork is adopted.

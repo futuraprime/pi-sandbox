@@ -1,6 +1,7 @@
 # Draft upstream request: extension-aware child session lifecycle
 
 - **Created:** 2026-10-18
+- **Updated:** 2026-10-19
 - **Status:** local draft; not submitted
 - **Related proposal:** [Sandbox protection for subagent sessions](../proposals/proposal-subagent-sandbox-sessions.md)
 
@@ -54,7 +55,7 @@ Required behaviour:
 - Support nested spawns from their actual immediate parent while retaining an association with the originating root session's lifetime.
 - Define failure and cleanup for missing required participants, malformed payloads, callback errors, cancellation, and startup failure. Required initialisation failure must not silently fall back to an uninitialised protected child.
 
-For the sandbox consumer, the payload is a snapshot of approved allowance values, not a manager reference, credential value, sandbox-disable setting, or one-command unsandboxed approval. The child validates the snapshot against its own policy; explicit denies and mandatory protections remain effective.
+For the sandbox consumer, the payload is a snapshot of approved allowance values, not a manager reference, credential value, sandbox-disable setting, or one-command unsandboxed approval. The child validates the snapshot against its own policy using existing specificity-aware precedence, without giving inherited grants extra precedence: a strictly more-specific allow may override a broader ordinary deny, denies win ties, and mandatory protections always win.
 
 An API using runner lifecycle callbacks or scoped extension events is acceptable. The request is for the lifecycle contract, not a new general-purpose RPC framework. Existing public hooks do not yet establish this contract.
 
@@ -71,17 +72,17 @@ Required behaviour:
 - Define size/schema validation, truncation reporting, per-run reset on resume, and collection on success, partial failure, or cancellation where records exist. A malformed optional report must not erase the normal result or create authority.
 - Collect before disposing the extension state that owns the report. Do not require the child model to summarise or reproduce every record correctly.
 
-For the sandbox consumer, records describe blocked operations: requested access kind, specific path/domain, and available diagnostic context. Agent-suggested requests may also travel as ordinary completion text but remain labelled suggestions. Neither kind of report grants access or triggers a retry.
+For the sandbox consumer, records describe requested access kind, specific path/domain, and available diagnostic context, with explicit evidence-source labels: direct policy denial, runtime-observed violation, output-inferred diagnostic, or agent suggestion. Extension provenance establishes the report producer, not that a denial necessarily occurred. Command-controlled output remains labelled inference even when the extension collects it; it must not become an observed block merely by entering this channel. Agent suggestions may also travel as ordinary completion text. Evidence-source labels must survive every result path. No category grants access or triggers a retry. These consumer-specific categories do not require sandbox-specific runner behaviour.
 
 ## Session lifetime and resume
 
-The originating main session is the lifetime boundary for inherited temporary authority:
+The originating main session is the lifetime boundary for inherited grant state used in further child execution, not for authority retained by every subprocess descendant:
 
-- Shutdown or replacement stops owned children, prevents queued/nested starts from using stale initialisation data, and expires inherited grants.
+- Shutdown or replacement cancels owned child tasks, prevents queued/nested starts from using stale initialisation data, and invalidates inherited grant state for further tool execution.
 - Resuming an old child must never restore temporary grants from its transcript. It receives a fresh snapshot from the current spawning session; an in-memory resume must replace stale inherited grant state before further execution as well.
-- The runner owns cancellation and lifecycle delivery; the consumer owns stopping its subprocesses and cleaning its runtime. Specify how these cooperate when child shutdown exceeds the current timeout. A disposed session or an emitted abort signal is not, by itself, a successful termination guarantee.
+- The runner owns cancellation and lifecycle delivery; the consumer owns cancelling and awaiting tracked commands, attempting process-group termination, and cleaning its runtime. Specify how these cooperate when child shutdown exceeds the current timeout. A disposed session or an emitted abort signal is not, by itself, proof of tracked-command completion and cleanup.
 
-This request does not prescribe unbounded waiting on shutdown. Timeout escalation and actual termination guarantees need an explicit implementation design and tests before claiming that grants cannot outlive the originating session.
+This request does not prescribe unbounded waiting on shutdown. Timeout handling needs an explicit implementation design and tests for tracked-command cancellation and cleanup. It does not require guaranteed termination of every subprocess descendant: a tracked shell can exit while backgrounded or detached descendants remain alive, and those descendants may retain filesystem access or other authority acquired under inherited grants after the originating session ends. Invalidating grant state does not revoke that authority. Complete descendant termination is not a rollout prerequisite; tests must document this limitation rather than claim universal grant expiry.
 
 ## Consumer workflow and non-goals
 
@@ -92,6 +93,7 @@ Out of scope:
 - Sandbox policy evaluation or OS runtime management inside the runner.
 - Live child-to-parent permission forwarding or live grant synchronisation.
 - Automatically approving requests, persisting grants, or retrying work.
+- Guaranteed termination of every subprocess descendant or revocation of authority retained by surviving descendants.
 - Sandboxing arbitrary extension code or tools outside the consumer's coverage.
 - Moving children into separate processes or replacing orchestration features.
 
@@ -104,8 +106,8 @@ Use deterministic runner tests with fixture extensions before LLM-based or OS-le
 - Concurrent, queued, nested, foreground, background, and RPC spawns receive only their own trusted initialisation snapshots; parent shutdown invalidates queued work.
 - Model arguments, persisted history, and claimed parent IDs cannot manufacture authoritative payloads.
 - Resume receives current authority and does not revive old grants or old completion records.
-- Completion metadata survives each result path separately from normal output and model-authored structured JSON, with limits and provenance preserved.
-- Cancellation, startup failure, and parent replacement release integration state; timeout tests establish what actually stops rather than asserting only that `dispose()` was called.
+- Completion metadata survives each result path separately from normal output and model-authored structured JSON, with limits, producer provenance, and consumer evidence-source labels preserved.
+- Cancellation, startup failure, and parent replacement release integration state; timeout tests establish tracked-command cancellation and cleanup rather than asserting only that `dispose()` was called. Consumer OS-level tests separately demonstrate the surviving-descendant limitation.
 
 The sandbox repository must separately verify tool dispatch, policy enforcement, permission approval/retry, and independent runtime safety on macOS and Linux. Runner fixture tests alone cannot prove OS containment.
 
@@ -114,6 +116,6 @@ The sandbox repository must separately verify tool dispatch, policy enforcement,
 1. Which public extension lifecycle surface should own trusted initialisation and completion contributions, across supported Pi versions?
 2. Can required-extension startup errors be attributed reliably, or should all binding errors fail startup when requirements are declared?
 3. How should in-memory resume refresh extension initialisation before execution without rebuilding unrelated session state?
-4. What cancellation/shutdown contract can the runner guarantee after its child-shutdown timeout?
+4. What cancellation/shutdown contract can the runner provide so the consumer can await tracked-command completion and cleanup after the child-shutdown timeout, without claiming termination of every descendant?
 
 Prefer upstream capabilities rather than a maintained local patch. Upstream API agreement and availability remain rollout dependencies; adopting a temporary fork or patch requires separate approval.
