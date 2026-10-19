@@ -192,6 +192,9 @@ importers:
       tsx:
         specifier: ^4.23.1
         version: 4.23.1
+      typebox:
+        specifier: ^1.1.24
+        version: 1.1.38
       typescript:
         specifier: ^5
         version: 5.9.3

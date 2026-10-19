@@ -252,11 +252,27 @@ file masking. Do not put tokens in configuration or permission prompts.
 
 The footer shows a lock indicator while the sandbox is active.
 
+<<<<<<< HEAD
 ## Acknowledgements
 This private fork integrates work from
 [carderne/pi-sandbox](https://github.com/carderne/pi-sandbox) by Chris Arderne.
 It is maintained independently and is not published to a package registry.
 
+=======
+## Development
+
+Use Node.js 24 and pnpm 10.34.3. After cloning, install dependencies and run the CI checks with:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm run ci:fmt
+pnpm run ci:lint
+pnpm run ci:check
+pnpm run ci:test
+```
+
+## Ackowledgements
+>>>>>>> 801af75 (fix: declare host-provided extension peer dependencies)
 Based on code from
 [badlogic/pi-mono](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/examples/extensions/sandbox/index.ts)
 by Mario Zechner, used under the
