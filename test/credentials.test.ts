@@ -1,7 +1,14 @@
 import type { CredentialEnvVarConfig, CredentialFileConfig } from "@carderne/sandbox-runtime";
 
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -242,6 +249,7 @@ test("file JWT decode mismatch honors fail-closed deny and error choices", () =>
       for (const fileCase of cases) {
         const realPath = join(root, `${onExtractNoMatch}-${fileCase.filename}`);
         writeFileSync(realPath, fileCase.content, "utf8");
+        const canonicalPath = realpathSync(realPath);
         const registry = new SentinelRegistry();
         const store = new MaskedFileStore();
         try {
@@ -249,7 +257,7 @@ test("file JWT decode mismatch honors fail-closed deny and error choices", () =>
             buildMaskedFileBinds(
               [
                 {
-                  path: realPath,
+                  path: canonicalPath,
                   mode: "mask",
                   decode: "jwt",
                   maskClaims: ["access_token"],
@@ -265,7 +273,7 @@ test("file JWT decode mismatch honors fail-closed deny and error choices", () =>
           if (onExtractNoMatch === "deny") {
             const result = build();
             assert.deepEqual(result.binds, []);
-            assert.deepEqual(result.degradeToDenyPaths, [realpathSync(realPath)]);
+            assert.deepEqual(result.degradeToDenyPaths, [canonicalPath]);
           } else {
             assert.throws(build, (error: unknown) => {
               return !String(error).includes(syntheticPlaintext);
@@ -281,7 +289,7 @@ test("file JWT decode mismatch honors fail-closed deny and error choices", () =>
   }
 });
 
-test("masked file material is fake while macOS wrapper denies the real path", (t) => {
+test("masked file material is fake while macOS wrapper denies canonical and alias paths", (t) => {
   if (process.platform !== "darwin") {
     t.skip("macOS credential-file fallback");
     return;
@@ -296,16 +304,30 @@ test("masked file material is fake while macOS wrapper denies the real path", (t
   try {
     const realPath = join(root, "credential.txt");
     writeFileSync(realPath, `token=${SYNTHETIC_SECRET}\n`, "utf8");
+    const canonicalPath = realpathSync(realPath);
+    const aliasPath = join(root, "credential-alias.txt");
+    symlinkSync(canonicalPath, aliasPath);
+    assert.notEqual(aliasPath, canonicalPath, "the fixture includes a distinct symlink alias");
+    assert.equal(
+      realpathSync(aliasPath),
+      canonicalPath,
+      "the fixture alias resolves to the credential",
+    );
     const registry = new SentinelRegistry();
     const files: CredentialFileConfig[] = [
       {
-        path: realPath,
+        path: canonicalPath,
         mode: "mask",
         injectHosts: [INJECT_HOST],
       },
     ];
     const { binds } = buildMaskedFileBinds(files, [INJECT_HOST], registry, store);
     assert.equal(binds.length, 1);
+    assert.equal(
+      binds[0].realPath,
+      canonicalPath,
+      "the dependency receives the extension's canonical path",
+    );
     const fakeContent = readFileSync(binds[0].fakePath, "utf8");
     assert.equal(
       fakeContent.includes(SYNTHETIC_SECRET),
@@ -313,51 +335,57 @@ test("masked file material is fake while macOS wrapper denies the real path", (t
       "fake file must not contain plaintext",
     );
 
-    const wrapped = wrapCommandWithSandboxMacOS({
-      command: `cat ${JSON.stringify(realPath)}`,
-      needsNetworkRestriction: false,
-      readConfig: { denyOnly: [] },
-      writeConfig: undefined,
-      maskedFileBinds: binds,
-      binShell: "sh",
-    });
-    assert.match(wrapped, /deny file-read\*/);
-    assert.equal(wrapped.includes(realPath), true, "the real credential path is the denied path");
-    assert.equal(
-      wrapped.includes(binds[0].fakePath),
-      false,
-      "macOS must not deliver a fake file bind",
-    );
-    assert.equal(
-      containsPlaintext([fakeContent, wrapped], SYNTHETIC_SECRET),
-      false,
-      "file reads and wrapper diagnostics must not contain plaintext",
-    );
+    for (const readPath of [canonicalPath, aliasPath]) {
+      const wrapped = wrapCommandWithSandboxMacOS({
+        command: `cat ${JSON.stringify(readPath)}`,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [] },
+        writeConfig: undefined,
+        maskedFileBinds: binds,
+        binShell: "sh",
+      });
+      assert.match(wrapped, /deny file-read\*/);
+      assert.equal(
+        wrapped.includes(canonicalPath),
+        true,
+        "the canonical credential path must be denied",
+      );
+      assert.equal(
+        wrapped.includes(binds[0].fakePath),
+        false,
+        "macOS must not deliver a fake file bind",
+      );
+      assert.equal(
+        containsPlaintext([fakeContent, wrapped], SYNTHETIC_SECRET),
+        false,
+        "file reads and wrapper diagnostics must not contain plaintext",
+      );
 
-    const fileRun = spawnSync("/bin/sh", ["-c", wrapped], {
-      encoding: "utf8",
-      env: { ...process.env },
-    });
-    const spawnError = fileRun.error as NodeJS.ErrnoException | undefined;
-    if (spawnError?.code === "EPERM") {
-      assert.fail(
-        "outer harness returned EPERM while spawning nested sandbox-exec; direct file-denial evidence is unavailable",
+      const fileRun = spawnSync("/bin/sh", ["-c", wrapped], {
+        encoding: "utf8",
+        env: { ...process.env },
+      });
+      const spawnError = fileRun.error as NodeJS.ErrnoException | undefined;
+      if (spawnError?.code === "EPERM") {
+        assert.fail(
+          "outer harness returned EPERM while spawning nested sandbox-exec; direct file-denial evidence is unavailable",
+        );
+      }
+      assert.equal(spawnError, undefined, "direct nested sandbox-exec could not be spawned");
+      assert.notEqual(fileRun.status, 0, `reading credential via ${readPath} must fail`);
+      assert.equal(fileRun.signal, null, "credential read should return a denial, not a signal");
+      assert.equal(fileRun.stdout, "", "denied credential file must not produce stdout");
+      assert.equal(
+        containsPlaintext([fileRun.stdout, fileRun.stderr], SYNTHETIC_SECRET),
+        false,
+        "denied credential read must not disclose plaintext in child output",
+      );
+      assert.equal(
+        fileRun.stderr.includes(readPath),
+        true,
+        `the child must report denial of the requested path ${readPath}; otherwise nested execution may be blocked by the outer harness`,
       );
     }
-    assert.equal(spawnError, undefined, "direct nested sandbox-exec could not be spawned");
-    assert.notEqual(fileRun.status, 0, "reading the real credential file must fail");
-    assert.equal(fileRun.signal, null, "credential read should return a denial, not a signal");
-    assert.equal(fileRun.stdout, "", "denied credential file must not produce stdout");
-    assert.equal(
-      containsPlaintext([fileRun.stdout, fileRun.stderr], SYNTHETIC_SECRET),
-      false,
-      "denied credential read must not disclose plaintext in child output",
-    );
-    assert.equal(
-      fileRun.stderr.includes(realPath),
-      true,
-      "the child must report denial of the real path; otherwise nested execution may be blocked by the outer harness",
-    );
   } finally {
     store.dispose();
     rmSync(root, { recursive: true, force: true });
