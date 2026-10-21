@@ -32,7 +32,13 @@ All test commands used `TMPDIR="$PWD/tmp"`.
 - Final `pnpm test`: attempted and failed. Output includes mandatory `.pi`/`.git` fixture denials, runtime mux socket `listen EPERM`, and restoration assertions that did not reach replacement. No protections were relaxed. The full output was truncated by the tool; no reliable aggregate count is recorded here.
 - `git diff --check`: passed.
 
-Unit 2 remains unchecked pending an external-terminal full regression result for this implementation. Unit 1's earlier external pass is not evidence for changed code.
+## External-terminal regression result (2026-10-21)
+
+The user supplied `tsx --test test/**/*.test.ts` output: 232 tests, 227 passed, 2 failed, 3 skipped. All 56 extension and 41 runtime tests passed, including owner isolation and failed-cleanup restoration. The skipped tests remain the three opt-in credential CLI acceptance probes.
+
+Both failures are in unchanged `test/credentials.test.ts`: the JWT fallback deny-path assertion compares a `/projects/...` path with its `/Users/Shared/projects/...` realpath, and the masked-file OS probe unexpectedly reads the synthetic credential file successfully. Read-only inspection confirms `/projects` is a symlink to `/Users/Shared/projects`. The tests call dependency helpers directly with the alias path; `buildRuntimeConfig()` canonicalises credential paths before passing them to the runtime, whereas the dependency helper uses its own path normalisation. This supports an alias-sensitive test/dependency explanation, but the successful-read failure must not be dismissed as a harmless string mismatch or treated as passing denial evidence.
+
+Unit 2 remains unchecked while these regression failures are unresolved. Any credential-test or production correction is a separately approved follow-up; no dependency patch or weakened assertion is authorised. Unit 1's earlier external pass is not evidence for changed code.
 
 ## Evidence limits
 

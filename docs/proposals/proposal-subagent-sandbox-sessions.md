@@ -1,7 +1,7 @@
 # Sandbox protection for subagent sessions
 
 - **Created:** 2026-10-15
-- **Updated:** 2026-10-19
+- **Updated:** 2026-10-21
 - **Status:** accepted
 
 ## Summary
@@ -151,7 +151,7 @@ Assumptions still requiring evidence: the pinned runtime factory isolates releva
   - **Dependencies:** Unit 1 establishes a usable factory contract.
   - **Acceptance:** initialisation, policy replacement, wrapping, proxy queries, diagnostics, reset, and command cleanup use the same owning manager. A failed or reset owner cannot reset a parent/sibling; existing disable/unsupported behaviour and fail-closed failure states remain. Active-command overlap is addressed by Units 3–4, not claimed complete here.
   - **Verification:** owner-aware cases in `test/extension.test.ts` and `test/sandbox-runtime.test.ts` cover two instances, failed initialisation, partial cleanup, and replacement. Inspect production paths for remaining singleton operations; retain existing macOS profile-adapter regressions.
-  - **Progress:** implemented in `b35e316`; see [ownership and verification record](../integration/subagent-sandbox-runtime-ownership.md). Owner-local managers/queues and explicit helper routing replace production singleton use. Failed initialisation awaits cleanup; restoration requires a successful reset boundary. Subagent reported 56 extension and 41 runtime tests passing; coordinator inspected changes and passed formatting, lint, and type checks. Three focused ownership tests independently passed, but the restoration regression and full suite remain restricted by the outer sandbox. Awaiting external-terminal regression verification before checking this unit. Command draining/cancellation and real OS concurrency remain deferred.
+  - **Progress:** implemented in `b35e316`; see [ownership and verification record](../integration/subagent-sandbox-runtime-ownership.md). Owner-local managers/queues and explicit helper routing replace production singleton use. Failed initialisation awaits cleanup; restoration requires a successful reset boundary. Coordinator inspected changes and passed formatting, lint, and type checks; three focused ownership tests independently passed. The user's external-terminal run confirms all 56 extension and 41 runtime tests pass, including failed-cleanup restoration. Full suite: 232 tests, 227 passed, 2 credential tests failed, 3 opt-in skips. The unchanged credential probes expose alias-path assumptions and an unexpected successful synthetic-credential read; follow-up approval is needed before changing those tests or production policy. Unit remains unchecked pending resolution. Command draining/cancellation and real OS concurrency remain deferred.
 
 - [ ] **Unit 3: Drain owned Bash attempts before policy refresh**
   - **Deliverable:** per-owner command leases from wrapping through execution and cleanup, integrated with policy refresh.
