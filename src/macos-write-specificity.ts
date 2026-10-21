@@ -25,8 +25,18 @@ interface ReadPolicyProvenance {
   credentialFiles: string;
 }
 
-const provenance = new WeakMap<SandboxRuntimeConfig, WritePolicyProvenance>();
-const readProvenance = new WeakMap<SandboxRuntimeConfig, ReadPolicyProvenance>();
+const writeProvenanceKey = Symbol.for("pi-sandbox.macos-write-specificity-provenance");
+const writeProvenanceGlobal = globalThis as unknown as Record<
+  symbol,
+  WeakMap<SandboxRuntimeConfig, WritePolicyProvenance> | undefined
+>;
+const provenance = (writeProvenanceGlobal[writeProvenanceKey] ??= new WeakMap());
+const readProvenanceKey = Symbol.for("pi-sandbox.macos-read-specificity-provenance");
+const readProvenanceGlobal = globalThis as unknown as Record<
+  symbol,
+  WeakMap<SandboxRuntimeConfig, ReadPolicyProvenance> | undefined
+>;
+const readProvenance = (readProvenanceGlobal[readProvenanceKey] ??= new WeakMap());
 const readSectionLabel = "; File read\n";
 const writeSectionLabel = "; File write\n";
 const readSpecificityMarker = "; pi-sandbox read specificity";

@@ -599,6 +599,64 @@ test("macOS write adapter narrows only less-specific ordinary denies", (t) => {
   assert.equal(adaptMacosWriteSpecificityProfile(adapted, runtime, "darwin"), adapted);
 });
 
+test("macOS specificity provenance survives module reload", async (t) => {
+  const cwd = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-specificity-reload-")));
+  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const runtime = buildRuntimeConfig(
+    {
+      ...DEFAULT_CONFIG,
+      filesystem: {
+        ...DEFAULT_CONFIG.filesystem!,
+        allowRead: [join(cwd, "read", "grant")],
+        denyRead: [join(cwd, "read")],
+        allowWrite: [join(cwd, "write", "grant")],
+        denyWrite: [join(cwd, "write")],
+      },
+    },
+    undefined,
+    "darwin",
+    cwd,
+  );
+  const readWrapped = generatedMacosReadWrapper(runtime);
+  const writeWrapped = generatedMacosWrapper(runtime);
+  const reloadedUrl = new URL("../src/macos-write-specificity.ts", import.meta.url);
+  reloadedUrl.searchParams.set("reload", String(Date.now()));
+  const reloaded = await import(reloadedUrl.href);
+  assert.notEqual(reloaded.adaptMacosReadSpecificityProfile, adaptMacosReadSpecificityProfile);
+  assert.notEqual(reloaded.adaptMacosWriteSpecificityProfile, adaptMacosWriteSpecificityProfile);
+
+  const readAdapted = reloaded.adaptMacosReadSpecificityProfile(readWrapped, runtime, "darwin");
+  const writeAdapted = reloaded.adaptMacosWriteSpecificityProfile(writeWrapped, runtime, "darwin");
+  assert.notEqual(readAdapted, readWrapped);
+  assert.notEqual(writeAdapted, writeWrapped);
+
+  const clonedRuntime = { ...runtime };
+  assert.throws(
+    () => reloaded.adaptMacosReadSpecificityProfile(readWrapped, clonedRuntime, "darwin"),
+    /provenance/i,
+  );
+  assert.equal(
+    reloaded.adaptMacosWriteSpecificityProfile(writeWrapped, clonedRuntime, "darwin"),
+    writeWrapped,
+  );
+
+  const originalAllowRead = runtime.filesystem!.allowRead![0]!;
+  runtime.filesystem!.allowRead![0] = join(cwd, "read", "mutated");
+  assert.throws(
+    () => reloaded.adaptMacosReadSpecificityProfile(readWrapped, runtime, "darwin"),
+    /changed/i,
+  );
+  runtime.filesystem!.allowRead![0] = originalAllowRead;
+
+  const originalAllowWrite = runtime.filesystem!.allowWrite![0]!;
+  runtime.filesystem!.allowWrite![0] = join(cwd, "write", "mutated");
+  assert.equal(
+    reloaded.adaptMacosWriteSpecificityProfile(writeWrapped, runtime, "darwin"),
+    writeWrapped,
+  );
+  runtime.filesystem!.allowWrite![0] = originalAllowWrite;
+});
+
 test("macOS read adapter guards ordinary denies only against more-specific grants", (t) => {
   const cwd = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-c1-read-matrix-")));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
