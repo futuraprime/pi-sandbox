@@ -38,7 +38,13 @@ The user supplied `tsx --test test/**/*.test.ts` output: 232 tests, 227 passed, 
 
 Both failures are in unchanged `test/credentials.test.ts`: the JWT fallback deny-path assertion compares a `/projects/...` path with its `/Users/Shared/projects/...` realpath, and the masked-file OS probe unexpectedly reads the synthetic credential file successfully. Read-only inspection confirms `/projects` is a symlink to `/Users/Shared/projects`. The tests call dependency helpers directly with the alias path; `buildRuntimeConfig()` canonicalises credential paths before passing them to the runtime, whereas the dependency helper uses its own path normalisation. This supports an alias-sensitive test/dependency explanation, but the successful-read failure must not be dismissed as a harmless string mismatch or treated as passing denial evidence.
 
-Unit 2 remains unchecked while these regression failures are unresolved. Any credential-test or production correction is a separately approved follow-up; no dependency patch or weakened assertion is authorised. Unit 1's earlier external pass is not evidence for changed code.
+### Approved test-only follow-up
+
+The user approved correcting credential-test path handling, with production/dependency changes requiring separate approval. Commit `a387f6a` passes canonical credential paths to dependency helpers, matching the extension's contract. The macOS probe now explicitly tests both canonical and symlink-alias command paths against the canonical deny; nonzero exit, denial stderr, empty stdout, and no synthetic plaintext assertions remain. Existing platform/nested-sandbox guards are unchanged. No production or dependency change was required.
+
+The implementing agent reproduced the dependency's alias-preserving path behaviour and reported 6/6 credential tests passing with `TMPDIR` through `/projects`, including both real OS read-denial probes with no skips. Coordinator inspected the diff and ran `TMPDIR="$PWD/tmp" pnpm exec tsx --test test/credentials.test.ts`: 4 passed, 0 failed, 2 existing nested-sandbox skips. Coordinator formatting, lint, type checks, and `git diff --check` passed.
+
+This is not a claim that direct noncanonical dependency input is safe; the integration canonicalises input. Unit 2 remains unchecked pending a final external full-suite result including this test correction. Unit 1's earlier external pass is not evidence for changed code.
 
 ## Evidence limits
 
