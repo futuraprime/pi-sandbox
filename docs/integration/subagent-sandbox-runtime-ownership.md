@@ -44,7 +44,11 @@ The user approved correcting credential-test path handling, with production/depe
 
 The implementing agent reproduced the dependency's alias-preserving path behaviour and reported 6/6 credential tests passing with `TMPDIR` through `/projects`, including both real OS read-denial probes with no skips. Coordinator inspected the diff and ran `TMPDIR="$PWD/tmp" pnpm exec tsx --test test/credentials.test.ts`: 4 passed, 0 failed, 2 existing nested-sandbox skips. Coordinator formatting, lint, type checks, and `git diff --check` passed.
 
-This is not a claim that direct noncanonical dependency input is safe; the integration canonicalises input. Unit 2 remains unchecked pending a final external full-suite result including this test correction. Unit 1's earlier external pass is not evidence for changed code.
+This is not a claim that direct noncanonical dependency input is safe; the integration canonicalises input.
+
+### Final external verification (2026-10-22)
+
+The user supplied a new external-terminal `tsx --test test/**/*.test.ts` result after `a387f6a`: 232 tests, 229 passed, 0 failed, 3 skipped. All extension/runtime regressions and both corrected credential tests passed, including real macOS denial through canonical and alias command paths. The only skips were the opt-in AWS CLI, gh/npm, and Wrangler credential acceptance probes. This is user-supplied full-suite evidence, not a coordinator-run full suite. Unit 2's regression gate is satisfied and its proposal checkbox is complete; the concurrency and lifetime limits below remain.
 
 ## Evidence limits
 

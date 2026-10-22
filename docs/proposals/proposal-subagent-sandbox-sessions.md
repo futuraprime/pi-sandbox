@@ -1,7 +1,7 @@
 # Sandbox protection for subagent sessions
 
 - **Created:** 2026-10-15
-- **Updated:** 2026-10-21
+- **Updated:** 2026-10-22
 - **Status:** accepted
 
 ## Summary
@@ -146,12 +146,12 @@ Assumptions still requiring evidence: the pinned runtime factory isolates releva
   - **Verification:** source references and focused factory-contract tests using two managers with distinct configurations. Run `test/sandbox-runtime.test.ts`; record what remains OS-dependent. See Session-owned runtimes.
   - **Progress:** [audit and verification record](../integration/subagent-sandbox-runtime-audit.md) and `test/sandbox-manager-factory.test.ts` added. Coordinator verified source/tests, passed formatting, lint, and type checks, and independently passed both factory tests after user configuration and restart resolved tsx IPC permissions. Existing regression fixtures were restricted by the outer sandbox; the user subsequently supplied full external-terminal results: 229 tests, 226 passed, 0 failed, 3 opt-in credential CLI acceptance skips. Shared macOS monitoring tags, retained reset state, Linux mount cleanup, and config/provenance identity require care in Unit 2; real factory-manager OS concurrency remains unverified.
 
-- [ ] **Unit 2: Give sandbox lifecycles independent managers**
+- [x] **Unit 2: Give sandbox lifecycles independent managers**
   - **Deliverable:** owner-local lifecycle serialisation and manager routing in the extension and Bash/runtime helpers, replacing the singleton and process-global transition queue together.
   - **Dependencies:** Unit 1 establishes a usable factory contract.
   - **Acceptance:** initialisation, policy replacement, wrapping, proxy queries, diagnostics, reset, and command cleanup use the same owning manager. A failed or reset owner cannot reset a parent/sibling; existing disable/unsupported behaviour and fail-closed failure states remain. Active-command overlap is addressed by Units 3–4, not claimed complete here.
   - **Verification:** owner-aware cases in `test/extension.test.ts` and `test/sandbox-runtime.test.ts` cover two instances, failed initialisation, partial cleanup, and replacement. Inspect production paths for remaining singleton operations; retain existing macOS profile-adapter regressions.
-  - **Progress:** implemented in `b35e316`; see [ownership and verification record](../integration/subagent-sandbox-runtime-ownership.md). Owner-local managers/queues and explicit helper routing replace production singleton use. Failed initialisation awaits cleanup; restoration requires a successful reset boundary. Coordinator inspected changes and passed formatting, lint, and type checks; three focused ownership tests independently passed. The user's external-terminal run confirms all 56 extension and 41 runtime tests pass, including failed-cleanup restoration. Full suite: 232 tests, 227 passed, 2 credential tests failed, 3 opt-in skips. The user approved a test-only credential-fixture correction (`a387f6a`): pass canonical paths as production does and verify OS denial through both canonical and alias command paths. Subagent reported 6/6 credential tests passing including OS probes; coordinator passed 4 with 2 existing nested-sandbox skips, plus formatting/lint/type checks. Unit remains unchecked pending the final external full-suite run; no production credential or dependency changes were made. Command draining/cancellation and real OS concurrency remain deferred.
+  - **Progress:** implemented in `b35e316`; see [ownership and verification record](../integration/subagent-sandbox-runtime-ownership.md). Owner-local managers/queues and explicit helper routing replace production singleton use. Failed initialisation awaits cleanup; restoration requires a successful reset boundary. Coordinator inspected changes and passed formatting, lint, and type checks; three focused ownership tests independently passed. The user's external-terminal run confirms all 56 extension and 41 runtime tests pass, including failed-cleanup restoration. Initial full-suite verification exposed two credential-fixture failures. The user approved a test-only correction (`a387f6a`): pass canonical paths as production does and verify OS denial through both canonical and alias command paths. Final user-supplied external-terminal verification on 2026-10-22 passed: 232 tests, 229 passed, 0 failed, 3 opt-in credential CLI skips, including both corrected credential probes. No production credential or dependency changes were made. Command draining/cancellation and real OS concurrency remain deferred.
 
 - [ ] **Unit 3: Drain owned Bash attempts before policy refresh**
   - **Deliverable:** per-owner command leases from wrapping through execution and cleanup, integrated with policy refresh.
